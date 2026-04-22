@@ -1,11 +1,11 @@
 # 🚀 RTRWNET Management & Billing System
 
-![ISP Management Hero](public/img/hero.png)
+![ISP Management Hero](public/img/dash.png)
 
 Sistem manajemen ISP modern yang mengintegrasikan **Penagihan (Billing)**, **Manajemen ONU (GenieACS)**, **Manajemen Bandwidth (MikroTik)**, dan **Notifikasi WhatsApp** dalam satu platform terpadu.
 
-[![GitHub license](https://img.shields.io/github/license/alijayanet/billing-rtrw)](https://github.com/alijayanet/billing-rtrw/blob/main/LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/alijayanet/billing-rtrw)](https://github.com/alijayanet/billing-rtrw/stargazers)
+[![GitHub license](https://img.shields.io/github/license/heruhendri/billing-rtrw)](https://github.com/heruhendri/billing-rtrw/blob/main/LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/heruhendri/billing-rtrw)](https://github.com/heruhendri/billing-rtrw/stargazers)
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen)](https://nodejs.org/)
 
 ---
@@ -63,7 +63,7 @@ Pastikan Anda memiliki akses `root` atau `sudo`.
 
 ```bash
 # Clone repository
-git clone https://github.com/alijayanet/billing-rtrw.git
+git clone https://github.com/heruhendri/billing-rtrw.git
 cd billing-rtrw
 ```
 
@@ -78,9 +78,9 @@ npm start
 
 ### 3. Akses Portal
 Setelah instalasi berhasil, portal dapat diakses melalui browser:
-- **Admin Portal**: `http://[IP-SERVER]:3001/admin/login`
-- **teknisi Portal**: `http://[IP-SERVER]:3001/tech/login`
-- **Customer Portal**: `http://[IP-SERVER]:3001/login`
+- **Admin Portal**: `http://[IP-SERVER]:4000/admin/login`
+- **teknisi Portal**: `http://[IP-SERVER]:4000/tech/login`
+- **Customer Portal**: `http://[IP-SERVER]:4000/login`
 
 
 
