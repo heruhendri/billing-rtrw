@@ -1,6 +1,6 @@
 # 🚀 RTRWNET Management & Billing System
 
-![ISP Management Hero](public/img/dash.png)
+![Dashboard](public/img/dash.png)
 
 Sistem manajemen ISP modern yang mengintegrasikan **Penagihan (Billing)**, **Manajemen ONU (GenieACS)**, **Manajemen Bandwidth (MikroTik)**, dan **Notifikasi WhatsApp** dalam satu platform terpadu.
 
