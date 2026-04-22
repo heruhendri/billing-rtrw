@@ -1231,3 +1231,53 @@
 2026-04-21 06:27:18 info: [WA] QR Code Baru Dihasilkan: 2@ec9SqWwBU0F4w1ZXIJ...
 2026-04-21 06:27:36 info: [MikroTik] Profile for serveroki is already BRONZE. Skipping update and kick.
 2026-04-21 06:28:18 info: [WA] QR Code Baru Dihasilkan: 2@mS9uGflbjlfCn5ivWq...
+2026-04-22 22:09:37 info: [settings] Memantau perubahan settings.json
+2026-04-22 22:09:37 info: [DB] Billing database ready
+2026-04-22 22:09:37 info: Attempting to start server on configured port: 4000
+2026-04-22 22:09:37 info: Mencoba memulai server pada port 4000...
+2026-04-22 22:09:37 info: [CRON] Semua tugas penjadwalan telah aktif.
+2026-04-22 22:09:37 info: Server berhasil berjalan pada port 4000
+2026-04-22 22:09:37 info: Environment: development
+2026-04-22 22:09:38 info: [WA] Connection Update: connecting
+2026-04-22 22:09:40 info: [WA] QR Code Baru Dihasilkan: 2@G9LHmwIXJtAekMTnd1...
+2026-04-22 22:10:23 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:10:23 error: Error getting active Hotspot sessions:
+2026-04-22 22:10:23 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:10:23 error: Error getting PPPoE secrets:
+2026-04-22 22:10:23 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:10:23 error: Error getting Hotspot users:
+2026-04-22 22:10:23 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:10:23 error: Error getting active PPPoE sessions:
+2026-04-22 22:10:30 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:10:30 error: Error getting Hotspot user profiles:
+2026-04-22 22:10:30 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:10:30 error: Error getting PPPoE profiles:
+2026-04-22 22:10:40 info: [WA] QR Code Baru Dihasilkan: 2@Oh+6fFVi/EWEsH4rz2...
+2026-04-22 22:10:44 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:10:44 error: Error getting Hotspot user profiles:
+2026-04-22 22:11:00 info: [WA] QR Code Baru Dihasilkan: 2@5knENoiyZ6cXSTItrd...
+2026-04-22 22:11:20 info: [WA] QR Code Baru Dihasilkan: 2@r1yV3tJU7eqNj2S56P...
+2026-04-22 22:11:40 info: [WA] QR Code Baru Dihasilkan: 2@t07F9f04gI4ka6cot3...
+2026-04-22 22:12:00 info: [WA] QR Code Baru Dihasilkan: 2@tZK+1TlYi1D9Oh5yd9...
+2026-04-22 22:12:15 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:12:15 error: Error getting PPPoE users:
+2026-04-22 22:12:15 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:12:15 error: Error getting PPPoE profiles:
+2026-04-22 22:12:20 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:12:20 error: Error getting PPPoE secrets:
+2026-04-22 22:12:20 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:12:20 error: Error getting active PPPoE sessions:
+2026-04-22 22:12:20 info: [WA] Connection Update: close
+2026-04-22 22:12:20 warn: WhatsApp terputus (kode 408). Mencoba reconnect dalam 3 detik...
+2026-04-22 22:12:24 info: [WA] Connection Update: connecting
+2026-04-22 22:12:25 info: [WA] QR Code Baru Dihasilkan: 2@IuyWf4CkeooZlnlp56...
+2026-04-22 22:12:36 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:12:36 error: Error getting active Hotspot sessions:
+2026-04-22 22:12:36 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:12:36 error: Error getting Hotspot users:
+2026-04-22 22:12:38 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:12:38 error: Error getting PPPoE profiles:
+2026-04-22 22:12:38 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:12:38 error: Error getting Hotspot user profiles:
+2026-04-22 22:12:41 error: Failed to connect to MikroTik (192.168.8.1):
+2026-04-22 22:12:41 error: Error getting PPPoE users:
