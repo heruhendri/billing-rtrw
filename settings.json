@@ -1,5 +1,5 @@
 {
-  "genieacs_url": "http://192.168.8.89:7557",
+  "genieacs_url": "http://192.168.8.189:7557",
   "genieacs_username": "admin",
   "genieacs_password": "admin",
   "company_header": "BILLING SYSTEM",
@@ -34,5 +34,18 @@
   "login_otp_enabled": false,
   "telegram_enabled": false,
   "telegram_bot_token": "",
-  "telegram_admin_id": ""
+  "telegram_admin_id": "",
+  "company_manager": "ALIJAYA",
+  "default_gateway": "tripay",
+  "midtrans_enabled": true,
+  "midtrans_server_key": "",
+  "midtrans_mode": "sandbox",
+  "xendit_enabled": "true",
+  "xendit_api_key": "",
+  "duitku_enabled": "true",
+  "duitku_merchant_code": "",
+  "duitku_api_key": "",
+  "duitku_mode": "sandbox",
+  "office_lat": "-6.252118625253105",
+  "office_lng": " 107.9205270612316"
 }

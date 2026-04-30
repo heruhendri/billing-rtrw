@@ -11,13 +11,55 @@ const customerSvc = require('../services/customerService');
 const billingSvc = require('../services/billingService');
 const mikrotikService = require('../services/mikrotikService');
 const adminSvc = require('../services/adminService');
+const agentSvc = require('../services/agentService');
 const oltSvc = require('../services/oltService');
 const odpSvc = require('../services/odpService');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const { spawnSync } = require('child_process');
 const XLSX = require('xlsx');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage() });
+
+const pppoeTrafficSamples = new Map();
+function prunePppoeTrafficSamples(now) {
+  for (const [k, v] of pppoeTrafficSamples.entries()) {
+    if (!v || !v.t || (now - v.t) > 15000) pppoeTrafficSamples.delete(k);
+  }
+}
+
+function numField(obj, keys) {
+  if (!obj) return 0;
+  for (const k of keys) {
+    if (obj[k] !== undefined && obj[k] !== null && obj[k] !== '') {
+      const n = Number(obj[k]);
+      if (Number.isFinite(n)) return n;
+    }
+    if (obj[String(k).toLowerCase()] !== undefined && obj[String(k).toLowerCase()] !== null && obj[String(k).toLowerCase()] !== '') {
+      const n = Number(obj[String(k).toLowerCase()]);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return 0;
+}
+
+function strField(obj, keys) {
+  if (!obj) return '';
+  for (const k of keys) {
+    const v = obj[k] !== undefined ? obj[k] : obj[String(k).toLowerCase()];
+    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+  }
+  return '';
+}
+
+async function invokeRouterOsMenuCommand(menu, command, args) {
+  if (!menu) return null;
+  if (typeof menu.call === 'function') return await menu.call(command, args);
+  if (typeof menu.command === 'function') return await menu.command(command, args);
+  if (typeof menu.run === 'function') return await menu.run(command, args);
+  return null;
+}
 
 // ─── AUTH ──────────────────────────────────────────────────────────────────
 function requireAdmin(req, res, next) {
@@ -46,6 +88,81 @@ function flashMsg(req) {
   const m = req.session._msg;
   delete req.session._msg;
   return m || null;
+}
+
+function popUpdateLog(req) {
+  const l = req.session._updateLog;
+  delete req.session._updateLog;
+  return l || '';
+}
+
+function readTextFileSafe(filePath) {
+  try {
+    return String(fs.readFileSync(filePath, 'utf8')).trim();
+  } catch (e) {
+    return '';
+  }
+}
+
+function runCmd(cmd, args, cwd) {
+  try {
+    const r = spawnSync(cmd, args, { cwd, encoding: 'utf8' });
+    return { ok: r.status === 0, code: r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
+  } catch (e) {
+    return { ok: false, code: -1, stdout: '', stderr: String(e?.message || e) };
+  }
+}
+
+function copyDirSync(srcDir, destDir) {
+  fs.mkdirSync(destDir, { recursive: true });
+  const entries = fs.readdirSync(srcDir, { withFileTypes: true });
+  for (const ent of entries) {
+    const src = path.join(srcDir, ent.name);
+    const dst = path.join(destDir, ent.name);
+    if (ent.isDirectory()) copyDirSync(src, dst);
+    else if (ent.isFile()) fs.copyFileSync(src, dst);
+  }
+}
+
+function getGitDefaultBranch(repoRoot) {
+  const r = runCmd('git', ['symbolic-ref', 'refs/remotes/origin/HEAD'], repoRoot);
+  if (r.ok) {
+    const ref = String(r.stdout || '').trim();
+    const m = ref.match(/refs\/remotes\/origin\/(.+)$/);
+    if (m && m[1]) return m[1].trim();
+  }
+  return 'main';
+}
+
+function getUpdateInfo(repoRoot) {
+  const localVersion = readTextFileSafe(path.join(repoRoot, 'version.txt')) || '-';
+  const info = { localVersion, remoteVersion: '-', branch: '-', needsUpdate: false, error: '' };
+
+  const inside = runCmd('git', ['rev-parse', '--is-inside-work-tree'], repoRoot);
+  if (!inside.ok) {
+    info.error = 'Folder ini belum menjadi git repository.';
+    return info;
+  }
+
+  const branch = getGitDefaultBranch(repoRoot);
+  info.branch = branch;
+
+  const fetch = runCmd('git', ['fetch', '--prune'], repoRoot);
+  if (!fetch.ok) {
+    info.error = 'Gagal git fetch: ' + (fetch.stderr || fetch.stdout || '').trim();
+    return info;
+  }
+
+  const remote = runCmd('git', ['show', `origin/${branch}:version.txt`], repoRoot);
+  if (!remote.ok) {
+    info.error = `Tidak bisa membaca version.txt dari GitHub (origin/${branch}).`;
+    return info;
+  }
+
+  const remoteVersion = String(remote.stdout || '').trim() || '-';
+  info.remoteVersion = remoteVersion;
+  info.needsUpdate = Boolean(remoteVersion && remoteVersion !== '-' && remoteVersion !== localVersion);
+  return info;
 }
 
 function parseMikhmonOnLogin(script) {
@@ -287,6 +404,158 @@ router.get('/map', requireAdminSession, (req, res) => {
   });
 });
 
+router.get('/api/customers/:id/pppoe-traffic', requireAdminSession, async (req, res) => {
+  const customerId = Number(req.params.id);
+  if (!customerId) return res.status(400).json({ ok: false, error: 'invalid_customer' });
+
+  const customer = customerSvc.getCustomerById(customerId);
+  if (!customer) return res.status(404).json({ ok: false, error: 'not_found' });
+
+  const routerId = customer.router_id ? Number(customer.router_id) : null;
+  const username = String(customer.pppoe_username || '').trim();
+
+  if (!routerId || !username) {
+    return res.json({ ok: true, available: false, online: false, username: username || null, rxMbps: 0, txMbps: 0 });
+  }
+
+  const now = Date.now();
+  prunePppoeTrafficSamples(now);
+
+  let conn = null;
+  try {
+    conn = await mikrotikService.getConnection(routerId);
+    const sessions = await conn.client.menu('/ppp/active').where('name', username).get();
+    if (!sessions || sessions.length === 0) {
+      return res.json({ ok: true, available: true, online: false, username, rxMbps: 0, txMbps: 0 });
+    }
+
+    const s = sessions[0];
+    let iface = strField(s, ['interface', 'interface-name', 'interfaceName', 'ifname', 'if-name', 'pppInterface']) || null;
+    const baseSessionId = strField(s, ['.id', 'id', 'sessionId', 'session-id']) || `${username}`;
+    const bytesIn = numField(s, ['bytesIn', 'bytes-in', 'bytes_in']);
+    const bytesOut = numField(s, ['bytesOut', 'bytes-out', 'bytes_out']);
+    const uptime = strField(s, ['uptime']) || null;
+
+    if (!iface) {
+      try {
+        const pppoeSrvMenu = conn.client.menu('/interface/pppoe-server');
+        let pppoeRows = [];
+        try {
+          pppoeRows = await pppoeSrvMenu.where('user', username).get();
+        } catch {
+          pppoeRows = await pppoeSrvMenu.get();
+        }
+        const hit = (Array.isArray(pppoeRows) ? pppoeRows : []).find(r => String(r.user || r['user'] || '').trim() === username);
+        const ifaceName = strField(hit, ['name']);
+        if (ifaceName) iface = ifaceName;
+      } catch {}
+    }
+
+    const sessionId = `${baseSessionId}${iface ? `|${iface}` : ''}`;
+
+    const key = `${routerId || 'default'}:${username}`;
+    const prev = pppoeTrafficSamples.get(key);
+    let rxBytes = bytesIn;
+    let txBytes = bytesOut;
+    let source = 'ppp-active';
+
+    if (iface) {
+      const ifMenu = conn.client.menu('/interface');
+      if (ifMenu) {
+        try {
+          const mtRaw = await invokeRouterOsMenuCommand(ifMenu, 'monitor-traffic', { interface: iface, once: '' });
+          const mt = Array.isArray(mtRaw) ? mtRaw[0] : mtRaw;
+          const rxBps = numField(mt, ['rxBitsPerSecond', 'rx-bits-per-second', 'rx-bits-per-second']);
+          const txBps = numField(mt, ['txBitsPerSecond', 'tx-bits-per-second', 'tx-bits-per-second']);
+          if (rxBps || txBps) {
+            return res.json({
+              ok: true,
+              available: true,
+              online: true,
+              username,
+              iface,
+              source: 'monitor-traffic',
+              uptime,
+              rxMbps: (Number(rxBps) || 0) / 1e6,
+              txMbps: (Number(txBps) || 0) / 1e6
+            });
+          }
+        } catch {}
+      }
+    }
+
+    if (iface) {
+      try {
+        const ifRows = await conn.client.menu('/interface').where('name', iface).get();
+        if (ifRows && ifRows.length > 0) {
+          const row = ifRows[0];
+          const ifRx = numField(row, ['rxByte', 'rx-byte', 'rx-bytes', 'rxBytes']);
+          const ifTx = numField(row, ['txByte', 'tx-byte', 'tx-bytes', 'txBytes']);
+          if (ifRx || ifTx) {
+            rxBytes = ifRx;
+            txBytes = ifTx;
+            source = 'interface';
+          }
+        }
+      } catch {}
+    }
+
+    pppoeTrafficSamples.set(key, { t: now, sessionId, rxBytes, txBytes, source });
+
+    if (!prev || prev.sessionId !== sessionId || !prev.t) {
+      return res.json({
+        ok: true,
+        available: true,
+        online: true,
+        warmup: true,
+        username,
+        iface,
+        source,
+        uptime,
+        rxMbps: 0,
+        txMbps: 0
+      });
+    }
+
+    const dtMs = Math.max(1, now - prev.t);
+    const dIn = rxBytes - numField(prev, ['rxBytes']);
+    const dOut = txBytes - numField(prev, ['txBytes']);
+    if (dIn < 0 || dOut < 0) {
+      return res.json({
+        ok: true,
+        available: true,
+        online: true,
+        warmup: true,
+        username,
+        iface,
+        source,
+        uptime,
+        rxMbps: 0,
+        txMbps: 0
+      });
+    }
+
+    const rxMbps = (dIn * 8) / (dtMs / 1000) / 1e6;
+    const txMbps = (dOut * 8) / (dtMs / 1000) / 1e6;
+
+    return res.json({
+      ok: true,
+      available: true,
+      online: true,
+      username,
+      iface,
+      source,
+      uptime,
+      rxMbps: Number.isFinite(rxMbps) ? rxMbps : 0,
+      txMbps: Number.isFinite(txMbps) ? txMbps : 0
+    });
+  } catch (e) {
+    return res.json({ ok: false, error: e.message || 'failed' });
+  } finally {
+    if (conn && conn.api) conn.api.close();
+  }
+});
+
 router.post('/odps', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), (req, res) => {
   try {
     odpSvc.createOdp(req.body);
@@ -379,6 +648,107 @@ router.post('/cashiers/:id/delete', requireAdminSession, restrictToAdmin, (req, 
   adminSvc.deleteCashier(req.params.id);
   req.session._msg = { type: 'success', text: 'Kasir berhasil dihapus.' };
   res.redirect('/admin/cashiers');
+});
+
+// --- AGENT MANAGEMENT ---
+router.get('/agents', requireAdminSession, restrictToAdmin, (req, res) => {
+  const agents = agentSvc.getAllAgents();
+  const routers = mikrotikService.getAllRouters();
+  res.render('admin/agents', {
+    title: 'Manajemen Agent',
+    company: company(),
+    activePage: 'agents',
+    agents,
+    routers,
+    msg: flashMsg(req)
+  });
+});
+
+router.post('/agents', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    agentSvc.createAgent(req.body);
+    req.session._msg = { type: 'success', text: 'Agent berhasil ditambahkan.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+  }
+  res.redirect('/admin/agents');
+});
+
+router.post('/agents/:id/update', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    agentSvc.updateAgent(req.params.id, req.body);
+    req.session._msg = { type: 'success', text: 'Data agent diperbarui.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+  }
+  res.redirect('/admin/agents');
+});
+
+router.post('/agents/:id/delete', requireAdminSession, restrictToAdmin, (req, res) => {
+  try {
+    agentSvc.deleteAgent(req.params.id);
+    req.session._msg = { type: 'success', text: 'Agent berhasil dihapus.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+  }
+  res.redirect('/admin/agents');
+});
+
+router.post('/agents/:id/topup', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    const amount = Number(req.body.amount || 0);
+    const note = String(req.body.note || '').trim();
+    agentSvc.topupAgent(req.params.id, amount, note, req.session.adminUser || 'Admin');
+    req.session._msg = { type: 'success', text: 'Topup saldo berhasil.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal topup: ' + e.message };
+  }
+  res.redirect('/admin/agents');
+});
+
+router.get('/agents/reports', requireAdminSession, restrictToAdmin, (req, res) => {
+  const agents = agentSvc.getAllAgents();
+  const agentId = req.query.agentId ? Number(req.query.agentId) : null;
+  const txs = agentSvc.listAgentTransactions({ agentId, limit: 500 });
+  res.render('admin/agent_reports', {
+    title: 'Laporan Agent',
+    company: company(),
+    activePage: 'agents_reports',
+    agents,
+    agentId,
+    txs,
+    msg: flashMsg(req)
+  });
+});
+
+router.get('/api/agents/:id/prices', requireAdmin, restrictToAdmin, (req, res) => {
+  try {
+    const rows = agentSvc.getAgentPrices(Number(req.params.id));
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/api/agents/:id/prices', requireAdmin, restrictToAdmin, express.json(), (req, res) => {
+  try {
+    const agentId = Number(req.params.id);
+    const result = agentSvc.upsertAgentHotspotPrice(agentId, req.body);
+    res.json({ success: true, result });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.post('/api/agents/:id/prices/:priceId/delete', requireAdmin, restrictToAdmin, (req, res) => {
+  try {
+    const agentId = Number(req.params.id);
+    const priceId = Number(req.params.priceId);
+    const result = agentSvc.deleteAgentHotspotPrice(agentId, priceId);
+    res.json({ success: true, result });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
 // ─── DASHBOARD ─────────────────────────────────────────────────────────────
@@ -668,6 +1038,54 @@ router.post('/customers/:id/unisolate', requireAdminSession, async (req, res) =>
   res.redirect('back');
 });
 
+router.post('/customers/:id/billing/generate', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    const { month, year } = req.body;
+    const result = billingSvc.generateInvoiceForCustomer(req.params.id, parseInt(month), parseInt(year));
+    if (result.created) {
+      req.session._msg = { type: 'success', text: `Tagihan berhasil dibuat untuk "${result.customerName}" periode ${month}/${year}.` };
+    } else {
+      req.session._msg = { type: 'success', text: `Tagihan sudah ada untuk "${result.customerName}" periode ${month}/${year}.` };
+    }
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal generate tagihan: ' + e.message };
+  }
+  res.redirect('back');
+});
+
+router.post('/customers/:id/billing/pay', requireAdminSession, express.urlencoded({ extended: true }), async (req, res) => {
+  try {
+    const { month, months, year, paid_by_name, notes } = req.body;
+    const y = parseInt(year);
+
+    if (months != null) {
+      const sum = billingSvc.payInvoicesForCustomerMonths(req.params.id, y, months, paid_by_name, notes);
+      const done = sum.paidMonths.length;
+      const already = sum.alreadyPaidMonths.length;
+      const created = sum.createdMonths.length;
+      const total = Number(sum.totalAmount) || 0;
+      req.session._msg = { type: 'success', text: `Pembayaran berhasil untuk "${sum.customerName}" tahun ${sum.year}. Total: Rp ${total.toLocaleString('id-ID')} (${sum.totalMonths || 0} bulan). Dibayar: ${done} bulan, dibuat: ${created}, sudah lunas: ${already}.` };
+    } else {
+      const m = parseInt(month);
+      const result = billingSvc.payInvoiceForCustomerPeriod(req.params.id, m, y, paid_by_name, notes);
+      if (result.alreadyPaid) {
+        req.session._msg = { type: 'success', text: `Tagihan periode ${m}/${y} untuk "${result.customerName}" sudah lunas.` };
+      } else {
+        const verb = result.created ? 'dibuat & dilunasi' : 'dilunasi';
+        req.session._msg = { type: 'success', text: `Tagihan periode ${m}/${y} untuk "${result.customerName}" berhasil ${verb}.` };
+      }
+    }
+
+    const freshCustomer = customerSvc.getAllCustomers().find(c => String(c.id) === String(req.params.id));
+    if (freshCustomer && freshCustomer.status === 'suspended' && freshCustomer.unpaid_count === 0) {
+      await customerSvc.activateCustomer(req.params.id);
+    }
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal bayar: ' + e.message };
+  }
+  res.redirect('back');
+});
+
 // ─── PACKAGES ──────────────────────────────────────────────────────────────
 router.get('/packages', requireAdminSession, (req, res) => {
   res.render('admin/packages', {
@@ -748,6 +1166,26 @@ router.get('/api/billing/unpaid/:customerId', requireAdmin, (req, res) => {
   try {
     const invoices = billingSvc.getUnpaidInvoicesByCustomerId(req.params.customerId);
     res.json(invoices);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/api/customers/:id/paid-months', requireAdmin, (req, res) => {
+  try {
+    const year = parseInt(req.query.year || new Date().getFullYear());
+    const months = billingSvc.getPaidMonthsForCustomerYear(req.params.id, year);
+    res.json({ year, months });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/api/customers/:id/billing-year', requireAdmin, (req, res) => {
+  try {
+    const year = parseInt(req.query.year || new Date().getFullYear());
+    const summary = billingSvc.getCustomerBillingYearSummary(req.params.id, year);
+    res.json(summary);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -952,17 +1390,64 @@ router.post('/tickets/:id/delete', requireAdminSession, (req, res) => {
 router.get('/reports', requireAdminSession, (req, res) => {
   const filterYear = parseInt(req.query.year) || new Date().getFullYear();
   const now = new Date();
-  const billing = billingSvc.getDashboardStats();
   const monthlyData = billingSvc.getMonthlyRevenue(filterYear);
   const recentPayments = billingSvc.getRecentPayments(10);
   const topUnpaid = billingSvc.getTopUnpaid(5);
   const activeCustomers = customerSvc.getCustomerStats().active;
 
+  const yStr = String(filterYear);
+  const revenueYearAllRow = db.prepare(
+    "SELECT SUM(amount) as t FROM invoices WHERE status='paid' AND strftime('%Y', paid_at) = ?"
+  ).get(yStr);
+  const revenueYearAll = Number(revenueYearAllRow?.t || 0);
+
+  const revenueYearDirectRow = db.prepare(
+    "SELECT SUM(amount) as t FROM invoices WHERE status='paid' AND strftime('%Y', paid_at) = ? AND (paid_by_name IS NULL OR paid_by_name NOT LIKE 'Agent %')"
+  ).get(yStr);
+  const revenueYearDirect = Number(revenueYearDirectRow?.t || 0);
+  const revenueYearAgent = Math.max(0, revenueYearAll - revenueYearDirect);
+
+  const agentDepositYearRow = db.prepare(
+    "SELECT SUM(amount_buy) as t FROM agent_transactions WHERE type='topup' AND strftime('%Y', created_at) = ?"
+  ).get(yStr);
+  const agentDepositYear = Number(agentDepositYearRow?.t || 0);
+
+  const nowYearStr = String(now.getFullYear());
+  const nowMonthStr = String(now.getMonth() + 1).padStart(2, '0');
+  const revenueThisMonthAllRow = db.prepare(
+    "SELECT SUM(amount) as t FROM invoices WHERE status='paid' AND strftime('%Y', paid_at) = ? AND strftime('%m', paid_at) = ?"
+  ).get(nowYearStr, nowMonthStr);
+  const revenueThisMonthAll = Number(revenueThisMonthAllRow?.t || 0);
+
+  const revenueThisMonthDirectRow = db.prepare(
+    "SELECT SUM(amount) as t FROM invoices WHERE status='paid' AND strftime('%Y', paid_at) = ? AND strftime('%m', paid_at) = ? AND (paid_by_name IS NULL OR paid_by_name NOT LIKE 'Agent %')"
+  ).get(nowYearStr, nowMonthStr);
+  const revenueThisMonthDirect = Number(revenueThisMonthDirectRow?.t || 0);
+  const revenueThisMonthAgent = Math.max(0, revenueThisMonthAll - revenueThisMonthDirect);
+
+  const agentDepositMonthRow = db.prepare(
+    "SELECT SUM(amount_buy) as t FROM agent_transactions WHERE type='topup' AND strftime('%Y', created_at) = ? AND strftime('%m', created_at) = ?"
+  ).get(nowYearStr, nowMonthStr);
+  const agentDepositThisMonth = Number(agentDepositMonthRow?.t || 0);
+
+  const cashInYear = revenueYearDirect + agentDepositYear;
+  const cashInThisMonth = revenueThisMonthDirect + agentDepositThisMonth;
+  const pendingAmountRow = db.prepare("SELECT SUM(amount) as t FROM invoices WHERE status='unpaid'").get();
+  const pendingAmount = Number(pendingAmountRow?.t || 0);
+
   res.render('admin/reports', {
     title: 'Laporan Keuangan', company: company(), activePage: 'reports',
     filterYear, monthlyData, chartData: monthlyData, recentPayments, topUnpaid,
-    totalRevenue: billing.totalRevenue, thisMonth: billing.thisMonth,
-    pendingAmount: billing.pendingAmount, activeCustomers
+    totalRevenue: revenueYearAll,
+    thisMonth: revenueThisMonthAll,
+    pendingAmount,
+    activeCustomers,
+    revenueYearAgent,
+    revenueThisMonthAgent,
+    agentDepositYear,
+    agentDepositThisMonth,
+    cashInYear,
+    cashInThisMonth
   });
 });
 
@@ -972,6 +1457,121 @@ router.get('/settings', requireAdminSession, (req, res) => {
     title: 'Pengaturan Sistem', company: company(), activePage: 'settings',
     settings: getSettings(), msg: flashMsg(req)
   });
+});
+
+router.get('/update', requireAdminSession, restrictToAdmin, (req, res) => {
+  const repoRoot = path.resolve(__dirname, '..');
+  const info = getUpdateInfo(repoRoot);
+  res.render('admin/update', {
+    title: 'Update Aplikasi',
+    company: company(),
+    activePage: 'update',
+    msg: flashMsg(req),
+    info,
+    log: popUpdateLog(req)
+  });
+});
+
+router.post('/update/run', requireAdminSession, restrictToAdmin, (req, res) => {
+  const repoRoot = path.resolve(__dirname, '..');
+  const log = [];
+  const pushCmd = (label, r) => {
+    log.push(`$ ${label}`.trim());
+    if (r.stdout) log.push(String(r.stdout).trimEnd());
+    if (r.stderr) log.push(String(r.stderr).trimEnd());
+  };
+
+  const versionPath = path.join(repoRoot, 'version.txt');
+  const localBefore = readTextFileSafe(versionPath) || '-';
+  const branch = getGitDefaultBranch(repoRoot);
+  const backupRoot = path.join(os.tmpdir(), `billing-update-backup-${Date.now()}`);
+  const backupSettings = path.join(backupRoot, 'settings.json');
+  const backupDb = path.join(backupRoot, 'database');
+  const settingsPath = path.join(repoRoot, 'settings.json');
+  const dbDir = path.join(repoRoot, 'database');
+
+  try {
+    const inside = runCmd('git', ['rev-parse', '--is-inside-work-tree'], repoRoot);
+    pushCmd('git rev-parse --is-inside-work-tree', inside);
+    if (!inside.ok) throw new Error('Folder ini belum menjadi git repository.');
+
+    const fetch = runCmd('git', ['fetch', '--prune'], repoRoot);
+    pushCmd('git fetch --prune', fetch);
+    if (!fetch.ok) throw new Error('Gagal git fetch.');
+
+    const remote = runCmd('git', ['show', `origin/${branch}:version.txt`], repoRoot);
+    pushCmd(`git show origin/${branch}:version.txt`, remote);
+    if (!remote.ok) throw new Error('Tidak bisa membaca version.txt dari GitHub.');
+    const remoteVersion = String(remote.stdout || '').trim() || '-';
+
+    if (remoteVersion !== '-' && remoteVersion === localBefore) {
+      req.session._msg = { type: 'success', text: 'Versi sudah terbaru: ' + localBefore };
+      req.session._updateLog = log.join('\n');
+      return res.redirect('/admin/update');
+    }
+
+    fs.mkdirSync(backupRoot, { recursive: true });
+    if (fs.existsSync(settingsPath)) fs.copyFileSync(settingsPath, backupSettings);
+    if (fs.existsSync(dbDir)) copyDirSync(dbDir, backupDb);
+
+    const resetSettings = runCmd('git', ['checkout', '--', 'settings.json'], repoRoot);
+    pushCmd('git checkout -- settings.json', resetSettings);
+    const resetDb = runCmd('git', ['checkout', '--', 'database'], repoRoot);
+    pushCmd('git checkout -- database', resetDb);
+
+    const resetHard = runCmd('git', ['reset', '--hard', `origin/${branch}`], repoRoot);
+    pushCmd(`git reset --hard origin/${branch}`, resetHard);
+    if (!resetHard.ok) throw new Error('Gagal reset ke origin/' + branch);
+
+    if (remoteVersion && remoteVersion !== '-') {
+      try {
+        fs.writeFileSync(versionPath, remoteVersion + os.EOL, 'utf8');
+        log.push(`$ write version.txt = ${remoteVersion}`);
+      } catch (e) {
+        log.push(`$ write version.txt failed: ${String(e?.message || e)}`);
+      }
+    }
+
+    const authFolder = String(getSetting('whatsapp_auth_folder', 'auth_info_baileys') || 'auth_info_baileys');
+    const clean = runCmd(
+      'git',
+      [
+        'clean',
+        '-fd',
+        '-e', 'settings.json',
+        '-e', 'database',
+        '-e', 'node_modules',
+        '-e', 'package-lock.json',
+        '-e', authFolder,
+        '-e', 'data'
+      ],
+      repoRoot
+    );
+    pushCmd(`git clean -fd -e settings.json -e database -e node_modules -e package-lock.json -e ${authFolder} -e data`, clean);
+
+    if (fs.existsSync(backupSettings)) fs.copyFileSync(backupSettings, settingsPath);
+    if (fs.existsSync(backupDb)) {
+      fs.mkdirSync(dbDir, { recursive: true });
+      copyDirSync(backupDb, dbDir);
+    }
+
+    const npm = runCmd('npm', ['install'], repoRoot);
+    pushCmd('npm install', npm);
+    if (!npm.ok) throw new Error('Update berhasil, tetapi npm install gagal.');
+
+    const localAfter = readTextFileSafe(versionPath) || '-';
+    req.session._msg = { type: 'success', text: `Update selesai. Versi: ${localBefore} → ${localAfter}. Silakan restart aplikasi.` };
+    req.session._updateLog = log.join('\n');
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal update: ' + (e?.message || e) };
+    req.session._updateLog = log.join('\n');
+  } finally {
+    try {
+      if (fs.existsSync(backupRoot)) fs.rmSync(backupRoot, { recursive: true, force: true });
+    } catch (e) {}
+  }
+
+  return res.redirect('/admin/update');
 });
 
 router.post('/api/telegram/sync', requireAdminSession, async (req, res) => {
@@ -1171,7 +1771,7 @@ router.get('/mikrotik', requireAdminSession, (req, res) => {
 router.get('/vouchers', requireAdminSession, (req, res) => {
   const routers = mikrotikService.getAllRouters();
   res.render('admin/vouchers', {
-    title: 'Manajemen Voucher', company: company(), activePage: 'vouchers',
+    title: 'Manajemen Voucher', company: company(), activePage: 'mikrotik',
     routers, msg: flashMsg(req), settings: getSettings()
   });
 });
@@ -1416,6 +2016,32 @@ router.post('/api/vouchers/batches/:id/sync', requireAdmin, async (req, res) => 
   }
 });
 
+router.post('/api/vouchers/batches/:id/delete', requireAdmin, async (req, res) => {
+  try {
+    const batchId = Number(req.params.id);
+    if (!batchId) return res.status(400).json({ error: 'Batch ID tidak valid' });
+
+    const batch = db.prepare('SELECT id, status FROM voucher_batches WHERE id = ?').get(batchId);
+    if (!batch) return res.status(404).json({ error: 'Batch tidak ditemukan' });
+    if (String(batch.status) === 'creating') {
+      return res.status(400).json({ error: 'Batch sedang diproses (creating). Silakan tunggu hingga selesai.' });
+    }
+
+    const stats = db.prepare(`
+      SELECT
+        (SELECT COUNT(1) FROM vouchers v WHERE v.batch_id = ?) AS total,
+        (SELECT COUNT(1) FROM vouchers v WHERE v.batch_id = ? AND v.used_at IS NOT NULL) AS used
+    `).get(batchId, batchId);
+
+    const del = db.prepare('DELETE FROM voucher_batches WHERE id = ?');
+    del.run(batchId);
+
+    res.json({ success: true, deletedBatchId: batchId, deletedVouchers: stats?.total || 0, usedCount: stats?.used || 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.get('/api/mikrotik/secrets', requireAdmin, async (req, res) => {
   try { res.json(await mikrotikService.getPppoeSecrets(req.query.routerId)); } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1514,7 +2140,7 @@ router.get('/whatsapp', requireAdminSession, async (req, res) => {
 
 router.get('/whatsapp/broadcast', requireAdminSession, (req, res) => {
   res.render('admin/broadcast', {
-    title: 'Broadcast WhatsApp', company: company(), activePage: 'broadcast', msg: flashMsg(req),
+    title: 'Broadcast WhatsApp', company: company(), activePage: 'whatsapp', msg: flashMsg(req),
     broadcastStatus: global.broadcastStatus, getSetting
   });
 });
@@ -1528,6 +2154,12 @@ router.post('/whatsapp/broadcast', requireAdminSession, express.urlencoded({ ext
     const { target, message, delay: customDelay } = req.body;
     if (!message) throw new Error('Pesan tidak boleh kosong');
     const delayMs = (parseInt(customDelay) || getSetting('whatsapp_broadcast_delay', 2)) * 1000;
+    if (customDelay) {
+      const v = parseInt(customDelay);
+      if (Number.isFinite(v) && v >= 1 && v <= 60) {
+        saveSettings({ whatsapp_broadcast_delay: v });
+      }
+    }
 
     if (global.broadcastStatus.active) {
       throw new Error('Ada proses broadcast yang sedang berjalan. Silakan tunggu hingga selesai.');
@@ -1613,6 +2245,26 @@ router.post('/whatsapp/broadcast', requireAdminSession, express.urlencoded({ ext
   res.redirect('/admin/whatsapp/broadcast');
 });
 
+router.post('/whatsapp/auto-billing', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    const enabled = req.body && req.body.enabled ? true : false;
+    const delay = req.body && req.body.delay ? parseInt(req.body.delay) : null;
+    const next = { whatsapp_auto_billing_enabled: enabled };
+    if (delay != null && Number.isFinite(delay) && delay >= 1 && delay <= 60) {
+      next.whatsapp_broadcast_delay = delay;
+    }
+    const msg = req.body && typeof req.body.message === 'string' ? req.body.message.trim() : '';
+    if (msg) {
+      next.whatsapp_auto_billing_message = msg;
+    }
+    saveSettings(next);
+    req.session._msg = { type: 'success', text: `Pengingat tagihan otomatis ${enabled ? 'diaktifkan' : 'dimatikan'}.` };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal menyimpan pengaturan: ' + e.message };
+  }
+  res.redirect('/admin/whatsapp/broadcast');
+});
+
 router.get('/api/whatsapp/status', requireAdmin, async (req, res) => {
     try {
       const { whatsappStatus } = await import('../services/whatsappBot.mjs');
@@ -1621,6 +2273,26 @@ router.get('/api/whatsapp/status', requireAdmin, async (req, res) => {
       res.status(500).json({ error: e.message });
     }
   });
+
+router.post('/whatsapp/test-notification', requireAdminSession, async (req, res) => {
+  try {
+    const { sendWA, whatsappStatus } = await import('../services/whatsappBot.mjs');
+    if (whatsappStatus.connection !== 'open') {
+      throw new Error('Bot WhatsApp belum terhubung. Silakan scan QR hingga status Terhubung.');
+    }
+    const adminPhone = '087820851413';
+    const msg =
+      `🧪 *TEST NOTIFIKASI WHATSAPP*\n\n` +
+      `✅ Jika pesan ini masuk, berarti notifikasi WhatsApp dari Billing Alijaya System sudah berfungsi.\n` +
+      `📅 Waktu: ${new Date().toLocaleString('id-ID')}`;
+    const ok = await sendWA(adminPhone, msg);
+    if (!ok) throw new Error('Gagal mengirim pesan test (sendWA=false).');
+    req.session._msg = { type: 'success', text: 'Test notifikasi WhatsApp berhasil dikirim.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal kirim test WhatsApp: ' + e.message };
+  }
+  res.redirect('/admin/whatsapp');
+});
 
 router.post('/whatsapp/reset', requireAdminSession, (req, res) => {
   try {
@@ -1651,7 +2323,7 @@ router.post('/whatsapp/reset', requireAdminSession, (req, res) => {
 // ─── ROUTERS (MULTI-ROUTER) ──────────────────────────────────────────────────
 router.get('/routers', requireAdminSession, (req, res) => {
   res.render('admin/routers', {
-    title: 'Manajemen Router', company: company(), activePage: 'routers',
+    title: 'Manajemen Router', company: company(), activePage: 'mikrotik',
     routers: mikrotikService.getAllRouters(), msg: flashMsg(req)
   });
 });

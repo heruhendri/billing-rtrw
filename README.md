@@ -39,6 +39,7 @@ Sistem manajemen ISP modern yang mengintegrasikan **Penagihan (Billing)**, **Man
 - **Super Admin**: Akses penuh ke pengaturan sistem dan manajemen user internal.
 - **Kasir**: Kelola pembayaran dan data pelanggan tanpa akses ke pengaturan sensitif.
 - **Teknisi**: Kelola tiket gangguan dan monitoring perangkat.
+- **Agent**: Kelola Pembayaran dan penjualan voucher system deposit.
 
 ---
 
@@ -55,6 +56,22 @@ Sistem manajemen ISP modern yang mengintegrasikan **Penagihan (Billing)**, **Man
 
 ---
 Noted : gunakan nodejs v20
+### 0. install nodejs v20
+```bash
+sudo apt update
+sudo apt install -y curl ca-certificates
+
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+export NVM_DIR="$HOME/.nvm"
+. "$NVM_DIR/nvm.sh"
+
+nvm install 20
+nvm use 20
+nvm alias default 20
+
+node -v
+npm -v
+```
 
 ## 🚀 Cara Instalasi (Ubuntu / Armbian)
 
@@ -87,12 +104,12 @@ Setelah instalasi berhasil, portal dapat diakses melalui browser:
 ## ⚙️ Konfigurasi Tambahan
 
 ```bash
-install pm2 -g
+npm install pm2 -g
 ```
 ## ⚙️ Jalankan Aplikasi Menggunakan pm2
 
 ```bash
-pm2 start app-customer.php --name billing-rtrw
+pm2 start app-customer.js
 ```
 
 
