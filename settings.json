@@ -35,7 +35,7 @@
   "telegram_enabled": false,
   "telegram_bot_token": "",
   "telegram_admin_id": "",
-  "company_manager": "ALIJAYA",
+  "company_manager": "HENDRI",
   "default_gateway": "tripay",
   "midtrans_enabled": true,
   "midtrans_server_key": "",
