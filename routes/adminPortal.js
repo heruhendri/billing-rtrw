@@ -21,6 +21,11 @@ const { spawnSync } = require('child_process');
 const XLSX = require('xlsx');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage() });
+const backupSvc = require('../services/backupService');
+const monitoringSvc = require('../services/monitoringService');
+const inventorySvc = require('../services/inventoryService');
+const auditSvc = require('../services/auditTrailService');
+const diagnosticsSvc = require('../services/diagnosticsService');
 
 const pppoeTrafficSamples = new Map();
 function prunePppoeTrafficSamples(now) {
@@ -358,6 +363,30 @@ router.post('/olts/:id/onu/:index/rename', requireAdminSession, restrictToAdmin,
   }
 });
 
+router.post('/olts/:id/onu/authorize', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), async (req, res) => {
+  try {
+    const output = await oltSvc.authorizeOnu(req.params.id, req.body);
+    res.json({ success: true, message: 'Otorisasi berhasil.', output });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/olts/:id/onu/configure-wan', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), async (req, res) => {
+  try {
+    const { method, sn } = req.body;
+    let output;
+    if (method === 'tr069') {
+      output = await oltSvc.configureWanViaAcs(sn, req.body);
+    } else {
+      output = await oltSvc.configureOnuWan(req.params.id, req.body);
+    }
+    res.json({ success: true, message: 'Konfigurasi WAN berhasil.', output });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.post('/olts', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), (req, res) => {
   try {
     oltSvc.createOlt(req.body);
@@ -553,6 +582,19 @@ router.get('/api/customers/:id/pppoe-traffic', requireAdminSession, async (req, 
     return res.json({ ok: false, error: e.message || 'failed' });
   } finally {
     if (conn && conn.api) conn.api.close();
+  }
+});
+
+router.post('/api/customers/:id/cable-path', requireAdminSession, (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { path } = req.body;
+    if (!id) throw new Error('ID pelanggan tidak valid');
+    customerSvc.updateCustomerCablePath(id, path);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[API] Save Cable Path Error:', e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -898,12 +940,12 @@ router.post('/customers/:id/update', requireAdminSession, express.urlencoded({ e
   res.redirect('/admin/customers');
 });
 
-router.post('/customers/:id/delete', requireAdminSession, (req, res) => {
+router.post('/customers/:id/delete', requireAdminSession, async (req, res) => {
   try {
-    customerSvc.deleteCustomer(req.params.id);
+    await customerSvc.deleteCustomer(req.params.id);
     req.session._msg = { type: 'success', text: 'Pelanggan berhasil dihapus.' };
   } catch (e) {
-    req.session._msg = { type: 'error', text: 'Gagal menghapus: ' + e.message };
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
   }
   res.redirect('/admin/customers');
 });
@@ -1255,6 +1297,81 @@ router.post('/billing/:id/unpay', requireAdminSession, (req, res) => {
   res.redirect('back');
 });
 
+router.post('/billing/:id/qris-assign', requireAdminSession, (req, res) => {
+  try {
+    const invId = Number(req.params.id);
+    if (!Number.isFinite(invId) || invId <= 0) throw new Error('Invoice ID tidak valid');
+
+    const force = String(req.query.force || '') === '1';
+    const inv = db.prepare('SELECT id, status, amount, qris_amount_unique FROM invoices WHERE id=?').get(invId);
+    if (!inv) throw new Error('Tagihan tidak ditemukan');
+    if (String(inv.status) !== 'unpaid') throw new Error('Hanya tagihan BELUM BAYAR yang bisa dibuat kode QRIS.');
+
+    if (!force && inv.qris_amount_unique) {
+      req.session._msg = { type: 'success', text: 'Kode QRIS sudah ada untuk tagihan ini.' };
+      return res.redirect('back');
+    }
+
+    const baseAmount = Number(inv.amount || 0);
+    if (!Number.isFinite(baseAmount) || baseAmount <= 0) throw new Error('Nominal tagihan tidak valid');
+
+    const exists = db.prepare('SELECT id FROM invoices WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1');
+    const update = db.prepare(`
+      UPDATE invoices
+      SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=CURRENT_TIMESTAMP
+      WHERE id=?
+    `);
+
+    let chosenCode = 0;
+    let chosenAmount = 0;
+
+    for (let i = 0; i < 50; i++) {
+      const code = 1 + Math.floor(Math.random() * 999);
+      const amount = baseAmount + code;
+      if (!exists.get('unpaid', amount, invId)) {
+        chosenCode = code;
+        chosenAmount = amount;
+        break;
+      }
+    }
+
+    if (!chosenAmount) {
+      for (let code = 1; code <= 999; code++) {
+        const amount = baseAmount + code;
+        if (!exists.get('unpaid', amount, invId)) {
+          chosenCode = code;
+          chosenAmount = amount;
+          break;
+        }
+      }
+    }
+
+    if (!chosenAmount) throw new Error('Gagal membuat nominal unik (slot 1-999 penuh).');
+
+    update.run(chosenCode, chosenAmount, invId);
+    req.session._msg = { type: 'success', text: `Kode QRIS dibuat: Rp ${Number(chosenAmount).toLocaleString('id-ID')} (kode ${chosenCode}).` };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal membuat kode QRIS: ' + e.message };
+  }
+  res.redirect('back');
+});
+
+router.post('/billing/:id/qris-clear', requireAdminSession, (req, res) => {
+  try {
+    const invId = Number(req.params.id);
+    if (!Number.isFinite(invId) || invId <= 0) throw new Error('Invoice ID tidak valid');
+    db.prepare(`
+      UPDATE invoices
+      SET qris_unique_code=NULL, qris_amount_unique=NULL, qris_assigned_at=NULL
+      WHERE id=?
+    `).run(invId);
+    req.session._msg = { type: 'success', text: 'Kode QRIS dihapus dari tagihan.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal menghapus kode QRIS: ' + e.message };
+  }
+  res.redirect('back');
+});
+
 router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
   try {
     const inv = billingSvc.getInvoiceById(req.params.id);
@@ -1269,6 +1386,10 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
       throw new Error('Bot WhatsApp belum terhubung. Silakan cek status WhatsApp di menu Admin.');
     }
 
+    const qrisAmountUnique = Number(inv.qris_amount_unique || 0) || 0;
+    const qrisCode = Number(inv.qris_unique_code || 0) || 0;
+    const qrisQrUrl = String(getSetting('qris_static_qr_url', '') || '').trim();
+
     // Hitung Tagihan
     const unpaidInvoices = billingSvc.getUnpaidInvoicesByCustomerId(customer.id);
     const totalTagihan = unpaidInvoices.reduce((sum, i) => sum + i.amount, 0);
@@ -1279,15 +1400,25 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
     const host = req.get('host');
     const loginLink = `${protocol}://${host}/customer/login`;
 
+    const templateQris = `Yth. *{{nama}}*,\n\nTagihan internet Anda untuk periode *{{periode}}*.\n\n📦 *Paket:* {{paket}}\n💳 *Pembayaran QRIS (Semua E-Wallet)*\n💰 *Nominal (WAJIB tepat):* Rp {{qris_nominal}}\n🏷️ *Kode:* {{qris_kode}}\n{{qris_qr}}\n\nCatatan: nominal harus sama persis agar sistem dapat mendeteksi pembayaran.\n\nTerima kasih.\nSalam,\nAdmin ${getSetting('company_header', 'ISP')}`;
+
     // Pesan Template (Sama dengan Broadcast Unpaid)
     const template = `Yth. *{{nama}}*,\n\nBerdasarkan data sistem kami, Anda memiliki tagihan internet yang *BELUM LUNAS*.\n\n📦 *Paket:* {{paket}}\n💰 *Total Tagihan:* Rp {{tagihan}}\n📅 *Periode:* {{rincian}}\n\nMohon segera melakukan pembayaran melalui portal pelanggan: {{link}}\n\nTerima kasih atas kerja samanya.\nSalam,\nAdmin ${getSetting('company_header', 'ISP')}`;
 
-    const formattedMsg = template
-      .replace(/{{nama}}/gi, customer.name || 'Pelanggan')
-      .replace(/{{tagihan}}/gi, totalTagihan.toLocaleString('id-ID'))
-      .replace(/{{rincian}}/gi, rincianBulan || '-')
-      .replace(/{{paket}}/gi, inv.package_name || '-')
-      .replace(/{{link}}/gi, loginLink);
+    const formattedMsg = (qrisAmountUnique > 0 && qrisCode > 0)
+      ? templateQris
+          .replace(/{{nama}}/gi, customer.name || 'Pelanggan')
+          .replace(/{{periode}}/gi, `${inv.period_month}/${inv.period_year}`)
+          .replace(/{{paket}}/gi, inv.package_name || '-')
+          .replace(/{{qris_nominal}}/gi, Number(qrisAmountUnique).toLocaleString('id-ID'))
+          .replace(/{{qris_kode}}/gi, String(qrisCode).padStart(3, '0'))
+          .replace(/{{qris_qr}}/gi, qrisQrUrl ? `🔗 QRIS: ${qrisQrUrl}` : '')
+      : template
+          .replace(/{{nama}}/gi, customer.name || 'Pelanggan')
+          .replace(/{{tagihan}}/gi, totalTagihan.toLocaleString('id-ID'))
+          .replace(/{{rincian}}/gi, rincianBulan || '-')
+          .replace(/{{paket}}/gi, inv.package_name || '-')
+          .replace(/{{link}}/gi, loginLink);
 
     const sent = await sendWA(customer.phone, formattedMsg);
     if (!sent) throw new Error('Gagal mengirim pesan melalui WhatsApp Bot.');
@@ -1607,6 +1738,7 @@ router.post('/settings', requireAdminSession, express.urlencoded({ extended: tru
     
     newSettings.login_otp_enabled = (newSettings.login_otp_enabled === 'true');
     newSettings.telegram_enabled = (newSettings.telegram_enabled === 'true');
+    newSettings.auto_backup_enabled = (newSettings.auto_backup_enabled === 'true');
 
     const success = saveSettings(newSettings);
     if (success) {
@@ -1624,6 +1756,230 @@ router.post('/settings', requireAdminSession, express.urlencoded({ extended: tru
     req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
   }
   res.redirect('/admin/settings');
+});
+
+// ─── BACKUP & RECOVERY ──────────────────────────────────────────────────────
+router.get('/backup', requireAdminSession, (req, res) => {
+  const result = backupSvc.listBackups();
+  res.render('admin/backup', {
+    title: 'Backup & Recovery',
+    company: company(),
+    activePage: 'backup',
+    msg: flashMsg(req),
+    backups: result.backups || [],
+    total: result.total || 0,
+    getSetting
+  });
+});
+
+router.post('/backup/create', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    const { type } = req.body;
+    let result;
+
+    if (type === 'all') {
+      result = backupSvc.backupAll();
+    } else if (type === 'database') {
+      result = backupSvc.backupDatabase();
+    } else if (type === 'settings') {
+      result = backupSvc.backupSettings();
+    } else {
+      req.session._msg = { type: 'error', text: 'Tipe backup tidak valid' };
+      return res.redirect('/admin/backup');
+    }
+
+    if (result.success) {
+      req.session._msg = { type: 'success', text: `Backup berhasil dibuat: ${result.fileName}` };
+    } else {
+      req.session._msg = { type: 'error', text: `Gagal backup: ${result.error}` };
+    }
+  } catch (e) {
+    req.session._msg = { type: 'error', text: `Gagal: ${e.message}` };
+  }
+  res.redirect('/admin/backup');
+});
+
+router.post('/backup/restore', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    const { fileName, type } = req.body;
+    let result;
+
+    if (type === 'database') {
+      result = backupSvc.restoreDatabase(fileName);
+    } else if (type === 'settings') {
+      result = backupSvc.restoreSettings(fileName);
+    } else {
+      req.session._msg = { type: 'error', text: 'Tipe restore tidak valid' };
+      return res.redirect('/admin/backup');
+    }
+
+    if (result.success) {
+      req.session._msg = { type: 'success', text: `Restore berhasil: ${fileName}` };
+    } else {
+      req.session._msg = { type: 'error', text: `Gagal restore: ${result.error}` };
+    }
+  } catch (e) {
+    req.session._msg = { type: 'error', text: `Gagal: ${e.message}` };
+  }
+  res.redirect('/admin/backup');
+});
+
+router.post('/backup/delete', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    const { fileName } = req.body;
+    const fs = require('fs');
+    const path = require('path');
+    const backupDir = path.join(__dirname, '../backups');
+    const backupFilePath = path.join(backupDir, fileName);
+
+    if (!fs.existsSync(backupFilePath)) {
+      req.session._msg = { type: 'error', text: 'File backup tidak ditemukan' };
+      return res.redirect('/admin/backup');
+    }
+
+    fs.unlinkSync(backupFilePath);
+    logger.info(`[Backup] Backup deleted: ${fileName}`);
+    req.session._msg = { type: 'success', text: `Backup berhasil dihapus: ${fileName}` };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: `Gagal menghapus: ${e.message}` };
+  }
+  res.redirect('/admin/backup');
+});
+
+router.post('/backup/cleanup', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    const { retentionDays } = req.body;
+    const result = backupSvc.cleanupOldBackups(parseInt(retentionDays) || 30);
+
+    if (result.success) {
+      req.session._msg = { type: 'success', text: `Cleanup selesai: ${result.deletedCount} backup lama dihapus` };
+    } else {
+      req.session._msg = { type: 'error', text: `Gagal cleanup: ${result.error}` };
+    }
+  } catch (e) {
+    req.session._msg = { type: 'error', text: `Gagal: ${e.message}` };
+  }
+  res.redirect('/admin/backup');
+});
+
+// ─── INVENTORY / WAREHOUSE ──────────────────────────────────────────────────
+router.get('/inventory', requireAdminSession, (req, res) => {
+  const items = inventorySvc.getAllItems(req.query.q);
+  const categories = inventorySvc.getAllCategories();
+  const logs = inventorySvc.getInventoryLogs(100);
+
+  res.render('admin/inventory', {
+    title: 'Manajemen Inventaris',
+    company: company(),
+    activePage: 'inventory',
+    msg: flashMsg(req),
+    items,
+    categories,
+    logs
+  });
+});
+
+router.post('/inventory/category/add', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    inventorySvc.createCategory(req.body);
+    req.session._msg = { type: 'success', text: 'Kategori berhasil ditambahkan.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+  }
+  res.redirect('/admin/inventory');
+});
+
+router.post('/inventory/category/delete/:id', requireAdminSession, (req, res) => {
+  try {
+    inventorySvc.deleteCategory(req.params.id);
+    req.session._msg = { type: 'success', text: 'Kategori berhasil dihapus.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+  }
+  res.redirect('/admin/inventory');
+});
+
+router.post('/inventory/item/add', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    inventorySvc.createItem(req.body);
+    req.session._msg = { type: 'success', text: 'Barang berhasil ditambahkan.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+  }
+  res.redirect('/admin/inventory');
+});
+
+router.post('/inventory/item/edit/:id', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    inventorySvc.updateItem(req.params.id, req.body);
+    req.session._msg = { type: 'success', text: 'Barang berhasil diperbarui.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+  }
+  res.redirect('/admin/inventory');
+});
+
+router.post('/inventory/stock/add', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    inventorySvc.addStock(req.body, req.session.adminUser || 'Admin');
+    req.session._msg = { type: 'success', text: 'Stok berhasil ditambahkan.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+  }
+  res.redirect('/admin/inventory');
+});
+
+router.get('/audit-logs', requireAdminSession, restrictToAdmin, (req, res) => {
+  const filters = {
+    action: req.query.action || null,
+    entity_type: req.query.entity_type || null,
+    limit: 100
+  };
+  const logs = auditSvc.getAuditTrail(filters);
+  const stats = auditSvc.getAuditStats();
+
+  res.render('admin/audit_logs', {
+    title: 'Audit Trail / Log Aktivitas',
+    company: company(),
+    activePage: 'audit_logs',
+    logs,
+    stats,
+    filters
+  });
+});
+
+// ─── MONITORING ──────────────────────────────────────────────────────────────
+router.get('/monitoring', requireAdminSession, restrictToAdmin, async (req, res) => {
+  const healthStatus = monitoringSvc.getHealthStatus();
+  const performanceSummary = monitoringSvc.getPerformanceSummary();
+  const dependencies = await diagnosticsSvc.checkDependencies();
+  const recentErrors = diagnosticsSvc.getRecentErrors(10);
+
+  res.render('admin/monitoring', {
+      title: 'Monitoring Sistem',
+      company: company(),
+      activePage: 'monitoring',
+      healthStatus,
+      performanceSummary,
+      dependencies,
+      recentErrors
+    });
+});
+
+router.get('/api/health', requireAdmin, (req, res) => {
+  const healthStatus = monitoringSvc.getHealthStatus();
+  res.json(healthStatus);
+});
+
+router.get('/api/metrics', requireAdmin, (req, res) => {
+  const metrics = monitoringSvc.getAllMetrics();
+  res.json(metrics);
+});
+
+router.get('/api/metrics/history', requireAdmin, (req, res) => {
+  const limit = parseInt(req.query.limit) || 10;
+  const history = monitoringSvc.getMetricsHistory(limit);
+  res.json(history);
 });
 
 // ─── API ROUTES (existing) ──────────────────────────────────────────────────
@@ -1776,6 +2132,77 @@ router.get('/vouchers', requireAdminSession, (req, res) => {
   });
 });
 
+router.get('/api/vouchers/template', requireAdminSession, (req, res) => {
+  const settings = getSettings();
+  res.json({
+    use_template: !!settings.voucher_print_use_template,
+    default_style: String(settings.voucher_print_default_style || ''),
+    header: String(settings.voucher_print_template_header || ''),
+    row: String(settings.voucher_print_template_row || ''),
+    footer: String(settings.voucher_print_template_footer || '')
+  });
+});
+
+router.post('/api/vouchers/template', requireAdminSession, restrictToAdmin, express.json({ limit: '1mb' }), (req, res) => {
+  try {
+    const useTemplate = !!req.body.use_template;
+    const defaultStyle = String(req.body.default_style || '').trim().toLowerCase();
+    const header = String(req.body.header || '');
+    const row = String(req.body.row || '');
+    const footer = String(req.body.footer || '');
+    saveSettings({
+      voucher_print_use_template: useTemplate,
+      voucher_print_default_style: defaultStyle,
+      voucher_print_template_header: header,
+      voucher_print_template_row: row,
+      voucher_print_template_footer: footer
+    });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/api/webhook/payment-notif/logs', requireAdminSession, (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 200));
+    const service = String(req.query.service || '').trim();
+    const q = String(req.query.q || '').trim();
+
+    const where = [];
+    const params = [];
+    if (service) {
+      where.push('service = ?');
+      params.push(service);
+    }
+    if (q) {
+      where.push('(content LIKE ? OR service LIKE ?)');
+      params.push(`%${q}%`, `%${q}%`);
+    }
+
+    const sql = `
+      SELECT id, created_at, service, content, parsed_amount, parsed_ok, matched_invoice_id, ip
+      FROM webhook_payment_notifs
+      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+      ORDER BY id DESC
+      LIMIT ?
+    `;
+    const rows = db.prepare(sql).all(...params, limit);
+    res.json({ ok: true, rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.post('/api/webhook/payment-notif/clear', requireAdminSession, restrictToAdmin, express.json(), (req, res) => {
+  try {
+    db.prepare('DELETE FROM webhook_payment_notifs').run();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 router.get('/vouchers/batches/:id/print', requireAdminSession, (req, res) => {
   const batchId = Number(req.params.id);
   const batch = db.prepare(`
@@ -1793,12 +2220,234 @@ router.get('/vouchers/batches/:id/print', requireAdminSession, (req, res) => {
     ORDER BY code ASC
   `).all(batchId);
 
+  const settings = getSettings();
+  const requestedStyle = String(req.query.style || '').trim().toLowerCase();
+  const style = requestedStyle || String(settings.voucher_print_default_style || '').trim().toLowerCase() || (settings.voucher_print_use_template ? 'template' : 'cards');
+
+  const escapeHtml = (s) => String(s ?? '').replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  const stripUnsafe = (html) => {
+    let out = String(html || '');
+    out = out.replace(/<\?(?:php)?[\s\S]*?\?>/gi, '');
+    out = out.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+    out = out.replace(/\son\w+\s*=\s*(['"]).*?\1/gi, '');
+    return out;
+  };
+
+  const applyVars = (tpl, vars) => {
+    let out = String(tpl || '');
+    out = out.replace(/%([a-zA-Z0-9_#]+)%/g, (m, k) => (vars[k] != null ? vars[k] : m));
+    out = out.replace(/\{\{\s*([a-zA-Z0-9_#]+)\s*\}\}/g, (m, k) => (vars[k] != null ? vars[k] : m));
+    return out;
+  };
+
+  const formatValidity = (v) => {
+    if (!v) return '-';
+    const s = String(v).trim();
+    const mDay = s.match(/^(\d+)\s*d$/i);
+    if (mDay) return `${Number(mDay[1])} hari`;
+    return s;
+  };
+
+  let renderedHtml = '';
+  let templateError = '';
+  const builtinTemplate = (name) => {
+    const phone = (Array.isArray(settings.whatsapp_admin_numbers) && settings.whatsapp_admin_numbers.length > 0)
+      ? ('+' + String(settings.whatsapp_admin_numbers[0]))
+      : String(settings.company_phone || '');
+    const companyName = settings.company_header || company();
+    const timeStamp = new Date().toISOString();
+    const priceNumber = Number(batch.price || 0);
+    const priceText = priceNumber.toLocaleString('id-ID');
+    const validityText = formatValidity(batch.validity);
+
+    const rows = (vouchers || []).map((v, i) => {
+      const credential = (String(v.code) === String(v.password))
+        ? escapeHtml(String(v.code))
+        : `U: ${escapeHtml(v.code)}<br>P: ${escapeHtml(v.password)}`;
+      return {
+        idx: i + 1,
+        username: escapeHtml(v.code),
+        password: escapeHtml(v.password),
+        credential,
+        profile: escapeHtml(batch.profile_name || v.profile_name || ''),
+        company: escapeHtml(companyName),
+        phone: escapeHtml(phone),
+        timeStamp: escapeHtml(timeStamp),
+        currency: 'Rp',
+        price: escapeHtml(String(priceNumber)),
+        priceText: escapeHtml(priceText),
+        validity: escapeHtml(batch.validity || ''),
+        validityText: escapeHtml(validityText),
+      };
+    });
+
+    if (name === 'mks') {
+      const css = `<style>
+@page{size:A4;margin:6mm}
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,sans-serif;color:#0f172a}
+.v-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.vc{border:1px solid #0f172a;border-radius:10px;min-height:110px;padding:8px;position:relative;break-inside:avoid;overflow:hidden}
+.vc:before{content:"";position:absolute;inset:0;background:linear-gradient(120deg,rgba(59,130,246,.03),rgba(16,185,129,.025))}
+.vc>*{position:relative}
+.vh{font-weight:900;font-size:11px;letter-spacing:.2px}
+.vp{position:absolute;top:8px;right:8px;font-size:10.5px;font-weight:800;background:rgba(16,185,129,.16);border:1px solid rgba(16,185,129,.35);padding:2px 7px;border-radius:999px}
+.vm{font-size:10px;color:#334155;margin-top:6px}
+.vu{font-weight:950;font-size:18px;letter-spacing:1px;margin-top:8px;font-family:Consolas,monospace;line-height:1.15}
+.vf{position:absolute;left:50%;bottom:6px;transform:translateX(-50%);font-size:9.5px;color:#334155;white-space:nowrap}
+</style>`;
+      const html = rows.map(r => `<div class="vc">
+  <div class="vh">${r.company}</div>
+  <div class="vp">${r.currency} ${r.priceText}</div>
+  <div class="vm">${r.profile} • ${r.validityText}</div>
+  <div class="vu">${r.credential}</div>
+  <div class="vf">WA: ${r.phone}</div>
+</div>`).join('\n');
+      return `${css}<div class="v-grid">\n${html}\n</div>`;
+    }
+
+    if (name === 'simple') {
+      const css = `<style>
+@page{size:A4;margin:6mm}
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,sans-serif;color:#0f172a}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.card{border:1.5px solid #334155;border-radius:10px;padding:8px 8px 22px;min-height:110px;position:relative;break-inside:avoid}
+.hd{font-weight:800;font-size:11px}
+.code{font-weight:900;font-size:22px;letter-spacing:2px;margin-top:6px;font-family:Consolas,monospace}
+.meta{font-size:10px;color:#334155;margin-top:4px}
+.wa{position:absolute;left:50%;bottom:6px;transform:translateX(-50%);font-size:9.5px;color:#334155;white-space:nowrap}
+</style>`;
+      const html = rows.map(r => `<div class="card">
+  <div class="hd">${r.company}</div>
+  <div class="meta">${r.profile} • ${r.validityText} • ${r.currency} ${r.priceText}</div>
+  <div class="code">${r.username}</div>
+  <div class="meta">${r.password}</div>
+  <div class="wa">WA: ${r.phone}</div>
+</div>`).join('\n');
+      return `${css}<div class="grid">\n${html}\n</div>`;
+    }
+
+    if (name === 'minimal') {
+      const css = `<style>
+@page{size:A4;margin:6mm}
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,sans-serif;color:#0f172a}
+.g{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.c{border:1px dashed #334155;border-radius:8px;padding:6px 6px 18px;min-height:84px;position:relative;break-inside:avoid}
+.t{font-weight:900;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.m{font-size:9.5px;color:#334155;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.k{font-weight:950;font-size:18px;letter-spacing:2px;margin-top:8px;font-family:Consolas,monospace}
+.w{position:absolute;left:6px;right:6px;bottom:5px;font-size:9px;color:#334155;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+</style>`;
+      const html = rows.map(r => `<div class="c">
+  <div class="t">${r.company}</div>
+  <div class="m">${r.profile}</div>
+  <div class="k">${r.username}</div>
+  <div class="w">${r.validityText} • ${r.currency} ${r.priceText} • ${r.phone}</div>
+</div>`).join('\n');
+      return `${css}<div class="g">\n${html}\n</div>`;
+    }
+
+    return '';
+  };
+
+  if (style === 'mks' || style === 'simple' || style === 'minimal') {
+    renderedHtml = builtinTemplate(style);
+  } else if (style === 'template') {
+    const headerTpl = String(settings.voucher_print_template_header || '');
+    const rowTpl = String(settings.voucher_print_template_row || '');
+    const footerTpl = String(settings.voucher_print_template_footer || '');
+
+    if (rowTpl.trim()) {
+      const looksLikePhpOnly = (tpl) => {
+        const s = String(tpl || '');
+        const hasHtml = /<\s*[a-zA-Z][^>]*>/.test(s);
+        const phpSignals = /(\$[a-zA-Z_])|(\bif\s*\()|(\bsubstr\s*\()|(\bstrlen\s*\()|(\belse(if)?\b)|(\bforeach\b)/.test(s);
+        const manyPhp = (s.match(/\$/g) || []).length >= 3;
+        return !hasHtml && (phpSignals || manyPhp);
+      };
+      const combined = `${headerTpl}\n${rowTpl}\n${footerTpl}`;
+      if (/<\?(?:php)?/i.test(combined) || looksLikePhpOnly(combined)) {
+        templateError = 'Template yang dipaste masih format PHP (Mikhmon). Di sini hanya mendukung template HTML + placeholder (%username% dll).';
+      }
+
+      const phone = (Array.isArray(settings.whatsapp_admin_numbers) && settings.whatsapp_admin_numbers.length > 0)
+        ? ('+' + String(settings.whatsapp_admin_numbers[0]))
+        : String(settings.company_phone || '');
+      const timeStamp = new Date().toISOString();
+      const priceNumber = Number(batch.price || 0);
+      const priceText = priceNumber.toLocaleString('id-ID');
+      const validityText = formatValidity(batch.validity);
+
+      const parts = [];
+      parts.push(stripUnsafe(applyVars(headerTpl, {
+        company: escapeHtml(settings.company_header || company()),
+        phone: escapeHtml(phone),
+        timeStamp: escapeHtml(timeStamp),
+        currency: 'Rp',
+        validityText: escapeHtml(validityText),
+        priceText: escapeHtml(priceText)
+      })));
+
+      vouchers.forEach((v, i) => {
+        const credential = (String(v.code) === String(v.password))
+          ? escapeHtml(String(v.code))
+          : `U: ${escapeHtml(v.code)}<br>P: ${escapeHtml(v.password)}`;
+        const vars = {
+          username: escapeHtml(v.code),
+          password: escapeHtml(v.password),
+          profile: escapeHtml(batch.profile_name || v.profile_name || ''),
+          validity: escapeHtml(batch.validity || ''),
+          validityText: escapeHtml(validityText),
+          price: escapeHtml(String(priceNumber)),
+          priceText: escapeHtml(priceText),
+          currency: 'Rp',
+          company: escapeHtml(settings.company_header || company()),
+          phone: escapeHtml(phone),
+          timeStamp: escapeHtml(timeStamp),
+          '#': escapeHtml(String(i + 1)),
+          credential
+        };
+        parts.push(stripUnsafe(applyVars(rowTpl, vars)));
+      });
+
+      parts.push(stripUnsafe(applyVars(footerTpl, {
+        company: escapeHtml(settings.company_header || company()),
+        phone: escapeHtml(phone),
+        timeStamp: escapeHtml(timeStamp),
+        currency: 'Rp',
+        validityText: escapeHtml(validityText),
+        priceText: escapeHtml(priceText)
+      })));
+
+      renderedHtml = parts.join('\n');
+    }
+  }
+
+  let finalStyle = style;
+  if (finalStyle === 'template') {
+    const s = String(renderedHtml || '').trim();
+    if (!s || !/<\s*[a-zA-Z][^>]*>/.test(s) || templateError) {
+      renderedHtml = '';
+      finalStyle = 'cards';
+    }
+  }
+
   res.render('admin/print_vouchers', {
     title: 'Cetak Voucher',
     company: company(),
-    settings: getSettings(),
+    settings,
     batch,
-    vouchers
+    vouchers,
+    style: finalStyle,
+    renderedHtml,
+    templateError
   });
 });
 
@@ -2129,8 +2778,115 @@ global.broadcastStatus = {
   total: 0,
   sent: 0,
   failed: 0,
-  startTime: null
+  startTime: null,
+  paused: false,
+  stopped: false,
+  currentBatch: 0,
+  messagesPerHour: 0,
+  hourlyLimit: 100
 };
+
+// Helper: Random delay generator untuk smart rate limiting
+function getRandomDelay(baseDelayMs, varianceMs = 3000) {
+  const minDelay = Math.max(baseDelayMs - varianceMs, 2000);
+  const maxDelay = baseDelayMs + varianceMs;
+  return Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+}
+
+// Helper: Exponential backoff untuk error handling
+function getBackoffDelay(attemptCount, baseDelayMs = 2000) {
+  const maxDelay = 30000;
+  const delay = Math.min(baseDelayMs * Math.pow(2, attemptCount), maxDelay);
+  return delay + Math.floor(Math.random() * 1000);
+}
+
+// Helper: Message variation untuk menghindari spam detection
+function addMessageVariation(message, index) {
+  const variations = [
+    '',
+    '\n\n_',
+    '\n\n•',
+    '\n\n▪',
+    '\n\n▫'
+  ];
+  const suffix = variations[index % variations.length];
+  return message + suffix;
+}
+
+// Helper: Cek apakah waktu aman untuk broadcast (hindari jam sibuk)
+function isSafeTimeToBroadcast() {
+  const now = new Date();
+  const hour = now.getHours();
+  // Hindari jam 00:00 - 06:00 (jam malam) dan jam 18:00 - 21:00 (jam sibuk)
+  return hour >= 8 && hour <= 17;
+}
+
+// Helper: Hitung delay berdasarkan jam (lebih lama di jam sibuk)
+function getTimeBasedDelay(baseDelayMs) {
+  const now = new Date();
+  const hour = now.getHours();
+  
+  // Jam sibuk (18:00 - 21:00): delay 2x lebih lama
+  if (hour >= 18 && hour <= 21) {
+    return baseDelayMs * 2;
+  }
+  
+  // Jam malam (00:00 - 06:00): delay 3x lebih lama
+  if (hour >= 0 && hour <= 6) {
+    return baseDelayMs * 3;
+  }
+  
+  // Jam normal: delay normal
+  return baseDelayMs;
+}
+
+// Helper: Cek duplicate message untuk menghindari spam
+function isDuplicateMessage(phone, message, messageHistory) {
+  const key = `${phone}_${message.substring(0, 50)}`;
+  const lastSent = messageHistory.get(key);
+  if (!lastSent) return false;
+  
+  const timeDiff = Date.now() - lastSent;
+  return timeDiff < 3600000; // 1 jam
+}
+
+// Helper: Cek apakah error adalah permanent (tidak perlu retry)
+function isPermanentError(errorMessage) {
+  const permanentErrorPatterns = [
+    /invalid.*number/i,
+    /number.*not.*found/i,
+    /phone.*not.*exist/i,
+    /blocked/i,
+    /banned/i,
+    /not.*registered/i,
+    /user.*not.*found/i,
+    /404/i,
+    /400/i
+  ];
+  
+  return permanentErrorPatterns.some(pattern => pattern.test(errorMessage));
+}
+
+// Helper: Cek apakah error adalah temporary (bisa retry)
+function isTemporaryError(errorMessage) {
+  const temporaryErrorPatterns = [
+    /timeout/i,
+    /network/i,
+    /connection/i,
+    /rate.*limit/i,
+    /too.*many/i,
+    /429/i,
+    /500/i,
+    /502/i,
+    /503/i,
+    /504/i
+  ];
+  
+  return temporaryErrorPatterns.some(pattern => pattern.test(errorMessage));
+}
+
+// Global message history untuk duplicate detection
+global.broadcastMessageHistory = new Map();
 
 router.get('/whatsapp', requireAdminSession, async (req, res) => {
   res.render('admin/whatsapp', {
@@ -2149,11 +2905,48 @@ router.get('/api/whatsapp/broadcast-status', requireAdminSession, (req, res) => 
   res.json(global.broadcastStatus);
 });
 
+// API: Pause Broadcast
+router.post('/api/whatsapp/broadcast-pause', requireAdminSession, (req, res) => {
+  if (!global.broadcastStatus.active) {
+    return res.json({ ok: false, error: 'Tidak ada broadcast yang sedang berjalan.' });
+  }
+  global.broadcastStatus.paused = true;
+  logger.info('[Broadcast] Broadcast dipause oleh admin.');
+  res.json({ ok: true, message: 'Broadcast berhasil dipause.' });
+});
+
+// API: Resume Broadcast
+router.post('/api/whatsapp/broadcast-resume', requireAdminSession, (req, res) => {
+  if (!global.broadcastStatus.active) {
+    return res.json({ ok: false, error: 'Tidak ada broadcast yang sedang berjalan.' });
+  }
+  global.broadcastStatus.paused = false;
+  logger.info('[Broadcast] Broadcast dilanjutkan oleh admin.');
+  res.json({ ok: true, message: 'Broadcast berhasil dilanjutkan.' });
+});
+
+// API: Stop Broadcast
+router.post('/api/whatsapp/broadcast-stop', requireAdminSession, (req, res) => {
+  if (!global.broadcastStatus.active) {
+    return res.json({ ok: false, error: 'Tidak ada broadcast yang sedang berjalan.' });
+  }
+  global.broadcastStatus.stopped = true;
+  global.broadcastStatus.paused = false;
+  logger.info('[Broadcast] Broadcast dihentikan oleh admin.');
+  res.json({ ok: true, message: 'Broadcast berhasil dihentikan.' });
+});
+
 router.post('/whatsapp/broadcast', requireAdminSession, express.urlencoded({ extended: true }), async (req, res) => {
   try {
-    const { target, message, delay: customDelay } = req.body;
+    const { target, message, delay: customDelay, batchSize: customBatchSize, hourlyLimit: customHourlyLimit } = req.body;
     if (!message) throw new Error('Pesan tidak boleh kosong');
-    const delayMs = (parseInt(customDelay) || getSetting('whatsapp_broadcast_delay', 2)) * 1000;
+    
+    // Smart Rate Limit Settings
+    const baseDelayMs = (parseInt(customDelay) || getSetting('whatsapp_broadcast_delay', 5)) * 1000; // Default 5 detik
+    const batchSize = parseInt(customBatchSize) || 15; // Default 15 pesan per batch (lebih aman)
+    const batchPauseMs = 120000; // Pause 2 menit setelah setiap batch (lebih aman)
+    const hourlyLimit = parseInt(customHourlyLimit) || 80; // Default 80 pesan per jam (lebih aman)
+    
     if (customDelay) {
       const v = parseInt(customDelay);
       if (Number.isFinite(v) && v >= 1 && v <= 60) {
@@ -2194,51 +2987,135 @@ router.post('/whatsapp/broadcast', requireAdminSession, express.urlencoded({ ext
 
     const { sendWA } = await import('../services/whatsappBot.mjs');
     
-    // Initialize Tracker
+    // Initialize Tracker dengan Smart Rate Limit
     global.broadcastStatus = {
       active: true,
       total: uniqueCustomers.length,
       sent: 0,
       failed: 0,
-      startTime: new Date()
+      startTime: new Date(),
+      paused: false,
+      stopped: false,
+      currentBatch: 0,
+      messagesPerHour: 0,
+      hourlyLimit: hourlyLimit
     };
 
     const sendMessageAsync = async () => {
-      for (const cust of uniqueCustomers) {
-        try {
-          await new Promise(r => setTimeout(r, delayMs)); 
-          
-          // Hitung Tagihan
-          const unpaidInvoices = billingSvc.getUnpaidInvoicesByCustomerId(cust.id);
-          const totalTagihan = unpaidInvoices.reduce((sum, inv) => sum + inv.amount, 0);
-          const rincianBulan = unpaidInvoices.map(inv => `${inv.period_month}/${inv.period_year}`).join(', ');
-          
-          // Generate Link Login
-          const protocol = req.protocol;
-          const host = req.get('host');
-          const loginLink = `${protocol}://${host}/customer/login`;
+      let batchCount = 0;
+      let messagesInCurrentHour = 0;
+      let hourStartTime = Date.now();
+      
+      for (let i = 0; i < uniqueCustomers.length; i++) {
+        // Cek jika broadcast dihentikan
+        if (global.broadcastStatus.stopped) {
+          logger.info('[Broadcast] Broadcast dihentikan oleh admin.');
+          break;
+        }
+        
+        // Cek jika broadcast dipause
+        while (global.broadcastStatus.paused) {
+          await new Promise(r => setTimeout(r, 2000));
+          if (global.broadcastStatus.stopped) break;
+        }
+        
+        if (global.broadcastStatus.stopped) break;
 
-          // Format Pesan
-          let formattedMsg = message
-            .replace(/{{nama}}/gi, cust.name || 'Pelanggan')
-            .replace(/{{tagihan}}/gi, totalTagihan.toLocaleString('id-ID'))
-            .replace(/{{rincian}}/gi, rincianBulan || '-')
-            .replace(/{{paket}}/gi, cust.package_name || '-')
-            .replace(/{{link}}/gi, loginLink);
+        // Hourly Rate Limiting
+        const elapsedHour = Date.now() - hourStartTime;
+        if (elapsedHour >= 3600000) { // 1 jam
+          messagesInCurrentHour = 0;
+          hourStartTime = Date.now();
+        }
+        
+        if (messagesInCurrentHour >= hourlyLimit) {
+          const waitTime = 3600000 - elapsedHour;
+          logger.info(`[Broadcast] Hourly limit tercapai (${hourlyLimit} pesan). Menunggu ${Math.floor(waitTime / 60000)} menit...`);
+          await new Promise(r => setTimeout(r, waitTime));
+          messagesInCurrentHour = 0;
+          hourStartTime = Date.now();
+        }
 
-          await sendWA(cust.phone, formattedMsg);
-          global.broadcastStatus.sent++;
-        } catch (e) {
-          logger.error(`[Broadcast] Gagal kirim ke ${cust.phone}: ${e.message}`);
-          global.broadcastStatus.failed++;
+        const cust = uniqueCustomers[i];
+        let attemptCount = 0;
+        const maxAttempts = 3;
+        
+        while (attemptCount < maxAttempts) {
+          try {
+            // Smart Random Delay
+            const randomDelay = getRandomDelay(baseDelayMs, 2000);
+            await new Promise(r => setTimeout(r, randomDelay));
+            
+            // Hitung Tagihan
+            const unpaidInvoices = billingSvc.getUnpaidInvoicesByCustomerId(cust.id);
+            const totalTagihan = unpaidInvoices.reduce((sum, inv) => sum + inv.amount, 0);
+            const rincianBulan = unpaidInvoices.map(inv => `${inv.period_month}/${inv.period_year}`).join(', ');
+            
+            // Generate Link Login
+            const protocol = req.protocol;
+            const host = req.get('host');
+            const loginLink = `${protocol}://${host}/customer/login`;
+
+            // Format Pesan dengan variation untuk menghindari spam detection
+            let formattedMsg = message
+              .replace(/{{nama}}/gi, cust.name || 'Pelanggan')
+              .replace(/{{tagihan}}/gi, totalTagihan.toLocaleString('id-ID'))
+              .replace(/{{rincian}}/gi, rincianBulan || '-')
+              .replace(/{{paket}}/gi, cust.package_name || '-')
+              .replace(/{{link}}/gi, loginLink);
+            
+            // Add subtle variation untuk menghindari spam detection
+            formattedMsg = addMessageVariation(formattedMsg, i);
+
+            await sendWA(cust.phone, formattedMsg);
+            global.broadcastStatus.sent++;
+            messagesInCurrentHour++;
+            global.broadcastStatus.messagesPerHour = messagesInCurrentHour;
+            batchCount++;
+            
+            // Batch Processing: Pause setelah N pesan
+            if (batchCount >= batchSize && i < uniqueCustomers.length - 1) {
+              logger.info(`[Broadcast] Selesai batch ${global.broadcastStatus.currentBatch + 1} (${batchSize} pesan). Pause ${Math.floor(batchPauseMs / 1000)} detik...`);
+              global.broadcastStatus.currentBatch++;
+              await new Promise(r => setTimeout(r, batchPauseMs));
+              batchCount = 0;
+            }
+            
+            break; // Sukses, keluar dari retry loop
+          } catch (e) {
+            attemptCount++;
+            const errorMsg = e.message || e.toString();
+            
+            // Cek apakah error permanent (tidak perlu retry)
+            if (isPermanentError(errorMsg)) {
+              logger.warn(`[Broadcast] SKIP: Error permanent untuk ${cust.phone} - ${errorMsg}`);
+              global.broadcastStatus.failed++;
+              break; // Skip retry langsung ke pelanggan berikutnya
+            }
+            
+            // Error temporary, bisa retry
+            logger.error(`[Broadcast] Gagal kirim ke ${cust.phone} (attempt ${attemptCount}/${maxAttempts}): ${errorMsg}`);
+            
+            if (attemptCount >= maxAttempts) {
+              logger.warn(`[Broadcast] Max attempts tercapai untuk ${cust.phone}`);
+              global.broadcastStatus.failed++;
+            } else {
+              // Exponential backoff untuk retry
+              const backoffDelay = getBackoffDelay(attemptCount);
+              logger.info(`[Broadcast] Retry ke ${cust.phone} dalam ${Math.floor(backoffDelay / 1000)} detik...`);
+              await new Promise(r => setTimeout(r, backoffDelay));
+            }
+          }
         }
       }
+      
       global.broadcastStatus.active = false;
+      logger.info(`[Broadcast] Selesai. Terkirim: ${global.broadcastStatus.sent}, Gagal: ${global.broadcastStatus.failed}`);
     };
     
     sendMessageAsync(); 
 
-    req.session._msg = { type: 'success', text: `Broadcast sedang diproses untuk dikirim ke ${uniqueCustomers.length} pelanggan.` };
+    req.session._msg = { type: 'success', text: `Broadcast sedang diproses untuk dikirim ke ${uniqueCustomers.length} pelanggan dengan smart rate limit.` };
   } catch (e) {
     req.session._msg = { type: 'error', text: 'Gagal Broadcast: ' + e.message };
   }
@@ -2366,6 +3243,15 @@ router.get('/api/routers/:id/test', requireAdmin, async (req, res) => {
       return res.json({ success: true, message: 'Koneksi ke Router Berhasil!' });
     }
     throw new Error('Gagal terhubung ke router');
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+router.post('/api/routers/:id/setup-firewall', requireAdmin, async (req, res) => {
+  try {
+    const result = await mikrotikService.setupIsolirFirewall(req.params.id);
+    res.json(result);
   } catch (e) {
     res.json({ success: false, error: e.message });
   }

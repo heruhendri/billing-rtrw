@@ -5,18 +5,24 @@ const db = require('../config/database');
 
 // ─── CUSTOMERS ───────────────────────────────────────────────
 function getAllCustomers(search = '') {
+  const now = new Date();
+  const month = now.getMonth() + 1;
+  const year = now.getFullYear();
+
   const base = `
     SELECT c.*, p.name as package_name, p.price as package_price,
-           p.speed_down, p.speed_up,
+           p.speed_down, p.speed_up, p.fup_limit_gb, p.use_fup,
            r.name as router_name,
            o.name as olt_name,
            odp.name as odp_name,
-           (SELECT COUNT(*) FROM invoices WHERE customer_id=c.id AND status='unpaid') as unpaid_count
+           (SELECT COUNT(*) FROM invoices WHERE customer_id=c.id AND status='unpaid') as unpaid_count,
+           u.bytes_in, u.bytes_out
     FROM customers c
     LEFT JOIN packages p ON c.package_id = p.id
     LEFT JOIN routers r ON c.router_id = r.id
     LEFT JOIN olts o ON c.olt_id = o.id
     LEFT JOIN odps odp ON c.odp_id = odp.id
+    LEFT JOIN customer_usage u ON u.customer_id = c.id AND u.period_month = ${month} AND u.period_year = ${year}
   `;
   if (search) {
     const s = `%${search}%`;
@@ -39,8 +45,8 @@ function getCustomerById(id) {
 
 function createCustomer(data) {
   return db.prepare(`
-    INSERT INTO customers (name, phone, email, address, package_id, router_id, olt_id, odp_id, pon_port, lat, lng, genieacs_tag, pppoe_username, isolir_profile, status, install_date, notes, auto_isolate, isolate_day)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO customers (name, phone, email, address, package_id, router_id, olt_id, odp_id, pon_port, lat, lng, genieacs_tag, pppoe_username, isolir_profile, status, install_date, notes, auto_isolate, isolate_day, connection_type, static_ip, mac_address)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     data.name, data.phone || '', data.email || '', data.address || '',
     data.package_id ? parseInt(data.package_id) : null,
@@ -55,13 +61,16 @@ function createCustomer(data) {
     data.status || 'active',
     data.install_date || null, data.notes || '',
     data.auto_isolate !== undefined ? parseInt(data.auto_isolate) : 1,
-    data.isolate_day !== undefined ? parseInt(data.isolate_day) : 10
+    data.isolate_day !== undefined ? parseInt(data.isolate_day) : 10,
+    data.connection_type || 'pppoe',
+    data.static_ip || '',
+    data.mac_address || ''
   );
 }
 
 function updateCustomer(id, data) {
   return db.prepare(`
-    UPDATE customers SET name=?, phone=?, email=?, address=?, package_id=?, router_id=?, olt_id=?, odp_id=?, pon_port=?, lat=?, lng=?, genieacs_tag=?, pppoe_username=?, isolir_profile=?, status=?, install_date=?, notes=?, auto_isolate=?, isolate_day=?
+    UPDATE customers SET name=?, phone=?, email=?, address=?, package_id=?, router_id=?, olt_id=?, odp_id=?, pon_port=?, lat=?, lng=?, genieacs_tag=?, pppoe_username=?, isolir_profile=?, status=?, install_date=?, notes=?, auto_isolate=?, isolate_day=?, cable_path=?, connection_type=?, static_ip=?, mac_address=?
     WHERE id=?
   `).run(
     data.name, data.phone || '', data.email || '', data.address || '',
@@ -78,11 +87,28 @@ function updateCustomer(id, data) {
     data.install_date || null, data.notes || '',
     data.auto_isolate !== undefined ? parseInt(data.auto_isolate) : 1,
     data.isolate_day !== undefined ? parseInt(data.isolate_day) : 10,
+    data.cable_path || null,
+    data.connection_type || 'pppoe',
+    data.static_ip || '',
+    data.mac_address || '',
     id
   );
 }
 
-function deleteCustomer(id) {
+function updateCustomerCablePath(id, path) {
+  return db.prepare('UPDATE customers SET cable_path = ? WHERE id = ?').run(path, id);
+}
+
+async function deleteCustomer(id) {
+  const customer = getCustomerById(id);
+  if (customer && customer.connection_type === 'static' && customer.static_ip) {
+    const mikrotikSvc = require('./mikrotikService');
+    try {
+      await mikrotikSvc.removeStaticIp(customer.static_ip, customer.router_id);
+    } catch (e) {
+      console.error('Failed to remove static IP from MikroTik during customer deletion:', e);
+    }
+  }
   return db.prepare('DELETE FROM customers WHERE id=?').run(id);
 }
 
@@ -111,18 +137,48 @@ function getPackageById(id) {
 function createPackage(data) {
   const down = Math.round(parseFloat(data.speed_down || 0) * 1000);
   const up = Math.round(parseFloat(data.speed_up || 0) * 1000);
+  const n_down = Math.round(parseFloat(data.night_speed_down || 0) * 1000);
+  const n_up = Math.round(parseFloat(data.night_speed_up || 0) * 1000);
+  const f_down = Math.round(parseFloat(data.fup_speed_down || 0) * 1000);
+  const f_limit = parseFloat(data.fup_limit_gb || 0);
+
   return db.prepare(`
-    INSERT INTO packages (name, price, speed_down, speed_up, description)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(data.name, parseInt(data.price) || 0, down, up, data.description || '');
+    INSERT INTO packages (
+      name, price, speed_down, speed_up, 
+      use_night_speed, night_profile_name, night_speed_down, night_speed_up, 
+      use_fup, fup_profile_name, fup_limit_gb, fup_speed_down, 
+      description
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    data.name, parseInt(data.price) || 0, down, up, 
+    data.use_night_speed ? 1 : 0, data.night_profile_name || null, n_down, n_up,
+    data.use_fup ? 1 : 0, data.fup_profile_name || null, f_limit, f_down,
+    data.description || ''
+  );
 }
 
 function updatePackage(id, data) {
   const down = Math.round(parseFloat(data.speed_down || 0) * 1000);
   const up = Math.round(parseFloat(data.speed_up || 0) * 1000);
+  const n_down = Math.round(parseFloat(data.night_speed_down || 0) * 1000);
+  const n_up = Math.round(parseFloat(data.night_speed_up || 0) * 1000);
+  const f_down = Math.round(parseFloat(data.fup_speed_down || 0) * 1000);
+  const f_limit = parseFloat(data.fup_limit_gb || 0);
+
   return db.prepare(`
-    UPDATE packages SET name=?, price=?, speed_down=?, speed_up=?, description=?, is_active=? WHERE id=?
-  `).run(data.name, parseInt(data.price) || 0, down, up, data.description || '', data.is_active == '1' ? 1 : 0, id);
+    UPDATE packages 
+    SET name=?, price=?, speed_down=?, speed_up=?, 
+        use_night_speed=?, night_profile_name=?, night_speed_down=?, night_speed_up=?, 
+        use_fup=?, fup_profile_name=?, fup_limit_gb=?, fup_speed_down=?, 
+        description=?, is_active=? 
+    WHERE id=?
+  `).run(
+    data.name, parseInt(data.price) || 0, down, up, 
+    data.use_night_speed ? 1 : 0, data.night_profile_name || null, n_down, n_up,
+    data.use_fup ? 1 : 0, data.fup_profile_name || null, f_limit, f_down,
+    data.description || '', data.is_active == '1' ? 1 : 0, id
+  );
 }
 
 function deletePackage(id) {
@@ -160,11 +216,19 @@ async function suspendCustomer(id) {
   if (!customer) throw new Error('Pelanggan tidak ditemukan');
   
   updateCustomer(id, { ...customer, status: 'suspended' });
-  
-  if (customer.pppoe_username) {
-    const mikrotikSvc = require('./mikrotikService');
+  const mikrotikSvc = require('./mikrotikService');
+
+  if (customer.connection_type === 'static' && customer.static_ip) {
+    const pkg = getPackageById(customer.package_id);
+    const limit = pkg ? `${Math.round(pkg.speed_up/1000)}M/${Math.round(pkg.speed_down/1000)}M` : '5M/5M';
+    await mikrotikSvc.manageStaticIp({
+      ip: customer.static_ip,
+      name: customer.name,
+      limit: limit,
+      isolate: true
+    }, customer.router_id);
+  } else if (customer.pppoe_username) {
     const isolirProfile = customer.isolir_profile || 'isolir';
-    // setPppoeProfile sudah otomatis melakukan kick jika profile berubah
     await mikrotikSvc.setPppoeProfile(customer.pppoe_username, isolirProfile, customer.router_id);
   }
   return true;
@@ -175,12 +239,20 @@ async function activateCustomer(id) {
   if (!customer) throw new Error('Pelanggan tidak ditemukan');
   
   updateCustomer(id, { ...customer, status: 'active' });
-  
-  if (customer.pppoe_username) {
-    const mikrotikSvc = require('./mikrotikService');
+  const mikrotikSvc = require('./mikrotikService');
+
+  if (customer.connection_type === 'static' && customer.static_ip) {
+    const pkg = getPackageById(customer.package_id);
+    const limit = pkg ? `${Math.round(pkg.speed_up/1000)}M/${Math.round(pkg.speed_down/1000)}M` : '5M/5M';
+    await mikrotikSvc.manageStaticIp({
+      ip: customer.static_ip,
+      name: customer.name,
+      limit: limit,
+      isolate: false
+    }, customer.router_id);
+  } else if (customer.pppoe_username) {
     const pkg = getPackageById(customer.package_id);
     const targetProfile = pkg ? pkg.name : 'default';
-    // setPppoeProfile sudah otomatis melakukan kick jika profile berubah
     await mikrotikSvc.setPppoeProfile(customer.pppoe_username, targetProfile, customer.router_id);
   }
   return true;
@@ -189,5 +261,5 @@ async function activateCustomer(id) {
 module.exports = {
   getAllCustomers, getCustomerById, createCustomer, updateCustomer, deleteCustomer, getCustomerStats,
   getAllPackages, getPackageById, createPackage, updatePackage, deletePackage,
-  suspendCustomer, activateCustomer, findCustomerByAny
+  suspendCustomer, activateCustomer, findCustomerByAny, updateCustomerCablePath
 };

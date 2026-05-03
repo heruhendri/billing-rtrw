@@ -8,6 +8,8 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <link rel="stylesheet" href="/css/admin.css">
   <style>
+    .usage-bar { height: 4px; background: var(--bg3); border-radius: 2px; margin: 4px 0; overflow: hidden; width: 100px; }
+    .usage-fill { height: 100%; width: var(--p, 0%); background: var(--b, var(--primary)); transition: width 0.3s; }
     #picker-map { height: 400px; width: 100%; border-radius: 8px; margin-bottom: 15px; }
     .picker-icon { color: #3b82f6; font-size: 32px; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3)); display: block; width: 32px; height: 32px; text-align: center; line-height: 32px; text-shadow: -1.5px -1.5px 0 #fff, 1.5px -1.5px 0 #fff, -1.5px 1.5px 0 #fff, 1.5px 1.5px 0 #fff; }
   </style>
@@ -72,6 +74,7 @@
               <th><%= t('admin.customers.table.name', 'Nama') %></th>
               <th><%= t('admin.customers.table.phone_tag', 'Telepon / Tag ONU') %></th>
               <th><%= t('admin.customers.table.package', 'Paket') %></th>
+              <th>Usage (FUP)</th>
               <th><%= t('admin.customers.table.address', 'Alamat') %></th>
               <th><%= t('admin.customers.table.status', 'Status') %></th>
               <th><%= t('admin.customers.table.unpaid', 'Tagihan Belum Bayar') %></th>
@@ -95,6 +98,25 @@
                   <div><%= c.package_name %></div>
                   <div style="font-size:11px;color:var(--muted)"><%= (c.speed_down/1000).toFixed(0) %>/<%= (c.speed_up/1000).toFixed(0) %> Mbps &bull; Rp <%= c.package_price ? c.package_price.toLocaleString('id-ID') : '-' %></div>
                 <% } else { %><span class="text-muted">-</span><% } %>
+              </td>
+              <td>
+                <% 
+                  const usedGB = ((c.bytes_in || 0) + (c.bytes_out || 0)) / (1024 * 1024 * 1024);
+                  const limitGB = c.fup_limit_gb || 0;
+                  const useFup = c.use_fup === 1;
+                %>
+                <div class="fw6" style="font-size:12px"><%= usedGB.toFixed(2) %> GB</div>
+                <% if (useFup && limitGB > 0) { 
+                   const percent = Math.min(100, (usedGB / limitGB) * 100);
+                   const barColor = percent > 90 ? 'var(--danger)' : percent > 70 ? 'var(--warning)' : 'var(--success)';
+                %>
+                  <div class="usage-bar">
+                    <div class="usage-fill" style="--p: <%= percent %>%; --b: <%= barColor %>;"></div>
+                  </div>
+                  <div style="font-size:10px; color:var(--muted)">Limit: <%= limitGB %> GB</div>
+                <% } else { %>
+                  <div style="font-size:10px; color:var(--muted)">Unlimited</div>
+                <% } %>
               </td>
               <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><%= c.address || '-' %></td>
               <td>
@@ -167,15 +189,32 @@
             </select>
           </div>
           <div class="fg">
-            <label class="fl">PPPoE Username</label>
-            <input class="fc" name="pppoe_username" id="add_pppoe" list="add_pppoe_list" placeholder="Pilih / cari dari MikroTik">
-            <datalist id="add_pppoe_list"></datalist>
-            <div class="hint" id="add_pppoe_hint"></div>
+            <label class="fl">Metode Koneksi</label>
+            <select class="fs" name="connection_type" id="add_connection_type" onchange="toggleConnectionFields('add')">
+              <option value="pppoe">PPPoE (MikroTik)</option>
+              <option value="static">Static IP (MikroTik)</option>
+            </select>
           </div>
         </div>
         <div class="form-row">
+          <div class="fg" id="add_pppoe_field">
+            <label class="fl">PPPoE Username</label>
+            <input class="fc" name="pppoe_username" list="add_pppoe_list" placeholder="Pilih / cari dari MikroTik">
+            <datalist id="add_pppoe_list"></datalist>
+            <div class="hint" id="add_pppoe_hint"></div>
+          </div>
+          <div class="fg" id="add_static_field" style="display:none">
+            <label class="fl">IP Address Pelanggan</label>
+            <input class="fc" name="static_ip" placeholder="Contoh: 192.168.10.10">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="fg" id="add_mac_field" style="display:none">
+            <label class="fl">MAC Address (Optional)</label>
+            <input class="fc" name="mac_address" placeholder="Contoh: AA:BB:CC:DD:EE:FF">
+          </div>
           <div class="fg" style="max-width:200px">
-            <label class="fl">Profile Isolir</label>
+            <label class="fl">Profile Isolir / Address List</label>
             <select class="fs" name="isolir_profile" id="add_isolir_select">
               <option value="isolir">isolir</option>
             </select>
@@ -314,15 +353,30 @@
             </select>
           </div>
           <div class="fg">
+            <label class="fl">Metode Koneksi</label>
+            <select class="fs" name="connection_type" id="e_connection_type" onchange="toggleConnectionFields('edit')">
+              <option value="pppoe">PPPoE (MikroTik)</option>
+              <option value="static">Static IP (MikroTik)</option>
+            </select>
+          </div>
+          <div class="fg" id="e_pppoe_field">
             <label class="fl">PPPoE Username</label>
             <input class="fc" name="pppoe_username" id="e_pppoe" list="e_pppoe_list" placeholder="Pilih / cari dari MikroTik">
             <datalist id="e_pppoe_list"></datalist>
             <div class="hint" id="e_pppoe_hint"></div>
           </div>
+          <div class="fg" id="e_static_field" style="display:none">
+            <label class="fl">IP Address Pelanggan</label>
+            <input class="fc" name="static_ip" id="e_static_ip" placeholder="Contoh: 192.168.10.10">
+          </div>
         </div>
         <div class="form-row">
+          <div class="fg" id="e_mac_field" style="display:none">
+            <label class="fl">MAC Address (Optional)</label>
+            <input class="fc" name="mac_address" id="e_mac_address" placeholder="Contoh: AA:BB:CC:DD:EE:FF">
+          </div>
           <div class="fg" style="max-width:200px">
-            <label class="fl">Profile Isolir</label>
+            <label class="fl">Profile Isolir / Address List</label>
             <select class="fs" name="isolir_profile" id="e_isolir_profile">
               <option value="isolir">isolir</option>
             </select>
@@ -596,6 +650,23 @@ function updateInputs(lat, lng) {
   document.getElementById(prefix + 'lng').value = lng.toFixed(8);
 }
 
+function toggleConnectionFields(type) {
+  const connType = document.getElementById(type === 'add' ? 'add_connection_type' : 'e_connection_type').value;
+  const pppoeField = document.getElementById(type === 'add' ? 'add_pppoe_field' : 'e_pppoe_field');
+  const staticField = document.getElementById(type === 'add' ? 'add_static_field' : 'e_static_field');
+  const macField = document.getElementById(type === 'add' ? 'add_mac_field' : 'e_mac_field');
+
+  if (connType === 'pppoe') {
+    pppoeField.style.display = 'block';
+    staticField.style.display = 'none';
+    macField.style.display = 'none';
+  } else {
+    pppoeField.style.display = 'none';
+    staticField.style.display = 'block';
+    macField.style.display = 'block';
+  }
+}
+
 document.querySelectorAll('.mo').forEach(m=>m.addEventListener('click',e=>{if(e.target===m)m.classList.remove('show')}));
 function editCust(idx) {
   const c = customersData[idx];
@@ -607,8 +678,11 @@ function editCust(idx) {
   document.getElementById('e_address').value=c.address||'';
   document.getElementById('e_package').value=c.package_id||'';
   document.getElementById('e_router_id').value=c.router_id||'';
-  document.getElementById('e_tag').value=c.genieacs_tag||'';
+  document.getElementById('e_connection_type').value=c.connection_type||'pppoe';
   document.getElementById('e_pppoe').value=c.pppoe_username||'';
+  document.getElementById('e_static_ip').value=c.static_ip||'';
+  document.getElementById('e_mac_address').value=c.mac_address||'';
+  document.getElementById('e_tag').value=c.genieacs_tag||'';
   document.getElementById('e_olt_id').value=c.olt_id||'';
   document.getElementById('e_odp_id').value=c.odp_id||'';
   document.getElementById('e_pon_port').value=c.pon_port||'';
@@ -620,6 +694,7 @@ function editCust(idx) {
   document.getElementById('e_notes').value=c.notes||'';
   document.getElementById('e_auto_isolate').value=(c.auto_isolate !== undefined ? c.auto_isolate : 1);
   document.getElementById('e_isolate_day').value=(c.isolate_day || 10);
+  toggleConnectionFields('edit');
   openModal('editModal');
   loadPppoeEdit(c.router_id || '', c.id || '');
 }
