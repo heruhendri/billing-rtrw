@@ -1216,7 +1216,7 @@ router.get('/billing/:id/print', requireAdminSession, (req, res) => {
   res.render('admin/print_invoice', {
     invoice: inv,
     customer,
-    company: settings.company_header || 'ALIJAYA DIGITAL NETWORK',
+    company: settings.company_header || 'DIGITAL NETWORK',
     settings
   });
 });
@@ -3185,10 +3185,10 @@ router.post('/whatsapp/test-notification', requireAdminSession, async (req, res)
     if (whatsappStatus.connection !== 'open') {
       throw new Error('Bot WhatsApp belum terhubung. Silakan scan QR hingga status Terhubung.');
     }
-    const adminPhone = '087820851413';
+    const adminPhone = '08977345640';
     const msg =
       `🧪 *TEST NOTIFIKASI WHATSAPP*\n\n` +
-      `✅ Jika pesan ini masuk, berarti notifikasi WhatsApp dari Billing Alijaya System sudah berfungsi.\n` +
+      `✅ Jika pesan ini masuk, berarti notifikasi WhatsApp dari Billing System sudah berfungsi.\n` +
       `📅 Waktu: ${new Date().toLocaleString('id-ID')}`;
     const ok = await sendWA(adminPhone, msg);
     if (!ok) throw new Error('Gagal mengirim pesan test (sendWA=false).');

@@ -91,7 +91,7 @@ function getPhoneFromKey(key) {
 }
 
 function waBrand() {
-  const companyHeader = getSetting('company_header', 'ALIJAYA WEBPORTAL');
+  const companyHeader = getSetting('company_header', 'HENDRI WEBPORTAL');
   const footerInfo = getSetting('footer_info', 'Internet Tanpa Batas');
   const sep = '─'.repeat(30);
   return { companyHeader, footerInfo, sep };
@@ -402,7 +402,7 @@ async function resolveTargetTagForAdmin(tagToken) {
 }
 
 function formatListOnu(devices) {
-  const companyHeader = getSetting('company_header', 'ALIJAYA WEBPORTAL');
+  const companyHeader = getSetting('company_header', 'HENDRI WEBPORTAL');
   const footerInfo = getSetting('footer_info', 'Internet Tanpa Batas');
   
   const header = `📱 *DAFTAR ONU BER-TAG*
@@ -610,7 +610,7 @@ export async function startWhatsAppBot() {
     version,
     auth: state,
     printQRInTerminal: false,
-    browser: ['ALIJAYA WEBPORTAL', 'Chrome', '1.0.0'],
+    browser: ['Hendri WEBPORTAL', 'Chrome', '1.0.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: false,
