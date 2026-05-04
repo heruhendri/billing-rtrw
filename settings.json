@@ -20,7 +20,7 @@
   "company_email": "heruu2004@gmail.com",
   "company_address": "Jl. Kampung Belian Batam Center, Batam",
   "operational_hours": "Setiap Hari: 08.00 - 22.00 WIB",
-  "mikrotik_host": "192.168.8.1",
+  "mikrotik_host": "192.168.88.1",
   "mikrotik_user": "admin",
   "mikrotik_password": "admin",
   "mikrotik_port": 8728,
@@ -46,6 +46,8 @@
   "duitku_merchant_code": "",
   "duitku_api_key": "",
   "duitku_mode": "sandbox",
-  "office_lat": "-6.252118625253105",
-  "office_lng": " 107.9205270612316"
+  "office_lat": "1.563623",
+  "office_lng": "124.877533",
+  "qris_static_qr_url": "",
+  "auto_backup_enabled": false
 }
