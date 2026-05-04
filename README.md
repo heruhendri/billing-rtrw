@@ -183,7 +183,7 @@ pm2 start app-customer.js --name billing-rtrw
 
 ## Akses portal (setelah server jalan)
 
-Port mengikuti **`server_port`** di `settings.json` (default **3001**). Ganti `[IP-SERVER]` dengan IP atau hostname mesin Anda.
+Port mengikuti **`server_port`** di `settings.json` (default **4000**). Ganti `[IP-SERVER]` dengan IP atau hostname mesin Anda.
 
 | Portal | URL contoh |
 |--------|------------|
