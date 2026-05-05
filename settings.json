@@ -46,6 +46,10 @@
   "duitku_merchant_code": "",
   "duitku_api_key": "",
   "duitku_mode": "sandbox",
+  "digiflazz_username": "",
+  "digiflazz_api_key": "",
+  "digiflazz_webhook_secret": "",
+  "digiflazz_markup": 0,
   "office_lat": "-6.252118625253105",
   "office_lng": " 107.9205270612316"
 }
