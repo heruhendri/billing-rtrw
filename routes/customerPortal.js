@@ -11,6 +11,37 @@ const ticketSvc = require('../services/ticketService');
 const crypto = require('crypto');
 const db = require('../config/database');
 
+/** Cocokkan session login (tag GenieACS / PPPoE / nomor) ke baris customers */
+function findCustomerProfileByLoginId(loginId) {
+  if (!loginId) return null;
+  const cleanLogin = String(loginId).replace(/\D/g, '');
+  return customerSvc.getAllCustomers().find((c) => {
+    const cleanDb = String(c.phone || '').replace(/\D/g, '');
+    return (
+      cleanDb === cleanLogin ||
+      c.phone === loginId ||
+      c.genieacs_tag === loginId ||
+      c.pppoe_username === loginId
+    );
+  }) || null;
+}
+
+/** Rute portal yang boleh diakses saat status suspended (bayar publik, logout, dll.) */
+function isSuspendedPortalExemptPath(reqPath) {
+  const p = String(reqPath || '');
+  if (
+    p === '/login' ||
+    p === '/register' ||
+    p === '/login-otp' ||
+    p === '/logout'
+  ) return true;
+  if (p.startsWith('/public/')) return true;
+  if (p.startsWith('/payment/')) return true;
+  const staticPages = ['/tos', '/privacy', '/about', '/contact', '/check-billing', '/voucher'];
+  if (staticPages.includes(p)) return true;
+  return false;
+}
+
 function dashboardNotif(message, type = 'success') {
   if (!message) return null;
   return { text: message, type };
@@ -235,7 +266,8 @@ const {
 
 router.get('/login', (req, res) => {
   const settings = getSettingsWithCache();
-  res.render('login', { error: null, settings });
+  const packages = customerSvc.getAllPackages().filter(p => p.is_active !== 0);
+  res.render('login', { error: null, settings, packages });
 });
 
 router.get('/check-billing', async (req, res) => {
@@ -539,8 +571,14 @@ router.post('/register', async (req, res) => {
       const mapLine = (latStr && lngStr) ? `\n🗺️ *Lokasi:* https://maps.google.com/?q=${encodeURIComponent(latStr)},${encodeURIComponent(lngStr)}` : '';
       const finalAdminMsg = adminMsg + mapLine;
       
+      const seen = new Set();
       for (const adminPhone of settings.whatsapp_admin_numbers) {
-        try { await sendWA(adminPhone, finalAdminMsg); } catch(e) { /* ignore */ }
+        let digits = String(adminPhone || '').replace(/\D/g, '');
+        if (!digits) continue;
+        if (digits.startsWith('0')) digits = '62' + digits.slice(1);
+        if (seen.has(digits)) continue;
+        seen.add(digits);
+        try { await sendWA(digits, finalAdminMsg); } catch(e) { /* ignore */ }
       }
     }
 
@@ -605,9 +643,11 @@ router.post('/login', async (req, res) => {
   // 3. Tahap 3: Verifikasi Akhir
   if (!device && !customer) {
     logger.warn('[Login] Gagal: pelanggan tidak ditemukan.');
+    const packages = customerSvc.getAllPackages().filter(p => p.is_active !== 0);
     return res.render('login', { 
       error: 'Data pelanggan tidak ditemukan. Pastikan nomor WhatsApp sudah benar.', 
-      settings 
+      settings,
+      packages
     });
   }
 
@@ -649,7 +689,8 @@ router.post('/login', async (req, res) => {
         logger.info('[Login] OTP dikirim via WhatsApp.');
       } catch (e) {
         logger.error(`[Login] Gagal kirim OTP via WhatsApp: ${e.message}`);
-        return res.render('login', { error: e.message, settings });
+        const packages = customerSvc.getAllPackages().filter(p => p.is_active !== 0);
+        return res.render('login', { error: e.message, settings, packages });
       }
     }
 
@@ -659,6 +700,9 @@ router.post('/login', async (req, res) => {
   // --- DIRECT LOGIN ---
   logger.info('[Login] Login direct berhasil.');
   req.session.phone = effectiveTag;
+  if (customer && customer.status === 'suspended') {
+    return res.redirect('/isolated');
+  }
   return res.redirect('/customer/dashboard');
 });
 
@@ -677,17 +721,34 @@ router.post('/login-otp', (req, res) => {
 
   if (Date.now() > pending.expiry) {
     delete req.session.pending_login;
-    return res.render('login', { error: 'Kode OTP telah kadaluarsa. Silakan login kembali.', settings });
+    const packages = customerSvc.getAllPackages().filter(p => p.is_active !== 0);
+    return res.render('login', { error: 'Kode OTP telah kadaluarsa. Silakan login kembali.', settings, packages });
   }
 
   if (otp === pending.otp) {
     logger.info('[Login] OTP berhasil diverifikasi.');
     req.session.phone = pending.effectiveTag;
     delete req.session.pending_login;
+    const custAfterOtp = customerSvc.findCustomerByAny(pending.phone);
+    if (custAfterOtp && custAfterOtp.status === 'suspended') {
+      return res.redirect('/isolated');
+    }
     return res.redirect('/customer/dashboard');
   } else {
     return res.render('login_otp', { error: 'Kode OTP salah. Silakan coba lagi.', settings, phone: pending.phone });
   }
+});
+
+// Pelanggan terisolir: paksa halaman /isolated, kecuali cek tagihan / bayar / logout
+router.use((req, res, next) => {
+  if (isSuspendedPortalExemptPath(req.path)) return next();
+  const loginId = req.session && req.session.phone;
+  if (!loginId) return next();
+  const profile = findCustomerProfileByLoginId(loginId);
+  if (profile && profile.status === 'suspended') {
+    return res.redirect('/isolated');
+  }
+  next();
 });
 
 router.get('/dashboard', async (req, res) => {
@@ -1202,17 +1263,29 @@ router.post('/tickets/create', async (req, res) => {
 
         // Kirim ke Admin
         if (settings.whatsapp_admin_numbers && settings.whatsapp_admin_numbers.length > 0) {
+          const seen = new Set();
           for (const adminPhone of settings.whatsapp_admin_numbers) {
-            await sendWA(adminPhone, waMsg);
+            let digits = String(adminPhone || '').replace(/\D/g, '');
+            if (!digits) continue;
+            if (digits.startsWith('0')) digits = '62' + digits.slice(1);
+            if (seen.has(digits)) continue;
+            seen.add(digits);
+            await sendWA(digits, waMsg);
           }
         }
 
         // Kirim ke semua Teknisi Aktif
         const techSvc = require('../services/techService');
         const technicians = techSvc.getAllTechnicians().filter(t => t.is_active === 1);
+        const seenTech = new Set();
         for (const tech of technicians) {
           if (tech.phone) {
-            await sendWA(tech.phone, waMsg);
+            let digits = String(tech.phone || '').replace(/\D/g, '');
+            if (!digits) continue;
+            if (digits.startsWith('0')) digits = '62' + digits.slice(1);
+            if (seenTech.has(digits)) continue;
+            seenTech.add(digits);
+            await sendWA(digits, waMsg);
           }
         }
       }
@@ -1320,6 +1393,10 @@ router.get('/payment/create/:invoiceId', async (req, res) => {
 /**
  * Webhook Callback (Multi-Gateway)
  */
+router.get('/payment/callback', (req, res) => {
+  res.json({ success: true, message: 'OK. Use POST for gateway notifications.' });
+});
+router.head('/payment/callback', (req, res) => res.status(200).end());
 router.post('/payment/callback', express.json(), async (req, res) => {
   const settings = getSettingsWithCache();
   const tripaySignature = req.headers['x-callback-signature'];
