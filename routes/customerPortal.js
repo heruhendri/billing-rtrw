@@ -11,6 +11,27 @@ const ticketSvc = require('../services/ticketService');
 const crypto = require('crypto');
 const db = require('../config/database');
 
+const waSendDedup = new Map();
+function normalizeWaDigits(input) {
+  let digits = String(input || '').replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.startsWith('0')) digits = '62' + digits.slice(1);
+  if (digits.length < 8) return '';
+  return digits;
+}
+function shouldSendWa(key, ttlMs = 15000) {
+  const now = Date.now();
+  const last = waSendDedup.get(key);
+  if (last && (now - last) < ttlMs) return false;
+  waSendDedup.set(key, now);
+  if (waSendDedup.size > 5000) {
+    for (const [k, t] of waSendDedup.entries()) {
+      if ((now - t) > 10 * 60 * 1000) waSendDedup.delete(k);
+    }
+  }
+  return true;
+}
+
 /** Cocokkan session login (tag GenieACS / PPPoE / nomor) ke baris customers */
 function findCustomerProfileByLoginId(loginId) {
   if (!loginId) return null;
@@ -999,7 +1020,31 @@ router.post('/change-ssid', async (req, res) => {
   req.session._msg = ok 
     ? { type: 'success', text: 'Nama WiFi (SSID) berhasil diubah.' }
     : { type: 'danger', text: 'Gagal mengubah SSID.' };
-    
+
+  // Kirim notifikasi WhatsApp ke pelanggan
+  if (ok) {
+    try {
+      const settings = getSettingsWithCache();
+      if (settings.whatsapp_enabled) {
+        const profile = findCustomerProfileByLoginId(phone);
+        if (profile && profile.phone) {
+          const { sendWA, whatsappStatus } = await import('../services/whatsappBot.mjs');
+          if (whatsappStatus && whatsappStatus.connection === 'open') {
+            const now = new Date().toLocaleString('id-ID');
+            const msg = `\ud83d\udcf6 *PERUBAHAN SSID WIFI*\n\n` +
+              `\ud83d\udc64 *Pelanggan:* ${profile.name}\n` +
+              `\ud83d\udd52 *Waktu:* ${now}\n\n` +
+              `SSID WiFi Anda sudah diperbarui menjadi:\n` +
+              `\ud83d\udce1 *${ssid}*\n\n` +
+              `Silakan pilih SSID baru di perangkat Anda untuk terhubung.\n` +
+              `\u26a0\ufe0f Jangan bagikan info ini ke orang lain.`;
+            await sendWA(profile.phone, msg);
+          }
+        }
+      }
+    } catch (e) { /* ignore WA notification errors */ }
+  }
+
   res.redirect('/customer/dashboard');
 });
 
@@ -1012,6 +1057,30 @@ router.post('/change-password', async (req, res) => {
   req.session._msg = ok
     ? { type: 'success', text: 'Password WiFi berhasil diubah.' }
     : { type: 'danger', text: 'Gagal mengubah password. Pastikan minimal 8 karakter.' };
+
+  // Kirim notifikasi WhatsApp ke pelanggan
+  if (ok) {
+    try {
+      const settings = getSettingsWithCache();
+      if (settings.whatsapp_enabled) {
+        const profile = findCustomerProfileByLoginId(phone);
+        if (profile && profile.phone) {
+          const { sendWA, whatsappStatus } = await import('../services/whatsappBot.mjs');
+          if (whatsappStatus && whatsappStatus.connection === 'open') {
+            const now = new Date().toLocaleString('id-ID');
+            const msg = `\ud83d\udd11 *PERUBAHAN PASSWORD WIFI*\n\n` +
+              `\ud83d\udc64 *Pelanggan:* ${profile.name}\n` +
+              `\ud83d\udd52 *Waktu:* ${now}\n\n` +
+              `Password WiFi Anda sudah diperbarui menjadi:\n` +
+              `\ud83d\udd10 *${password}*\n\n` +
+              `Silakan gunakan password baru untuk terhubung.\n` +
+              `\u26a0\ufe0f Jangan bagikan password ini ke orang lain.`;
+            await sendWA(profile.phone, msg);
+          }
+        }
+      }
+    } catch (e) { /* ignore WA notification errors */ }
+  }
 
   res.redirect('/customer/dashboard');
 });
@@ -1261,32 +1330,24 @@ router.post('/tickets/create', async (req, res) => {
                      `💬 *Pesan:* ${message}\n\n` +
                      `Silakan cek di panel Admin/Teknisi untuk menindaklanjuti.`;
 
-        // Kirim ke Admin
+        const recipients = new Set();
         if (settings.whatsapp_admin_numbers && settings.whatsapp_admin_numbers.length > 0) {
-          const seen = new Set();
           for (const adminPhone of settings.whatsapp_admin_numbers) {
-            let digits = String(adminPhone || '').replace(/\D/g, '');
-            if (!digits) continue;
-            if (digits.startsWith('0')) digits = '62' + digits.slice(1);
-            if (seen.has(digits)) continue;
-            seen.add(digits);
-            await sendWA(digits, waMsg);
+            const digits = normalizeWaDigits(adminPhone);
+            if (digits) recipients.add(digits);
           }
         }
-
-        // Kirim ke semua Teknisi Aktif
         const techSvc = require('../services/techService');
         const technicians = techSvc.getAllTechnicians().filter(t => t.is_active === 1);
-        const seenTech = new Set();
         for (const tech of technicians) {
-          if (tech.phone) {
-            let digits = String(tech.phone || '').replace(/\D/g, '');
-            if (!digits) continue;
-            if (digits.startsWith('0')) digits = '62' + digits.slice(1);
-            if (seenTech.has(digits)) continue;
-            seenTech.add(digits);
-            await sendWA(digits, waMsg);
-          }
+          const digits = normalizeWaDigits(tech.phone);
+          if (digits) recipients.add(digits);
+        }
+
+        for (const digits of recipients) {
+          const key = `ticket:new:${ticketId}:${digits}`;
+          if (!shouldSendWa(key)) continue;
+          await sendWA(digits, waMsg);
         }
       }
     } catch (waErr) {

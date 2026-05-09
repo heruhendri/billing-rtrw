@@ -26,6 +26,8 @@ const monitoringSvc = require('../services/monitoringService');
 const inventorySvc = require('../services/inventoryService');
 const auditSvc = require('../services/auditTrailService');
 const diagnosticsSvc = require('../services/diagnosticsService');
+const attendanceSvc = require('../services/attendanceService');
+const payrollSvc = require('../services/payrollService');
 const axios = require('axios');
 const crypto = require('crypto');
 
@@ -919,6 +921,104 @@ router.post('/collector-payments/:id/reject', requireAdminSession, express.urlen
   }
   res.redirect('back');
 });
+// ─── CASHIER ATTENDANCE ──────────────────────────────────────────────────────
+router.get('/cashiers/attendance', requireAdminSession, (req, res) => {
+  try {
+    const cashierId = req.session.cashierId || null;
+    const cashierName = req.session.cashierName || req.session.username || 'Kasir';
+    
+    if (!cashierId) {
+      req.session._msg = { type: 'error', text: 'Session kasir tidak valid' };
+      return res.redirect('/admin');
+    }
+
+    const todayAttendance = attendanceSvc.getTodayAttendance('cashier', cashierId);
+    const history = attendanceSvc.getAttendanceHistory('cashier', cashierId, 10);
+    
+    const now = new Date();
+    const summary = attendanceSvc.getMonthlyAttendanceSummary(
+      'cashier', 
+      cashierId, 
+      now.getFullYear(), 
+      now.getMonth() + 1
+    );
+    
+    res.render('admin/cashier_attendance', {
+      title: 'Absensi Saya',
+      company: company(),
+      activePage: 'cashier_attendance',
+      session: req.session,
+      cashierName,
+      todayAttendance,
+      history,
+      summary,
+      msg: flashMsg(req),
+      t: (key, defaultVal) => defaultVal || key
+    });
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal memuat absensi: ' + e.message };
+    res.redirect('/admin');
+  }
+});
+
+router.post('/cashiers/attendance/checkin', requireAdminSession, express.json(), (req, res) => {
+  try {
+    const cashierId = req.session.cashierId;
+    const cashierName = req.session.cashierName || req.session.username;
+    
+    if (!cashierId) {
+      return res.json({ success: false, message: 'Session kasir tidak valid' });
+    }
+    
+    const today = attendanceSvc.getTodayAttendance('cashier', cashierId);
+    if (today) {
+      return res.json({ success: false, message: 'Anda sudah melakukan check-in hari ini' });
+    }
+    
+    const result = attendanceSvc.checkIn({
+      employee_type: 'cashier',
+      employee_id: cashierId,
+      employee_name: cashierName,
+      lat: req.body.lat || '',
+      lng: req.body.lng || '',
+      note: req.body.note || ''
+    });
+    
+    res.json({ success: true, message: 'Check-in berhasil!', id: result.lastInsertRowid });
+  } catch (e) {
+    res.json({ success: false, message: 'Gagal check-in: ' + e.message });
+  }
+});
+
+router.post('/cashiers/attendance/checkout', requireAdminSession, express.json(), (req, res) => {
+  try {
+    const cashierId = req.session.cashierId;
+    
+    if (!cashierId) {
+      return res.json({ success: false, message: 'Session kasir tidak valid' });
+    }
+    
+    const today = attendanceSvc.getTodayAttendance('cashier', cashierId);
+    if (!today) {
+      return res.json({ success: false, message: 'Anda belum check-in hari ini' });
+    }
+    
+    if (today.status === 'checked_out') {
+      return res.json({ success: false, message: 'Anda sudah check-out hari ini' });
+    }
+    
+    attendanceSvc.checkOut(today.id, {
+      lat: req.body.lat || '',
+      lng: req.body.lng || '',
+      note: req.body.note || ''
+    });
+    
+    res.json({ success: true, message: 'Check-out berhasil!' });
+  } catch (e) {
+    res.json({ success: false, message: 'Gagal check-out: ' + e.message });
+  }
+});
+
 
 router.get('/cashiers/reports', requireAdminSession, (req, res) => {
   const allCashiers = adminSvc.getAllCashiers();
@@ -2730,6 +2830,24 @@ router.post('/api/device/:tag/ssid', requireAdmin, express.json(), async (req, r
   const { ssid } = req.body;
   if (!ssid) return res.status(400).json({ error: 'SSID required' });
   const ok = await customerDevice.updateSSID(req.params.tag, ssid);
+  // Kirim notifikasi WhatsApp ke pelanggan
+  if (ok) {
+    try {
+      const tag = req.params.tag;
+      const cust = customerSvc.findCustomerByAny(tag);
+      if (cust && cust.phone) {
+        const now = new Date().toLocaleString('id-ID');
+        const msg = `📶 *PERUBAHAN SSID WIFI*\n\n` +
+          `👤 *Pelanggan:* ${cust.name}\n` +
+          `🕒 *Waktu:* ${now}\n\n` +
+          `SSID WiFi Anda sudah diperbarui menjadi:\n` +
+          `📡 *${ssid}*\n\n` +
+          `Silakan pilih SSID baru di perangkat Anda untuk terhubung.\n` +
+          `⚠️ Jangan bagikan info ini ke orang lain.`;
+        await trySendWhatsappPayment(cust.phone, msg);
+      }
+    } catch (e) { logger.error('[Admin] Gagal kirim notif SSID via WA: ' + (e.message || e)); }
+  }
   res.json({ success: ok });
 });
 
@@ -2737,6 +2855,24 @@ router.post('/api/device/:tag/password', requireAdmin, express.json(), async (re
   const { password } = req.body;
   if (!password || password.length < 8) return res.status(400).json({ error: 'Password minimal 8 karakter' });
   const ok = await customerDevice.updatePassword(req.params.tag, password);
+  // Kirim notifikasi WhatsApp ke pelanggan
+  if (ok) {
+    try {
+      const tag = req.params.tag;
+      const cust = customerSvc.findCustomerByAny(tag);
+      if (cust && cust.phone) {
+        const now = new Date().toLocaleString('id-ID');
+        const msg = `🔑 *PERUBAHAN PASSWORD WIFI*\n\n` +
+          `👤 *Pelanggan:* ${cust.name}\n` +
+          `🕒 *Waktu:* ${now}\n\n` +
+          `Password WiFi Anda sudah diperbarui menjadi:\n` +
+          `🔐 *${password}*\n\n` +
+          `Silakan gunakan password baru untuk terhubung.\n` +
+          `⚠️ Jangan bagikan password ini ke orang lain.`;
+        await trySendWhatsappPayment(cust.phone, msg);
+      }
+    } catch (e) { logger.error('[Admin] Gagal kirim notif Password via WA: ' + (e.message || e)); }
+  }
   res.json({ success: ok });
 });
 
@@ -2750,7 +2886,27 @@ router.post('/api/bulk/ssid', requireAdmin, express.json(), async (req, res) => 
   if (!Array.isArray(tags) || !ssid) return res.status(400).json({ error: 'Tags and SSID required' });
   const results = [];
   for (const tag of tags) {
-    try { results.push({ tag, success: await customerDevice.updateSSID(tag, ssid) }); }
+    try {
+      const success = await customerDevice.updateSSID(tag, ssid);
+      results.push({ tag, success });
+      // Kirim notifikasi WhatsApp ke pelanggan
+      if (success) {
+        try {
+          const cust = customerSvc.findCustomerByAny(tag);
+          if (cust && cust.phone) {
+            const now = new Date().toLocaleString('id-ID');
+            const msg = `📶 *PERUBAHAN SSID WIFI*\n\n` +
+              `👤 *Pelanggan:* ${cust.name}\n` +
+              `🕒 *Waktu:* ${now}\n\n` +
+              `SSID WiFi Anda sudah diperbarui menjadi:\n` +
+              `📡 *${ssid}*\n\n` +
+              `Silakan pilih SSID baru di perangkat Anda untuk terhubung.\n` +
+              `⚠️ Jangan bagikan info ini ke orang lain.`;
+            await trySendWhatsappPayment(cust.phone, msg);
+          }
+        } catch (e) { /* ignore per-customer WA notification errors */ }
+      }
+    }
     catch (e) { results.push({ tag, success: false, error: e.message }); }
   }
   res.json({ results, total: tags.length, success: results.filter(r => r.success).length });
@@ -3926,9 +4082,9 @@ router.post('/api/routers/:id/setup-firewall', requireAdmin, async (req, res) =>
   }
 });
 
-router.get('/api/isolir-portal-script', requireAdmin, (req, res) => {
+router.get('/api/isolir-portal-script', requireAdmin, async (req, res) => {
   try {
-    const data = mikrotikService.generateIsolirPortalScript();
+    const data = await mikrotikService.generateIsolirPortalScript();
     res.json({ success: true, ...data });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
@@ -3960,6 +4116,343 @@ router.get('/api/mikrotik/users/:routerId', requireAdmin, async (req, res) => {
     res.json(filtered);
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+// ─── ATTENDANCE MANAGEMENT ───────────────────────────────────────────────────
+
+// Attendance dashboard
+router.get('/attendance', requireAdminSession, (req, res) => {
+  try {
+    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const attendances = attendanceSvc.getAttendanceByDate(date);
+    const stats = attendanceSvc.getAttendanceStats(date);
+    const lateCheckIns = attendanceSvc.getLateCheckIns(date);
+    const notCheckedOut = attendanceSvc.getNotCheckedOut(date);
+    
+    res.render('admin/attendance', {
+      title: 'Manajemen Absensi',
+      company: company(),
+      activePage: 'attendance',
+      session: req.session,
+      attendances,
+      stats,
+      lateCheckIns,
+      notCheckedOut,
+      selectedDate: date,
+      msg: flashMsg(req),
+      t: (key, defaultVal) => defaultVal || key
+    });
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal memuat data absensi: ' + e.message };
+    res.redirect('/admin');
+  }
+});
+
+// Get attendance by date range (API)
+router.get('/api/attendance/range', requireAdminSession, (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    if (!startDate || !endDate) {
+      return res.json({ success: false, message: 'Start date dan end date wajib diisi' });
+    }
+    
+    const attendances = attendanceSvc.getAttendanceByDateRange(startDate, endDate);
+    res.json({ success: true, data: attendances });
+  } catch (e) {
+    res.json({ success: false, message: e.message });
+  }
+});
+
+// Get employee attendance history
+router.get('/api/attendance/employee/:type/:id', requireAdminSession, (req, res) => {
+  try {
+    const { type, id } = req.params;
+    const limit = req.query.limit ? parseInt(req.query.limit) : 30;
+    const history = attendanceSvc.getAttendanceHistory(type, parseInt(id), limit);
+    res.json({ success: true, data: history });
+  } catch (e) {
+    res.json({ success: false, message: e.message });
+  }
+});
+
+// Get monthly summary
+router.get('/api/attendance/summary/:type/:id/:year/:month', requireAdminSession, (req, res) => {
+  try {
+    const { type, id, year, month } = req.params;
+    const summary = attendanceSvc.getMonthlyAttendanceSummary(
+      type, 
+      parseInt(id), 
+      parseInt(year), 
+      parseInt(month)
+    );
+    res.json({ success: true, data: summary });
+  } catch (e) {
+    res.json({ success: false, message: e.message });
+  }
+});
+
+// Update attendance (admin correction)
+router.post('/attendance/:id/update', requireAdminSession, express.json(), (req, res) => {
+  try {
+    const { id } = req.params;
+    const { check_in_time, check_in_note, check_out_time, check_out_note } = req.body;
+    
+    // Calculate duration if both times provided
+    let duration = 0;
+    if (check_in_time && check_out_time) {
+      const checkIn = new Date(check_in_time);
+      const checkOut = new Date(check_out_time);
+      duration = Math.floor((checkOut - checkIn) / 1000 / 60);
+    }
+    
+    attendanceSvc.updateAttendance(parseInt(id), {
+      check_in_time,
+      check_in_note: check_in_note || '',
+      check_out_time: check_out_time || null,
+      check_out_note: check_out_note || '',
+      work_duration_minutes: duration
+    });
+    
+    auditSvc.log('admin', req.session.username || 'admin', 'update_attendance', `Updated attendance #${id}`);
+    res.json({ success: true, message: 'Absensi berhasil diperbarui' });
+  } catch (e) {
+    res.json({ success: false, message: 'Gagal update absensi: ' + e.message });
+  }
+});
+
+// Delete attendance
+router.post('/attendance/:id/delete', requireAdminSession, (req, res) => {
+  try {
+    const { id } = req.params;
+    attendanceSvc.deleteAttendance(parseInt(id));
+    auditSvc.log('admin', req.session.username || 'admin', 'delete_attendance', `Deleted attendance #${id}`);
+    req.session._msg = { type: 'success', text: 'Absensi berhasil dihapus' };
+    res.redirect('/admin/attendance');
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal hapus absensi: ' + e.message };
+    res.redirect('/admin/attendance');
+  }
+});
+
+// Export attendance to Excel
+router.get('/attendance/export', requireAdminSession, (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    if (!startDate || !endDate) {
+      req.session._msg = { type: 'error', text: 'Tanggal mulai dan akhir wajib diisi' };
+      return res.redirect('/admin/attendance');
+    }
+    
+    const attendances = attendanceSvc.getAttendanceByDateRange(startDate, endDate);
+    
+    // Prepare data for Excel
+    const data = attendances.map(a => ({
+      'ID': a.id,
+      'Tipe Karyawan': a.employee_type,
+      'Nama': a.employee_name,
+      'Check In': a.check_in_time,
+      'Lokasi Check In': a.check_in_lat && a.check_in_lng ? `${a.check_in_lat}, ${a.check_in_lng}` : '-',
+      'Catatan Check In': a.check_in_note || '-',
+      'Check Out': a.check_out_time || '-',
+      'Lokasi Check Out': a.check_out_lat && a.check_out_lng ? `${a.check_out_lat}, ${a.check_out_lng}` : '-',
+      'Catatan Check Out': a.check_out_note || '-',
+      'Durasi (menit)': a.work_duration_minutes || 0,
+      'Status': a.status
+    }));
+    
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Absensi');
+    
+    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    
+    res.setHeader('Content-Disposition', `attachment; filename=absensi_${startDate}_${endDate}.xlsx`);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.send(buffer);
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal export: ' + e.message };
+    res.redirect('/admin/attendance');
+  }
+});
+
+
+// ─── PAYROLL / GAJI KARYAWAN ───────────────────────────────────────────────
+
+router.get('/payroll', requireAdmin, (req, res) => {
+  const now = new Date();
+  const month = parseInt(req.query.month) || (now.getMonth() + 1);
+  const year = parseInt(req.query.year) || now.getFullYear();
+
+  const employees = payrollSvc.getAllEmployees();
+  const slips = payrollSvc.getSlipsByPeriod(month, year);
+  const summary = payrollSvc.getPayrollSummary(month, year);
+
+  const { getSettingsWithCache } = require('../config/settingsManager');
+  res.render('admin/payroll', {
+    title: 'Gaji Karyawan',
+    company: getSettingsWithCache().company_header || 'My ISP',
+    employees,
+    slips,
+    summary,
+    selectedMonth: month,
+    selectedYear: year,
+    msg: req.session._msg || null
+  });
+  req.session._msg = null;
+});
+
+router.post('/payroll/settings', requireAdmin, (req, res) => {
+  try {
+    payrollSvc.upsertPayrollSetting(req.body);
+    req.session._msg = { type: 'success', text: 'Pengaturan gaji berhasil disimpan.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+  }
+  res.redirect('/admin/payroll');
+});
+
+router.post('/payroll/generate', requireAdmin, (req, res) => {
+  const month = parseInt(req.body.month);
+  const year = parseInt(req.body.year);
+  if (!month || !year) {
+    req.session._msg = { type: 'error', text: 'Bulan dan tahun diperlukan' };
+    return res.redirect('/admin/payroll');
+  }
+
+  const result = payrollSvc.generateAllSlips(month, year);
+  req.session._msg = { 
+    type: 'success', 
+    text: `Generate selesai: ${result.generated} berhasil, ${result.skipped} dilewati, ${result.errors.length} error.` 
+  };
+  res.redirect(`/admin/payroll?month=${month}&year=${year}`);
+});
+
+router.post('/payroll/slip/:id/deduction', requireAdmin, express.json(), (req, res) => {
+  try {
+    const { other_deduction, other_deduction_note } = req.body;
+    payrollSvc.updateSlipDeductions(req.params.id, other_deduction, other_deduction_note);
+    res.json({ success: true, message: 'Potongan diperbarui' });
+  } catch (e) {
+    res.json({ success: false, message: e.message });
+  }
+});
+
+router.post('/payroll/slip/:id/approve', requireAdmin, (req, res) => {
+  try {
+    payrollSvc.approveSlip(req.params.id);
+    req.session._msg = { type: 'success', text: 'Slip berhasil di-approve.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: e.message };
+  }
+  res.redirect('back');
+});
+
+router.post('/payroll/slip/:id/paid', requireAdmin, (req, res) => {
+  try {
+    payrollSvc.markSlipPaid(req.params.id);
+    req.session._msg = { type: 'success', text: 'Slip ditandai lunas (paid).' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: e.message };
+  }
+  res.redirect('back');
+});
+
+router.post('/payroll/slip/:id/delete', requireAdmin, (req, res) => {
+  try {
+    payrollSvc.deleteSlip(req.params.id);
+    req.session._msg = { type: 'success', text: 'Slip berhasil dihapus.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: e.message };
+  }
+  res.redirect('back');
+});
+
+router.post('/payroll/bulk-approve', requireAdmin, (req, res) => {
+  try {
+    payrollSvc.bulkApprove(parseInt(req.body.month), parseInt(req.body.year));
+    req.session._msg = { type: 'success', text: 'Semua slip draft berhasil di-approve.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: e.message };
+  }
+  res.redirect('back');
+});
+
+router.post('/payroll/bulk-paid', requireAdmin, (req, res) => {
+  try {
+    payrollSvc.bulkMarkPaid(parseInt(req.body.month), parseInt(req.body.year));
+    req.session._msg = { type: 'success', text: 'Semua slip approved ditandai lunas.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: e.message };
+  }
+  res.redirect('back');
+});
+
+router.post('/payroll/delete-drafts', requireAdmin, (req, res) => {
+  try {
+    payrollSvc.deleteSlipsByPeriod(parseInt(req.body.month), parseInt(req.body.year));
+    req.session._msg = { type: 'success', text: 'Semua slip draft dihapus.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: e.message };
+  }
+  res.redirect('back');
+});
+
+router.get('/payroll/slip/:id/print', requireAdmin, (req, res) => {
+  const slip = payrollSvc.getSlipById(req.params.id);
+  if (!slip) return res.status(404).send('Slip tidak ditemukan');
+  
+  const { getSettingsWithCache } = require('../config/settingsManager');
+  res.render('admin/print_payslip', {
+    company: getSettingsWithCache().company_header || 'My ISP',
+    slip
+  });
+});
+
+router.post('/payroll/slip/:id/send-wa', requireAdmin, async (req, res) => {
+  try {
+    const slip = payrollSvc.getSlipById(req.params.id);
+    if (!slip) throw new Error('Slip tidak ditemukan');
+    
+    const phone = payrollSvc.getEmployeePhone(slip.employee_type, slip.employee_id);
+    if (!phone) throw new Error('Nomor HP karyawan tidak diset');
+
+    const { getSettingsWithCache } = require('../config/settingsManager');
+    const settings = getSettingsWithCache();
+    if (!settings.whatsapp_enabled) throw new Error('WhatsApp bot tidak aktif');
+
+    const { sendWA, whatsappStatus } = await import('../services/whatsappBot.mjs');
+    if (!whatsappStatus || whatsappStatus.connection !== 'open') {
+      throw new Error('WhatsApp bot tidak terkoneksi');
+    }
+
+    const monthNames = ['','Januari','Februari','Maret','April','Mei','Juni','Juli','Agustus','September','Oktober','November','Desember'];
+    
+    const msg = `🧾 *SLIP GAJI KARYAWAN*\n\n` +
+      `👤 *Nama:* ${slip.employee_name}\n` +
+      `📅 *Periode:* ${monthNames[slip.period_month]} ${slip.period_year}\n` +
+      `🏢 *Status:* ${slip.status.toUpperCase()}\n\n` +
+      `*PENDAPATAN:*\n` +
+      `- Gaji Pokok: Rp ${slip.base_salary.toLocaleString('id-ID')}\n` +
+      (slip.transport_allowance ? `- Tunj. Transport: Rp ${slip.transport_allowance.toLocaleString('id-ID')}\n` : '') +
+      (slip.meal_allowance ? `- Tunj. Makan: Rp ${slip.meal_allowance.toLocaleString('id-ID')}\n` : '') +
+      (slip.phone_allowance ? `- Tunj. Pulsa: Rp ${slip.phone_allowance.toLocaleString('id-ID')}\n` : '') +
+      (slip.other_allowance ? `- Tunj. Lain: Rp ${slip.other_allowance.toLocaleString('id-ID')}\n` : '') +
+      (slip.ticket_bonus ? `- Bonus Tiket: +Rp ${slip.ticket_bonus.toLocaleString('id-ID')}\n` : '') +
+      (slip.collection_commission ? `- Komisi Tagihan: +Rp ${slip.collection_commission.toLocaleString('id-ID')}\n` : '') +
+      (slip.overtime_bonus ? `- Lembur: +Rp ${slip.overtime_bonus.toLocaleString('id-ID')}\n` : '') +
+      `*Total Pendapatan: Rp ${slip.gross_salary.toLocaleString('id-ID')}*\n\n` +
+      `*POTONGAN:*\n` +
+      (slip.absence_deduction ? `- Potongan Absen: -Rp ${slip.absence_deduction.toLocaleString('id-ID')}\n` : '') +
+      (slip.late_deduction ? `- Potongan Terlambat: -Rp ${slip.late_deduction.toLocaleString('id-ID')}\n` : '') +
+      (slip.other_deduction ? `- Potongan Lain: -Rp ${slip.other_deduction.toLocaleString('id-ID')}\n` : '') +
+      `*Total Potongan: Rp ${slip.total_deductions.toLocaleString('id-ID')}*\n\n` +
+      `💰 *GAJI BERSIH: Rp ${slip.net_salary.toLocaleString('id-ID')}*\n\n` +
+      `Terima kasih atas kerja keras Anda! 🙏`;
+
+    await sendWA(phone, msg);
+    res.json({ success: true, message: 'Terkirim' });
+  } catch (e) {
+    res.json({ success: false, message: e.message });
   }
 });
 
