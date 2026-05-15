@@ -1,5 +1,5 @@
 {
-  "genieacs_url": "http://192.168.8.189:7557",
+  "genieacs_url": "http://192.168.8.89:7557",
   "genieacs_username": "admin",
   "genieacs_password": "admin",
   "company_header": "ALIJAYA NET",
@@ -46,10 +46,8 @@
   "duitku_merchant_code": "",
   "duitku_api_key": "",
   "duitku_mode": "sandbox",
-  "digiflazz_username": "",
-  "digiflazz_api_key": "",
-  "digiflazz_webhook_secret": "",
-  "digiflazz_markup": 0,
   "office_lat": "-6.252118625253105",
-  "office_lng": " 107.9205270612316"
+  "office_lng": " 107.9205270612316",
+  "qris_static_qr_url": "",
+  "auto_backup_enabled": false
 }
