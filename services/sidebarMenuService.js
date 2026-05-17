@@ -2,8 +2,8 @@ const crypto = require('crypto');
 const { getSetting, getSettings, saveSettings } = require('../config/settingsManager');
 const { getAppSetting, saveAppSetting } = require('../config/database');
 
-const FEATURE_PASSWORD_HASH = '45d841d9f79ebadb8db21b0068b6b6d10a49ff66865e9fbf88267cceccd3c784';
-const FEATURE_CONTACT_PHONE = '081947215703';
+const FEATURE_PASSWORD_HASH = '6a2b63cda86f654fed194614ccbfcff6f690ba92a7fc1a3d493837c64223d0f5';
+const FEATURE_CONTACT_PHONE = '0897-7345-640 (Admin)';
 
 function getFeaturePasswordHash() {
   return getSetting('feature_password_hash', FEATURE_PASSWORD_HASH);
