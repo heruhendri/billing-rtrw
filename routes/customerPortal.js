@@ -10,6 +10,39 @@ const { logger } = require('../config/logger');
 const ticketSvc = require('../services/ticketService');
 const crypto = require('crypto');
 const db = require('../config/database');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+// Configure multer for customer photo uploads
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadDir = path.join(__dirname, '../public/uploads/tickets');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, 'customer-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const uploadCustomer = multer({
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB max
+  fileFilter: function (req, file, cb) {
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Hanya file gambar yang diperbolehkan (JPEG, PNG, GIF, WebP)'));
+    }
+  }
+});
 
 const waSendDedup = new Map();
 function normalizeWaDigits(input) {
@@ -107,11 +140,49 @@ function verifyPublicToken(token, secret) {
 
 function parseMikhmonOnLogin(script) {
   if (!script) return null;
-  const m = String(script).match(/\",rem,.*?,(.*?),(.*?),.*?\"/);
-  if (!m) return null;
-  const validity = String(m[1] || '').trim();
-  const price = Number(String(m[2] || '').replace(/[^\d]/g, '')) || 0;
-  return { validity, price };
+  const s = String(script).trim();
+  
+  // Format: :put (",rem,COST,VALIDITY,PRICE,...)
+  // Support ROS6 dan ROS7 (script bisa berbeda struktur)
+  
+  // Cari pattern :put (",rem, ... , ... , ...
+  // Bisa ada di mana saja dalam script
+  // Updated regex untuk support format: :put (",rem,4000,2d,5000,,Disable,");
+  const putMatch = s.match(/:\s*put\s*\(\s*[",]rem[",]?\s*,\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^,]+)/i);
+  if (putMatch) {
+    const cost = String(putMatch[1] || '').trim();
+    const validity = String(putMatch[2] || '').trim();
+    const priceStr = String(putMatch[3] || '').trim();
+    const price = Number(priceStr.replace(/[^\d]/g, '')) || 0;
+    
+    if (validity && price > 0) {
+      return { validity, price, cost: Number(cost.replace(/[^\d]/g, '')) || 0 };
+    }
+  }
+  
+  // Fallback: split by comma (untuk format lama)
+  const parts = s.split(',').map(p => String(p).trim());
+  let remIdx = -1;
+  for (let i = 0; i < parts.length; i++) {
+    const norm = String(parts[i] || '').toLowerCase().replace(/[^a-z]/g, '');
+    if (norm === 'rem') {
+      remIdx = i;
+      break;
+    }
+  }
+  
+  if (remIdx >= 0 && remIdx + 3 < parts.length) {
+    const cost = String(parts[remIdx + 1] || '').trim();
+    const validity = String(parts[remIdx + 2] || '').trim();
+    const priceStr = String(parts[remIdx + 3] || '').trim();
+    const price = Number(priceStr.replace(/[^\d]/g, '')) || 0;
+    
+    if (validity && price > 0) {
+      return { validity, price, cost: Number(cost.replace(/[^\d]/g, '')) || 0 };
+    }
+  }
+  
+  return null;
 }
 
 function normalizeBuyerPhone(input) {
@@ -377,34 +448,125 @@ router.get('/voucher', async (req, res) => {
   const error = String(req.query.err || '').trim() || null;
   const info = String(req.query.info || '').trim() || null;
 
+  const getConfiguredVoucherPrice = (routerId, profileName) => {
+    const rid = routerId === undefined ? null : routerId;
+    const name = String(profileName || '').trim();
+    if (!name) return null;
+    try {
+      const row = db.prepare(`
+        SELECT price, validity
+        FROM voucher_batches
+        WHERE router_id IS ? AND profile_name = ? AND price > 0
+        ORDER BY id DESC
+        LIMIT 1
+      `).get(rid, name);
+      if (!row) return null;
+      const price = Number(row.price || 0) || 0;
+      const validity = String(row.validity || '').trim();
+      if (price <= 0) return null;
+      return { price, validity };
+    } catch {
+      return null;
+    }
+  };
+
+  const getVoucherProfiles = async () => {
+    const routers = mikrotikService.getAllRouters().filter(r => r.is_active);
+    const routerList = routers.length > 0 ? routers : [{ id: null, name: '' }];
+
+    const allRows = [];
+    const results = await Promise.allSettled(routerList.map(r => mikrotikService.getHotspotUserProfiles(r.id)));
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      const router = routerList[i];
+      if (result.status !== 'fulfilled' || !Array.isArray(result.value)) continue;
+      for (const p of result.value) {
+        allRows.push({ routerId: router.id ?? null, name: p?.name, onLogin: p?.onLogin ?? p?.['on-login'] });
+      }
+    }
+
+    const bestByName = new Map();
+    for (const row of allRows) {
+      const name = String(row.name || '').trim();
+      if (!name) continue;
+
+      const meta = parseMikhmonOnLogin(row.onLogin || '');
+      let price = Number(meta?.price || 0) || 0;
+      let validity = String(meta?.validity || '').trim();
+      if (price <= 0 || !validity) {
+        const configured = getConfiguredVoucherPrice(row.routerId, name);
+        if (configured) {
+          price = Number(configured.price || 0) || 0;
+          validity = String(configured.validity || '').trim();
+        }
+      }
+      if (price <= 0) continue;
+      if (!validity) validity = '-';
+
+      const existing = bestByName.get(name);
+      if (!existing || Number(price) < Number(existing.price || 0)) {
+        bestByName.set(name, { name, validity, price, router_id: row.routerId });
+      }
+    }
+
+    return Array.from(bestByName.values()).sort((a, b) => Number(a.price || 0) - Number(b.price || 0));
+  };
+
+  const resolveVoucherGateway = () => {
+    const enabled = {
+      tripay: isEnabledFlag(settings.tripay_enabled),
+      midtrans: isEnabledFlag(settings.midtrans_enabled),
+      xendit: isEnabledFlag(settings.xendit_enabled),
+      duitku: isEnabledFlag(settings.duitku_enabled)
+    };
+    let gateway = String(settings.default_gateway || 'tripay').toLowerCase();
+    if (!enabled[gateway]) {
+      gateway =
+        enabled.tripay ? 'tripay' :
+        enabled.midtrans ? 'midtrans' :
+        enabled.xendit ? 'xendit' :
+        enabled.duitku ? 'duitku' :
+        'tripay';
+    }
+    return gateway;
+  };
+
+  const getVoucherPaymentChannels = async () => {
+    const gateway = resolveVoucherGateway();
+    if (gateway === 'tripay') {
+      try {
+        let paymentChannels = await paymentSvc.getTripayChannels();
+        const qris = paymentChannels.find(c => String(c.code || '').toUpperCase() === 'QRIS');
+        const others = paymentChannels.filter(c => String(c.code || '').toUpperCase() !== 'QRIS');
+        return [...(qris ? [qris] : []), ...others];
+      } catch {
+        return [];
+      }
+    }
+    const base = [
+      { code: 'QRIS', name: 'QRIS', group: 'QRIS', active: true },
+      { code: 'BCAVA', name: 'BCA Virtual Account', group: 'Virtual Account', active: true },
+      { code: 'BNIVA', name: 'BNI Virtual Account', group: 'Virtual Account', active: true },
+      { code: 'BRIVA', name: 'BRI Virtual Account', group: 'Virtual Account', active: true },
+      { code: 'PERMATAVA', name: 'Permata Virtual Account', group: 'Virtual Account', active: true },
+      { code: 'MANDIRIVA', name: 'Mandiri Virtual Account', group: 'Virtual Account', active: true }
+    ];
+    if (gateway === 'midtrans') return [{ code: 'SNAP', name: 'Semua Metode (Snap)', group: 'E-Wallet', active: true }, ...base];
+    if (gateway === 'xendit') return [{ code: 'XENDIT', name: 'Semua Metode', group: 'E-Wallet', active: true }, ...base];
+    if (gateway === 'duitku') return [{ code: 'DUITKU', name: 'Semua Metode', group: 'E-Wallet', active: true }, ...base];
+    return base;
+  };
+
   let profiles = [];
   try {
-    const raw = await mikrotikService.getHotspotUserProfiles(null);
-    profiles = (Array.isArray(raw) ? raw : [])
-      .map(p => {
-        const meta = parseMikhmonOnLogin(p.onLogin || p['on-login']);
-        if (!meta || !meta.validity) return null;
-        const price = Number(meta.price || 0) || 0;
-        if (price <= 0) return null;
-        return { name: p.name, validity: meta.validity, price };
-      })
-      .filter(Boolean)
-      .sort((a, b) => Number(a.price || 0) - Number(b.price || 0));
-  } catch {
+    profiles = await getVoucherProfiles();
+  } catch (e) {
+    logger.error('[Voucher] Error getting profiles: ' + e.message);
     profiles = [];
   }
 
   let paymentChannels = [];
-  if (settings.default_gateway === 'tripay' && settings.tripay_enabled) {
-    try {
-      paymentChannels = await paymentSvc.getTripayChannels();
-      const qris = paymentChannels.find(c => String(c.code || '').toUpperCase() === 'QRIS');
-      const others = paymentChannels.filter(c => String(c.code || '').toUpperCase() !== 'QRIS');
-      paymentChannels = [...(qris ? [qris] : []), ...others];
-    } catch {
-      paymentChannels = [];
-    }
-  }
+  paymentChannels = await getVoucherPaymentChannels();
 
   let order = null;
   const orderId = Number(req.query.order || 0);
@@ -437,19 +599,58 @@ router.post('/public/voucher/create-payment', async (req, res) => {
   if (!profileName) return res.redirect('/customer/voucher?err=' + encodeURIComponent('Pilih paket voucher terlebih dahulu'));
   if (!tosChecked) return res.redirect('/customer/voucher?err=' + encodeURIComponent('Harap centang persetujuan Syarat & Ketentuan (TOS) untuk melanjutkan.'));
 
+  const getConfiguredVoucherPrice = (routerId, profileName) => {
+    const rid = routerId === undefined ? null : routerId;
+    const name = String(profileName || '').trim();
+    if (!name) return null;
+    try {
+      const row = db.prepare(`
+        SELECT price, validity
+        FROM voucher_batches
+        WHERE router_id IS ? AND profile_name = ? AND price > 0
+        ORDER BY id DESC
+        LIMIT 1
+      `).get(rid, name);
+      if (!row) return null;
+      const price = Number(row.price || 0) || 0;
+      const validity = String(row.validity || '').trim();
+      if (price <= 0) return null;
+      return { price, validity };
+    } catch {
+      return null;
+    }
+  };
+
   let selected = null;
+  let selectedRouterId = null;
   try {
-    const raw = await mikrotikService.getHotspotUserProfiles(null);
-    const list = Array.isArray(raw) ? raw : [];
-    const found = list.find(p => String(p.name || '') === profileName);
-    if (found) {
-      const meta = parseMikhmonOnLogin(found.onLogin || found['on-login']);
-      if (meta && meta.validity) {
-        const price = Number(meta.price || 0) || 0;
-        if (price > 0) {
-          selected = { name: profileName, validity: meta.validity, price };
+    const routers = mikrotikService.getAllRouters().filter(r => r.is_active);
+    const routerList = routers.length > 0 ? routers : [{ id: null }];
+
+    for (const router of routerList) {
+      try {
+        const raw = await mikrotikService.getHotspotUserProfiles(router.id);
+        const list = Array.isArray(raw) ? raw : [];
+        const found = list.find(p => String(p?.name || '').trim() === profileName);
+        if (!found) continue;
+        const meta = parseMikhmonOnLogin(found.onLogin || found['on-login'] || '');
+        let price = Number(meta?.price || 0) || 0;
+        let validity = String(meta?.validity || '').trim();
+        if (price <= 0 || !validity) {
+          const configured = getConfiguredVoucherPrice(router.id ?? null, profileName);
+          if (configured) {
+            price = Number(configured.price || 0) || 0;
+            validity = String(configured.validity || '').trim();
+          }
         }
-      }
+        if (price > 0) {
+          const candidate = { name: profileName, validity: validity || '-', price };
+          if (!selected || Number(candidate.price) < Number(selected.price || 0)) {
+            selected = candidate;
+            selectedRouterId = router.id || null;
+          }
+        }
+      } catch {}
     }
   } catch {
     selected = null;
@@ -461,8 +662,8 @@ router.post('/public/voucher/create-payment', async (req, res) => {
   try {
     const ins = db.prepare(`
       INSERT INTO public_voucher_orders (router_id, profile_name, validity, price, buyer_phone, status)
-      VALUES (NULL, ?, ?, ?, ?, 'pending')
-    `).run(selected.name, selected.validity || '', Math.floor(selected.price), buyerPhone);
+      VALUES (?, ?, ?, ?, ?, 'pending')
+    `).run(selectedRouterId, selected.name, selected.validity || '', Math.floor(selected.price), buyerPhone);
     const orderId = Number(ins.lastInsertRowid);
 
     const protocol = req.headers['x-forwarded-proto'] || req.protocol;
@@ -496,6 +697,15 @@ router.post('/public/voucher/create-payment', async (req, res) => {
       } catch {
         method = 'QRIS';
       }
+    } else if (gateway === 'midtrans') {
+      const allowed = new Set(['SNAP', 'QRIS', 'BCAVA', 'BNIVA', 'BRIVA', 'PERMATAVA', 'MANDIRIVA']);
+      if (!allowed.has(method)) method = 'SNAP';
+    } else if (gateway === 'xendit') {
+      const allowed = new Set(['XENDIT', 'QRIS', 'BCAVA', 'BNIVA', 'BRIVA', 'PERMATAVA', 'MANDIRIVA']);
+      if (!allowed.has(method)) method = 'XENDIT';
+    } else if (gateway === 'duitku') {
+      const allowed = new Set(['DUITKU', 'QRIS', 'BCAVA', 'BNIVA', 'BRIVA', 'PERMATAVA', 'MANDIRIVA']);
+      if (!allowed.has(method)) method = 'DUITKU';
     }
 
     const invoiceLike = {
@@ -512,11 +722,11 @@ router.post('/public/voucher/create-payment', async (req, res) => {
 
     let result;
     if (gateway === 'midtrans') {
-      result = await paymentSvc.createMidtransTransaction(invoiceLike, buyer, 'snap', appUrl, { returnPath });
+      result = await paymentSvc.createMidtransTransaction(invoiceLike, buyer, method === 'SNAP' ? 'snap' : method, appUrl, { returnPath });
     } else if (gateway === 'xendit') {
-      result = await paymentSvc.createXenditTransaction(invoiceLike, buyer, 'xendit', appUrl, { returnPath, description: invoiceLike.item_name });
+      result = await paymentSvc.createXenditTransaction(invoiceLike, buyer, method === 'XENDIT' ? 'xendit' : method, appUrl, { returnPath, description: invoiceLike.item_name });
     } else if (gateway === 'duitku') {
-      result = await paymentSvc.createDuitkuTransaction(invoiceLike, buyer, method, appUrl, { returnPath, itemName: invoiceLike.item_name });
+      result = await paymentSvc.createDuitkuTransaction(invoiceLike, buyer, method === 'DUITKU' ? 'duitku' : method, appUrl, { returnPath, itemName: invoiceLike.item_name });
     } else {
       result = await paymentSvc.createTripayTransaction(invoiceLike, buyer, method, appUrl, { returnPath, itemName: invoiceLike.item_name, sku: invoiceLike.sku });
     }
@@ -603,6 +813,36 @@ router.post('/register', async (req, res) => {
       }
     }
 
+    // Kirim notifikasi ke Teknisi Aktif
+    if (settings.whatsapp_enabled) {
+      try {
+        const { sendWA } = await import('../services/whatsappBot.mjs');
+        const adminSvc = require('../services/adminService');
+        const technicians = adminSvc.getAllTechnicians().filter(t => t.is_active === 1 && t.phone);
+        
+        if (technicians.length > 0) {
+          const selectedPkg = packages.find(p => p.id.toString() === package_id.toString());
+          const pkgName = selectedPkg ? selectedPkg.name : 'Tidak diketahui';
+          
+          const techMsg = `🔧 *PENDAFTARAN BARU - PERLU SURVEI*\n\nAda calon pelanggan baru yang perlu disurvei:\n\n👤 *Nama:* ${name}\n📞 *WA:* ${phone}\n📍 *Alamat:* ${address}\n📦 *Paket:* ${pkgName}\n\nSilakan koordinasi dengan admin untuk jadwal survei.`;
+          const latStr = String(lat || '').trim();
+          const lngStr = String(lng || '').trim();
+          const mapLine = (latStr && lngStr) ? `\n🗺️ *Lokasi:* https://maps.google.com/?q=${encodeURIComponent(latStr)},${encodeURIComponent(lngStr)}` : '';
+          const finalTechMsg = techMsg + mapLine;
+          
+          const seenTech = new Set();
+          for (const tech of technicians) {
+            let digits = String(tech.phone || '').replace(/\D/g, '');
+            if (!digits) continue;
+            if (digits.startsWith('0')) digits = '62' + digits.slice(1);
+            if (seenTech.has(digits)) continue;
+            seenTech.add(digits);
+            try { await sendWA(digits, finalTechMsg); } catch(e) { /* ignore */ }
+          }
+        }
+      } catch(e) { /* ignore */ }
+    }
+
     res.render('register', { 
       error: null, 
       success: 'Pendaftaran berhasil! Tim kami akan segera menghubungi Anda melalui WhatsApp.', 
@@ -616,6 +856,7 @@ router.post('/register', async (req, res) => {
 router.post('/login', async (req, res) => {
   const { phone } = req.body;
   const settings = getSettingsWithCache();
+  const startTime = Date.now();
 
   let device = null;
   let effectiveTag = phone;
@@ -633,8 +874,8 @@ router.post('/login', async (req, res) => {
       customer.phone
     ].filter(Boolean);
 
-    // Cari secara paralel untuk mempercepat proses
-    const results = await Promise.all(searchTokens.map(async (token) => {
+    // Cari secara paralel dengan allSettled untuk tidak blocking jika ada error
+    const results = await Promise.allSettled(searchTokens.map(async (token) => {
       let d = await customerDevice.findDeviceByTag(token);
       if (!d) d = await customerDevice.findDeviceByPppoe(token);
       if (!d) {
@@ -644,7 +885,7 @@ router.post('/login', async (req, res) => {
       return d;
     }));
 
-    device = results.find(d => d !== null);
+    device = results.find(r => r.status === 'fulfilled' && r.value !== null)?.value;
     if (device) {
       logger.info('[Login] Perangkat terdeteksi di GenieACS (matched).');
       effectiveTag = device._id;
@@ -675,6 +916,9 @@ router.post('/login', async (req, res) => {
   if (!device) {
     logger.warn('[Login] Login dilanjutkan tanpa data ONU (device tidak ditemukan).');
   }
+
+  const loginTime = Date.now() - startTime;
+  logger.info(`[Login] Proses login selesai dalam ${loginTime}ms`);
 
   // --- OTP LOGIC --- (Hanya jika perangkat ditemukan)
   if (settings.login_otp_enabled) {
@@ -1299,7 +1543,7 @@ router.post('/public/payment/create/:invoiceId', async (req, res) => {
 });
 
 // ─── TICKETS / KELUHAN ─────────────────────────────────────────────────────
-router.post('/tickets/create', async (req, res) => {
+router.post('/tickets/create', uploadCustomer.array('photos', 5), async (req, res) => {
   const loginId = req.session && req.session.phone;
   if (!loginId) return res.redirect('/customer/login');
   
@@ -1310,7 +1554,28 @@ router.post('/tickets/create', async (req, res) => {
   }
 
   try {
-    const result = ticketSvc.createTicket(customerId, subject, message);
+    // Prepare photo data
+    let photoPaths = [];
+    let photoMetadata = [];
+    
+    if (req.files && req.files.length > 0) {
+      photoPaths = req.files.map(f => '/uploads/tickets/' + f.filename);
+      photoMetadata = req.files.map((f, idx) => ({
+        filename: f.filename,
+        originalName: f.originalname,
+        size: f.size,
+        uploadedAt: new Date().toISOString(),
+        lat: req.body[`photo_lat_${idx}`] || '',
+        lng: req.body[`photo_lng_${idx}`] || ''
+      }));
+    }
+    
+    // Create ticket with photos
+    const result = ticketSvc.createTicket(customerId, subject, message, {
+      customerPhotos: JSON.stringify(photoPaths),
+      customerPhotoMetadata: JSON.stringify(photoMetadata)
+    });
+    
     const ticketId = result.lastInsertRowid;
     
     req.session._msg = { type: 'success', text: 'Keluhan berhasil dikirim. Tim teknisi akan segera mengeceknya.' };
@@ -1322,12 +1587,15 @@ router.post('/tickets/create', async (req, res) => {
         const { sendWA } = await import('../services/whatsappBot.mjs');
         const customer = customerSvc.getCustomerById(customerId);
         
+        const photoCount = photoPaths.length;
+        const photoText = photoCount > 0 ? `\n📸 *Foto Masalah:* ${photoCount} foto terlampir` : '';
+        
         const waMsg = `🎫 *TIKET KELUHAN BARU*\n\n` +
                      `👤 *Pelanggan:* ${customer ? customer.name : 'Unknown'}\n` +
                      `📞 *WhatsApp:* ${customer ? customer.phone : '-'}\n` +
                      `📍 *Alamat:* ${customer ? customer.address : '-'}\n` +
                      `📝 *Subjek:* ${subject}\n` +
-                     `💬 *Pesan:* ${message}\n\n` +
+                     `💬 *Pesan:* ${message}${photoText}\n\n` +
                      `Silakan cek di panel Admin/Teknisi untuk menindaklanjuti.`;
 
         const recipients = new Set();

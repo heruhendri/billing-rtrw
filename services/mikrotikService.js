@@ -550,16 +550,20 @@ async function getPppoeActive(routerId = null) {
 
 async function getHotspotActive(routerId = null) {
   const ck = cacheKey(routerId, 'hotspotActive');
-  const cached = getCachedList(ck, 3000);
+  const cached = getCachedList(ck, 5000); // Increased cache from 3s to 5s for better performance
   if (cached) return cached;
   let conn = null;
   try {
     conn = await getConnection(routerId);
-    const rows = await conn.client.menu('/ip/hotspot/active').get();
+    const rows = await withTimeout(
+      conn.client.menu('/ip/hotspot/active').get(),
+      5000, // 5 second timeout
+      'getHotspotActive'
+    );
     setCachedList(ck, rows);
     return rows;
   } catch (e) {
-    logger.error('Error getting active Hotspot sessions:', e);
+    logger.error('Error getting active Hotspot sessions:', e.message);
     throw e;
   } finally {
     if (conn && conn.api) conn.api.close();
@@ -647,13 +651,20 @@ async function getHotspotUserProfiles(routerId = null) {
   try {
     conn = await getConnection(routerId);
     const start = Date.now();
-    const raw = await conn.api.send([
-      '/ip/hotspot/user/profile/print',
-      '=.proplist=.id,name,rate-limit,shared-users,session-timeout'
-    ]);
+    // Gunakan client.menu().get() agar semua field termasuk on-login ikut terambil
+    let rows = [];
+    try {
+      rows = await conn.client.menu('/ip/hotspot/user/profile').get();
+    } catch {
+      // Fallback ke conn.api.send jika client.menu tidak tersedia
+      const raw = await conn.api.send([
+        '/ip/hotspot/user/profile/print',
+        '=.proplist=.id,name,rate-limit,shared-users,session-timeout,on-login'
+      ]);
+      rows = Array.isArray(raw) ? raw.map(augmentRow) : [];
+    }
     const ms = Date.now() - start;
     if (ms > 1200) logger.warn(`[MikroTik] Slow /ip/hotspot/user/profile/print (${ms}ms)`);
-    const rows = Array.isArray(raw) ? raw.map(augmentRow) : [];
     setCachedList(ck, rows);
     return rows;
   } catch (e) {
@@ -706,6 +717,12 @@ async function addHotspotUserProfile(data, routerId = null) {
       const first = st ? st.split(/\\s+/)[0] : '';
       if (first) payload['session-timeout'] = first;
     }
+    
+    // Handle on-login (Mikhmon metadata)
+    if (data && data['on-login'] != null) {
+      const onLogin = String(data['on-login'] || '').trim();
+      if (onLogin) payload['on-login'] = onLogin;
+    }
 
     const op = menu.add(payload);
     const res = await withTimeout(op, 8000, '/ip/hotspot/user/profile/add').catch(async (err) => {
@@ -749,6 +766,12 @@ async function updateHotspotUserProfile(id, data, routerId = null) {
       const st = String(data['session-timeout'] || '').trim();
       const first = st ? st.split(/\\s+/)[0] : '';
       if (first) safe['session-timeout'] = first;
+    }
+    
+    // Handle on-login (Mikhmon metadata)
+    if (data && data['on-login'] != null) {
+      const onLogin = String(data['on-login'] || '').trim();
+      if (onLogin) safe['on-login'] = onLogin;
     }
 
     const name = String(safe?.name || '').trim();
@@ -796,16 +819,20 @@ async function deleteHotspotUserProfile(id, routerId = null) {
 
 async function getHotspotUsers(routerId = null) {
   const ck = cacheKey(routerId, 'hotspotUsers');
-  const cached = getCachedList(ck, 8000);
+  const cached = getCachedList(ck, 15000); // Increased cache from 8s to 15s for better performance
   if (cached) return cached;
   let conn = null;
   try {
     conn = await getConnection(routerId);
-    const rows = await conn.client.menu('/ip/hotspot/user').get();
+    const rows = await withTimeout(
+      conn.client.menu('/ip/hotspot/user').get(),
+      10000, // 10 second timeout
+      'getHotspotUsers'
+    );
     setCachedList(ck, rows);
     return rows;
   } catch (e) {
-    logger.error('Error getting Hotspot users:', e);
+    logger.error('Error getting Hotspot users:', e.message);
     throw e;
   } finally {
     if (conn && conn.api) conn.api.close();

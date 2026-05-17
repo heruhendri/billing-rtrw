@@ -28,8 +28,10 @@ const auditSvc = require('../services/auditTrailService');
 const diagnosticsSvc = require('../services/diagnosticsService');
 const attendanceSvc = require('../services/attendanceService');
 const payrollSvc = require('../services/payrollService');
+const sidebarMenuSvc = require('../services/sidebarMenuService');
 const axios = require('axios');
 const crypto = require('crypto');
+const { uploadAttendance, removeAttendanceFile } = require('../middleware/attendanceUpload');
 
 const DIGIFLAZZ_URL = 'https://api.digiflazz.com/v1';
 const digiflazzApi = axios.create({
@@ -171,6 +173,33 @@ function flashMsg(req) {
   return m || null;
 }
 
+function safeAdminPath(rawPath, fallback = '/admin/sidebar-settings') {
+  const candidate = String(rawPath || '').trim();
+  if (!candidate.startsWith('/admin')) return fallback;
+  if (candidate.startsWith('/admin/logout')) return fallback;
+  return candidate;
+}
+
+function requireSidebarMenuAccess(menuKey) {
+  return (req, res, next) => {
+    const access = sidebarMenuSvc.evaluateMenuAccess(menuKey, req.session);
+    if (access.allowed) return next();
+
+    if (access.reason === 'hidden') {
+      req.session._msg = { type: 'error', text: `Menu "${access.menu.labelDefault}" sedang disembunyikan dari sidebar.` };
+      return res.redirect('/admin');
+    }
+
+    if (access.reason === 'locked') {
+      req.session._msg = { type: 'error', text: `Menu "${access.menu.labelDefault}" terkunci. Hubungi ${sidebarMenuSvc.FEATURE_CONTACT_PHONE} untuk mendapatkan password.` };
+      return res.redirect('/admin/sidebar-settings');
+    }
+
+    req.session._msg = { type: 'error', text: 'Anda tidak memiliki akses ke menu ini.' };
+    return res.redirect('/admin');
+  };
+}
+
 function popUpdateLog(req) {
   const l = req.session._updateLog;
   delete req.session._updateLog;
@@ -248,12 +277,44 @@ function getUpdateInfo(repoRoot) {
 
 function parseMikhmonOnLogin(script) {
   if (!script) return null;
-  const m = String(script).match(/",rem,.*?,(.*?),(.*?),.*?"/);
-  if (!m) return null;
-  const validity = String(m[1] || '').trim();
-  const priceStr = String(m[2] || '').trim();
-  const price = Number(String(priceStr).replace(/[^\d]/g, '')) || 0;
-  return { validity, price };
+  const s = String(script).trim();
+  
+  // Cari pattern :put (",rem, ... , ... , ...
+  // Updated regex untuk support format: :put (",rem,4000,2d,5000,,Disable,");
+  const putMatch = s.match(/:\s*put\s*\(\s*[",]rem[",]?\s*,\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^,]+)/i);
+  if (putMatch) {
+    const cost = String(putMatch[1] || '').trim();
+    const validity = String(putMatch[2] || '').trim();
+    const priceStr = String(putMatch[3] || '').trim();
+    const price = Number(priceStr.replace(/[^\d]/g, '')) || 0;
+    
+    if (validity && price > 0) {
+      return { validity, price, cost: Number(cost.replace(/[^\d]/g, '')) || 0 };
+    }
+  }
+  
+  // Fallback: split by comma
+  const parts = s.split(',').map(p => String(p).trim());
+  let remIdx = -1;
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i].includes('rem')) {
+      remIdx = i;
+      break;
+    }
+  }
+  
+  if (remIdx >= 0 && remIdx + 3 < parts.length) {
+    const cost = String(parts[remIdx + 1] || '').trim();
+    const validity = String(parts[remIdx + 2] || '').trim();
+    const priceStr = String(parts[remIdx + 3] || '').trim();
+    const price = Number(priceStr.replace(/[^\d]/g, '')) || 0;
+    
+    if (validity && price > 0) {
+      return { validity, price, cost: Number(cost.replace(/[^\d]/g, '')) || 0 };
+    }
+  }
+  
+  return null;
 }
 
 function genCode(len, charset) {
@@ -366,6 +427,8 @@ async function createVoucherBatchAsync(batchId) {
 // Global locals middleware
 router.use((req, res, next) => {
   res.locals.session = req.session;
+  res.locals.sidebarSections = sidebarMenuSvc.getSidebarSections(req.session);
+  res.locals.sidebarBottomNavItems = sidebarMenuSvc.getBottomNavItems(req.session);
   next();
 });
 
@@ -495,7 +558,7 @@ router.post('/olts/:id/delete', requireAdminSession, restrictToAdmin, (req, res)
 });
 
 // ─── ODP & MAP MANAGEMENT ───────────────────────────────────────────────────
-router.get('/map', requireAdminSession, (req, res) => {
+router.get('/map', requireAdminSession, requireSidebarMenuAccess('map'), (req, res) => {
   const customers = customerSvc.getAllCustomers();
   const odps = odpSvc.getAllOdps();
   
@@ -706,7 +769,7 @@ router.post('/odps/:id/delete', requireAdminSession, restrictToAdmin, (req, res)
 });
 
 // --- TECHNICIAN MANAGEMENT ---
-router.get('/technicians', requireAdminSession, restrictToAdmin, (req, res) => {
+router.get('/technicians', requireAdminSession, requireSidebarMenuAccess('technicians'), restrictToAdmin, (req, res) => {
   const technicians = adminSvc.getAllTechnicians();
   res.render('admin/technicians', { title: 'Manajemen Teknisi', company: company(), activePage: 'technicians', technicians, msg: flashMsg(req) });
 });
@@ -738,7 +801,7 @@ router.post('/technicians/:id/delete', requireAdminSession, restrictToAdmin, (re
 });
 
 // --- CASHIER MANAGEMENT ---
-router.get('/cashiers', requireAdminSession, restrictToAdmin, (req, res) => {
+router.get('/cashiers', requireAdminSession, requireSidebarMenuAccess('cashiers'), restrictToAdmin, (req, res) => {
   const cashiers = adminSvc.getAllCashiers();
   res.render('admin/cashiers', { title: 'Manajemen Kasir', company: company(), activePage: 'cashiers', cashiers, msg: flashMsg(req) });
 });
@@ -770,7 +833,7 @@ router.post('/cashiers/:id/delete', requireAdminSession, restrictToAdmin, (req, 
 });
 
 // --- COLLECTOR MANAGEMENT ---
-router.get('/collectors', requireAdminSession, restrictToAdmin, (req, res) => {
+router.get('/collectors', requireAdminSession, requireSidebarMenuAccess('collectors'), restrictToAdmin, (req, res) => {
   const collectors = adminSvc.getAllCollectors();
   res.render('admin/collectors', { title: 'Manajemen Kolektor', company: company(), activePage: 'collectors', collectors, msg: flashMsg(req) });
 });
@@ -801,7 +864,7 @@ router.post('/collectors/:id/delete', requireAdminSession, restrictToAdmin, (req
   res.redirect('/admin/collectors');
 });
 
-router.get('/collector-payments', requireAdminSession, (req, res) => {
+router.get('/collector-payments', requireAdminSession, requireSidebarMenuAccess('collector_payments'), (req, res) => {
   const status = String(req.query.status || 'pending').trim() || 'pending';
   const rows = db.prepare(`
     SELECT r.*,
@@ -922,7 +985,7 @@ router.post('/collector-payments/:id/reject', requireAdminSession, express.urlen
   res.redirect('back');
 });
 // ─── CASHIER ATTENDANCE ──────────────────────────────────────────────────────
-router.get('/cashiers/attendance', requireAdminSession, (req, res) => {
+router.get('/cashiers/attendance', requireAdminSession, requireSidebarMenuAccess('cashier_attendance'), (req, res) => {
   try {
     const cashierId = req.session.cashierId || null;
     const cashierName = req.session.cashierName || req.session.username || 'Kasir';
@@ -961,7 +1024,7 @@ router.get('/cashiers/attendance', requireAdminSession, (req, res) => {
   }
 });
 
-router.post('/cashiers/attendance/checkin', requireAdminSession, express.json(), (req, res) => {
+router.post('/cashiers/attendance/checkin', requireAdminSession, uploadAttendance.single('photo'), (req, res) => {
   try {
     const cashierId = req.session.cashierId;
     const cashierName = req.session.cashierName || req.session.username;
@@ -969,9 +1032,14 @@ router.post('/cashiers/attendance/checkin', requireAdminSession, express.json(),
     if (!cashierId) {
       return res.json({ success: false, message: 'Session kasir tidak valid' });
     }
+
+    if (!req.file) {
+      return res.json({ success: false, message: 'Foto check-in wajib diunggah' });
+    }
     
     const today = attendanceSvc.getTodayAttendance('cashier', cashierId);
     if (today) {
+      removeAttendanceFile(req.file);
       return res.json({ success: false, message: 'Anda sudah melakukan check-in hari ini' });
     }
     
@@ -981,46 +1049,56 @@ router.post('/cashiers/attendance/checkin', requireAdminSession, express.json(),
       employee_name: cashierName,
       lat: req.body.lat || '',
       lng: req.body.lng || '',
-      note: req.body.note || ''
+      note: req.body.note || '',
+      photo: req.file ? '/uploads/attendance/' + req.file.filename : ''
     });
     
     res.json({ success: true, message: 'Check-in berhasil!', id: result.lastInsertRowid });
   } catch (e) {
+    removeAttendanceFile(req.file);
     res.json({ success: false, message: 'Gagal check-in: ' + e.message });
   }
 });
 
-router.post('/cashiers/attendance/checkout', requireAdminSession, express.json(), (req, res) => {
+router.post('/cashiers/attendance/checkout', requireAdminSession, uploadAttendance.single('photo'), (req, res) => {
   try {
     const cashierId = req.session.cashierId;
     
     if (!cashierId) {
       return res.json({ success: false, message: 'Session kasir tidak valid' });
     }
+
+    if (!req.file) {
+      return res.json({ success: false, message: 'Foto check-out wajib diunggah' });
+    }
     
     const today = attendanceSvc.getTodayAttendance('cashier', cashierId);
     if (!today) {
+      removeAttendanceFile(req.file);
       return res.json({ success: false, message: 'Anda belum check-in hari ini' });
     }
     
     if (today.status === 'checked_out') {
+      removeAttendanceFile(req.file);
       return res.json({ success: false, message: 'Anda sudah check-out hari ini' });
     }
     
     attendanceSvc.checkOut(today.id, {
       lat: req.body.lat || '',
       lng: req.body.lng || '',
-      note: req.body.note || ''
+      note: req.body.note || '',
+      photo: req.file ? '/uploads/attendance/' + req.file.filename : ''
     });
     
     res.json({ success: true, message: 'Check-out berhasil!' });
   } catch (e) {
+    removeAttendanceFile(req.file);
     res.json({ success: false, message: 'Gagal check-out: ' + e.message });
   }
 });
 
 
-router.get('/cashiers/reports', requireAdminSession, (req, res) => {
+router.get('/cashiers/reports', requireAdminSession, requireSidebarMenuAccess('cashiers_reports'), (req, res) => {
   const allCashiers = adminSvc.getAllCashiers();
   const isAdmin = Boolean(req.session?.isAdmin);
   const isCashier = Boolean(req.session?.isCashier);
@@ -1166,7 +1244,7 @@ router.get('/cashiers/reports', requireAdminSession, (req, res) => {
 });
 
 // --- AGENT MANAGEMENT ---
-router.get('/agents', requireAdminSession, (req, res) => {
+router.get('/agents', requireAdminSession, requireSidebarMenuAccess('agents'), (req, res) => {
   const agents = agentSvc.getAllAgents();
   const routers = mikrotikService.getAllRouters();
   res.render('admin/agents', {
@@ -1222,7 +1300,7 @@ router.post('/agents/:id/topup', requireAdminSession, express.urlencoded({ exten
   res.redirect('/admin/agents');
 });
 
-router.get('/agents/reports', requireAdminSession, restrictToAdmin, (req, res) => {
+router.get('/agents/reports', requireAdminSession, requireSidebarMenuAccess('agents_reports'), restrictToAdmin, (req, res) => {
   const agents = agentSvc.getAllAgents();
   const agentId = req.query.agentId ? Number(req.query.agentId) : null;
   const txs = agentSvc.listAgentTransactions({ agentId, limit: 500 });
@@ -1268,13 +1346,14 @@ router.post('/api/agents/:id/prices/:priceId/delete', requireAdmin, restrictToAd
 });
 
 // ─── DASHBOARD ─────────────────────────────────────────────────────────────
-router.get('/', requireAdminSession, async (req, res) => {
+router.get('/', requireAdminSession, requireSidebarMenuAccess('dashboard'), async (req, res) => {
   try {
     const billing = billingSvc.getDashboardStats();
     const custStats = customerSvc.getCustomerStats();
+    const settings = getSettings(); // Get current settings
     res.render('admin/dashboard', {
       title: 'Dashboard', company: company(), version: '2.0.0',
-      activePage: 'dashboard', billing, custStats
+      activePage: 'dashboard', billing, custStats, settings
     });
   } catch (e) {
     logger.error('Admin dashboard error:', e);
@@ -1284,15 +1363,17 @@ router.get('/', requireAdminSession, async (req, res) => {
 
 // ─── DEVICE ROUTES (existing) ───────────────────────────────────────────────
 router.get('/devices', requireAdminSession, (req, res) => {
-  res.render('admin/dashboard', { title: 'Monitoring ONU', company: company(), version: '2.0.0', activePage: 'devices', billing: null, custStats: null });
+  const settings = getSettings();
+  res.render('admin/dashboard', { title: 'Monitoring ONU', company: company(), version: '2.0.0', activePage: 'devices', billing: null, custStats: null, settings });
 });
 
 router.get('/bulk', requireAdminSession, (req, res) => {
-  res.render('admin/dashboard', { title: 'Konfigurasi Massal', company: company(), version: '2.0.0', activePage: 'bulk', billing: null, custStats: null });
+  const settings = getSettings();
+  res.render('admin/dashboard', { title: 'Konfigurasi Massal', company: company(), version: '2.0.0', activePage: 'bulk', billing: null, custStats: null, settings });
 });
 
 // ─── CUSTOMERS ─────────────────────────────────────────────────────────────
-router.get('/customers', requireAdminSession, (req, res) => {
+router.get('/customers', requireAdminSession, requireSidebarMenuAccess('customers'), (req, res) => {
   const { search = '', status: filterStatus = '' } = req.query;
   const customers = customerSvc.getAllCustomers(search);
   const stats = customerSvc.getCustomerStats();
@@ -1759,7 +1840,7 @@ router.post('/customers/:id/billing/pay', requireAdminSession, express.urlencode
 });
 
 // ─── PACKAGES ──────────────────────────────────────────────────────────────
-router.get('/packages', requireAdminSession, (req, res) => {
+router.get('/packages', requireAdminSession, requireSidebarMenuAccess('packages'), (req, res) => {
   res.render('admin/packages', {
     title: 'Paket Internet', company: company(), activePage: 'packages',
     packages: customerSvc.getAllPackages(), msg: flashMsg(req)
@@ -1797,7 +1878,7 @@ router.post('/packages/:id/delete', requireAdminSession, (req, res) => {
 });
 
 // ─── BILLING ───────────────────────────────────────────────────────────────
-router.get('/billing', requireAdminSession, (req, res) => {
+router.get('/billing', requireAdminSession, requireSidebarMenuAccess('billing'), (req, res) => {
   const { month: filterMonth, year: filterYear = new Date().getFullYear(), status: filterStatus = 'all', search = '' } = req.query;
   const summary = billingSvc.getInvoiceSummary(filterMonth || new Date().getMonth()+1, filterYear);
   const invoices = billingSvc.getAllInvoices({ month: filterMonth, year: filterYear, status: filterStatus, search });
@@ -2146,7 +2227,7 @@ router.post('/billing/:id/delete', requireAdminSession, (req, res) => {
 // ─── TICKETS ───────────────────────────────────────────────────────────────
 const ticketSvc = require('../services/ticketService');
 
-router.get('/tickets', requireAdminSession, (req, res) => {
+router.get('/tickets', requireAdminSession, requireSidebarMenuAccess('tickets'), (req, res) => {
   const { status = 'all' } = req.query;
   const tickets = ticketSvc.getAllTickets(status);
   const stats = ticketSvc.getTicketStats();
@@ -2227,7 +2308,7 @@ router.post('/tickets/:id/delete', requireAdminSession, (req, res) => {
 });
 
 // ─── REPORTS ───────────────────────────────────────────────────────────────
-router.get('/reports', requireAdminSession, (req, res) => {
+router.get('/reports', requireAdminSession, requireSidebarMenuAccess('reports'), (req, res) => {
   const filterYear = parseInt(req.query.year) || new Date().getFullYear();
   const now = new Date();
   const monthlyData = billingSvc.getMonthlyRevenue(filterYear);
@@ -2292,7 +2373,51 @@ router.get('/reports', requireAdminSession, (req, res) => {
 });
 
 // ─── SETTINGS ──────────────────────────────────────────────────────────────
-router.get('/settings', requireAdminSession, (req, res) => {
+router.get('/sidebar-settings', requireAdminSession, (req, res) => {
+  res.render('admin/sidebar_settings', {
+    title: 'Pengaturan Sidebar',
+    company: company(),
+    activePage: 'sidebar_settings',
+    msg: flashMsg(req),
+    canManageSidebar: Boolean(req.session?.isAdmin),
+    menuConfigs: sidebarMenuSvc.getConfigMenus(),
+    featureContactPhone: sidebarMenuSvc.FEATURE_CONTACT_PHONE
+  });
+});
+
+router.post('/sidebar-settings', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    const featurePassword = String(req.body.feature_password || '').trim();
+    if (!sidebarMenuSvc.isFeaturePasswordValid(featurePassword)) {
+      throw new Error(`Password aktivasi salah. Hubungi ${sidebarMenuSvc.FEATURE_CONTACT_PHONE} untuk mendapatkan password yang benar.`);
+    }
+
+    const menuStates = sidebarMenuSvc.sanitizeMenuStates(req.body.menu_state || {});
+    const success = sidebarMenuSvc.saveMenuStates(menuStates);
+    if (!success) throw new Error('Gagal menyimpan pengaturan sidebar');
+
+    if (auditSvc && typeof auditSvc.logAuditTrail === 'function') {
+      auditSvc.logAuditTrail({
+        action: 'UPDATE',
+        entity_type: 'sidebar_settings',
+        entity_id: 'global',
+        actor_type: req.session?.isAdmin ? 'admin' : 'cashier',
+        actor_id: String(req.session?.adminUser || req.session?.cashierUsername || ''),
+        actor_name: req.session?.adminUser || req.session?.cashierName || 'Admin',
+        details: { menuStates, password_verified: true },
+        ip_address: req.ip,
+        user_agent: req.get('user-agent')
+      });
+    }
+
+    req.session._msg = { type: 'success', text: 'Pengaturan sidebar berhasil disimpan.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal menyimpan pengaturan sidebar: ' + e.message };
+  }
+  res.redirect('/admin/sidebar-settings');
+});
+
+router.get('/settings', requireAdminSession, requireSidebarMenuAccess('settings'), (req, res) => {
   const settings = getSettings();
   const protocol = req.headers['x-forwarded-proto'] || req.protocol;
   const host = req.get('host');
@@ -2307,7 +2432,7 @@ router.get('/settings', requireAdminSession, (req, res) => {
   });
 });
 
-router.get('/digiflazz', requireAdminSession, restrictToAdmin, async (req, res) => {
+router.get('/digiflazz', requireAdminSession, requireSidebarMenuAccess('digiflazz'), restrictToAdmin, async (req, res) => {
   const settings = getSettings();
   const protocol = req.headers['x-forwarded-proto'] || req.protocol;
   const host = req.get('host');
@@ -2485,7 +2610,7 @@ router.post('/digiflazz/products/update-price', requireAdminSession, restrictToA
   res.redirect('/admin/digiflazz');
 });
 
-router.get('/update', requireAdminSession, restrictToAdmin, (req, res) => {
+router.get('/update', requireAdminSession, requireSidebarMenuAccess('update'), restrictToAdmin, (req, res) => {
   const repoRoot = path.resolve(__dirname, '..');
   const info = getUpdateInfo(repoRoot);
   res.render('admin/update', {
@@ -2655,7 +2780,7 @@ router.post('/settings', requireAdminSession, express.urlencoded({ extended: tru
 });
 
 // ─── BACKUP & RECOVERY ──────────────────────────────────────────────────────
-router.get('/backup', requireAdminSession, (req, res) => {
+router.get('/backup', requireAdminSession, requireSidebarMenuAccess('backup'), (req, res) => {
   const result = backupSvc.listBackups();
   res.render('admin/backup', {
     title: 'Backup & Recovery',
@@ -2759,7 +2884,7 @@ router.post('/backup/cleanup', requireAdminSession, express.urlencoded({ extende
 });
 
 // ─── INVENTORY / WAREHOUSE ──────────────────────────────────────────────────
-router.get('/inventory', requireAdminSession, (req, res) => {
+router.get('/inventory', requireAdminSession, requireSidebarMenuAccess('inventory'), (req, res) => {
   const items = inventorySvc.getAllItems(req.query.q);
   const categories = inventorySvc.getAllCategories();
   const logs = inventorySvc.getInventoryLogs(100);
@@ -2825,7 +2950,7 @@ router.post('/inventory/stock/add', requireAdminSession, express.urlencoded({ ex
   res.redirect('/admin/inventory');
 });
 
-router.get('/audit-logs', requireAdminSession, restrictToAdmin, (req, res) => {
+router.get('/audit-logs', requireAdminSession, requireSidebarMenuAccess('audit_logs'), restrictToAdmin, (req, res) => {
   const filters = {
     action: req.query.action || null,
     entity_type: req.query.entity_type || null,
@@ -2845,11 +2970,12 @@ router.get('/audit-logs', requireAdminSession, restrictToAdmin, (req, res) => {
 });
 
 // ─── MONITORING ──────────────────────────────────────────────────────────────
-router.get('/monitoring', requireAdminSession, restrictToAdmin, async (req, res) => {
+router.get('/monitoring', requireAdminSession, requireSidebarMenuAccess('monitoring'), restrictToAdmin, async (req, res) => {
   const healthStatus = monitoringSvc.getHealthStatus();
   const performanceSummary = monitoringSvc.getPerformanceSummary();
   const dependencies = await diagnosticsSvc.checkDependencies();
   const recentErrors = diagnosticsSvc.getRecentErrors(10);
+  const settings = getSettings(); // Get current settings
 
   res.render('admin/monitoring', {
       title: 'Monitoring Sistem',
@@ -2858,7 +2984,8 @@ router.get('/monitoring', requireAdminSession, restrictToAdmin, async (req, res)
       healthStatus,
       performanceSummary,
       dependencies,
-      recentErrors
+      recentErrors,
+      settings // Pass settings to view
     });
 });
 
@@ -2876,6 +3003,90 @@ router.get('/api/metrics/history', requireAdmin, (req, res) => {
   const limit = parseInt(req.query.limit) || 10;
   const history = monitoringSvc.getMetricsHistory(limit);
   res.json(history);
+});
+
+// ─── GENIEACS SETTINGS API ──────────────────────────────────────────────────
+router.post('/api/genieacs/settings', requireAdmin, async (req, res) => {
+  try {
+    const { genieacs_timeout, genieacs_rxpower_threshold, genieacs_monitoring_interval, genieacs_monitoring_enabled } = req.body;
+    
+    // Validate input
+    if (genieacs_timeout < 5000 || genieacs_timeout > 120000) {
+      return res.json({ success: false, message: 'Timeout harus antara 5000-120000 ms' });
+    }
+    if (genieacs_rxpower_threshold < -40 || genieacs_rxpower_threshold > -15) {
+      return res.json({ success: false, message: 'RX Power threshold harus antara -40 sampai -15 dBm' });
+    }
+    if (genieacs_monitoring_interval < 1 || genieacs_monitoring_interval > 24) {
+      return res.json({ success: false, message: 'Monitoring interval harus antara 1-24 jam' });
+    }
+
+    // Update settings
+    const currentSettings = getSettings();
+    currentSettings.genieacs_timeout = parseInt(genieacs_timeout);
+    currentSettings.genieacs_rxpower_threshold = parseFloat(genieacs_rxpower_threshold);
+    currentSettings.genieacs_monitoring_interval = parseInt(genieacs_monitoring_interval);
+    currentSettings.genieacs_monitoring_enabled = Boolean(genieacs_monitoring_enabled);
+
+    // Save to file
+    const fs = require('fs');
+    const path = require('path');
+    const settingsPath = path.join(__dirname, '../settings.json');
+    fs.writeFileSync(settingsPath, JSON.stringify(currentSettings, null, 2), 'utf8');
+
+    // Log audit
+    try {
+      if (auditSvc && typeof auditSvc.logAuditTrail === 'function') {
+        auditSvc.logAuditTrail({
+          action: 'UPDATE',
+          entity_type: 'genieacs_settings',
+          entity_id: 'settings.json',
+          actor_type: req.session.isAdmin ? 'admin' : 'cashier',
+          actor_id: req.session.adminUser || req.session.cashierUsername || 'admin',
+          actor_name: req.session.adminUser || req.session.cashierName || 'Admin',
+          details: {
+            timeout: genieacs_timeout,
+            rxpower_threshold: genieacs_rxpower_threshold,
+            monitoring_interval: genieacs_monitoring_interval,
+            monitoring_enabled: genieacs_monitoring_enabled
+          },
+          ip_address: req.ip || req.connection.remoteAddress,
+          user_agent: req.headers['user-agent']
+        });
+      } else {
+        logger.warn('[API] auditSvc.logAuditTrail is not available');
+      }
+    } catch (auditError) {
+      logger.error('[API] Error logging audit trail:', auditError);
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Pengaturan GenieACS berhasil disimpan. Restart aplikasi untuk menerapkan perubahan timeout.' 
+    });
+  } catch (error) {
+    logger.error('[API] Error saving GenieACS settings:', error);
+    res.json({ success: false, message: 'Error: ' + error.message });
+  }
+});
+
+router.get('/api/genieacs/test', requireAdmin, async (req, res) => {
+  try {
+    const genieacs = require('../config/genieacs');
+    const devices = await genieacs.getDevices();
+    
+    res.json({ 
+      success: true, 
+      message: 'Koneksi ke GenieACS berhasil!',
+      deviceCount: devices.length
+    });
+  } catch (error) {
+    logger.error('[API] Error testing GenieACS connection:', error);
+    res.json({ 
+      success: false, 
+      message: 'Koneksi gagal: ' + error.message 
+    });
+  }
 });
 
 // ─── API ROUTES (existing) ──────────────────────────────────────────────────
@@ -3068,7 +3279,7 @@ router.get('/api/mikrotik/users', requireAdmin, async (req, res) => {
 });
 
 // ─── MIKROTIK MONITORING ───────────────────────────────────────────────────
-router.get('/mikrotik', requireAdminSession, (req, res) => {
+router.get('/mikrotik', requireAdminSession, requireSidebarMenuAccess('mikrotik'), (req, res) => {
   const routers = mikrotikService.getAllRouters();
   res.render('admin/mikrotik', {
     title: 'Monitoring MikroTik', company: company(), activePage: 'mikrotik', 
@@ -3858,13 +4069,13 @@ function isTemporaryError(errorMessage) {
 // Global message history untuk duplicate detection
 global.broadcastMessageHistory = new Map();
 
-router.get('/whatsapp', requireAdminSession, async (req, res) => {
+router.get('/whatsapp', requireAdminSession, requireSidebarMenuAccess('whatsapp'), async (req, res) => {
   res.render('admin/whatsapp', {
     title: 'Status WhatsApp', company: company(), activePage: 'whatsapp', msg: flashMsg(req)
   });
 });
 
-router.get('/whatsapp/broadcast', requireAdminSession, (req, res) => {
+router.get('/whatsapp/broadcast', requireAdminSession, requireSidebarMenuAccess('broadcast'), (req, res) => {
   res.render('admin/broadcast', {
     title: 'Broadcast WhatsApp', company: company(), activePage: 'broadcast', msg: flashMsg(req),
     broadcastStatus: global.broadcastStatus, getSetting
@@ -4168,7 +4379,7 @@ router.post('/whatsapp/reset', requireAdminSession, (req, res) => {
 });
 
 // ─── ROUTERS (MULTI-ROUTER) ──────────────────────────────────────────────────
-router.get('/routers', requireAdminSession, (req, res) => {
+router.get('/routers', requireAdminSession, requireSidebarMenuAccess('mikrotik'), (req, res) => {
   res.render('admin/routers', {
     title: 'Manajemen Router', company: company(), activePage: 'mikrotik',
     routers: mikrotikService.getAllRouters(), msg: flashMsg(req)
@@ -4266,7 +4477,7 @@ router.get('/api/mikrotik/users/:routerId', requireAdmin, async (req, res) => {
 // ─── ATTENDANCE MANAGEMENT ───────────────────────────────────────────────────
 
 // Attendance dashboard
-router.get('/attendance', requireAdminSession, (req, res) => {
+router.get('/attendance', requireAdminSession, requireSidebarMenuAccess('attendance'), (req, res) => {
   try {
     const date = req.query.date || new Date().toISOString().split('T')[0];
     const attendances = attendanceSvc.getAttendanceByDate(date);
@@ -4398,9 +4609,11 @@ router.get('/attendance/export', requireAdminSession, (req, res) => {
       'Check In': a.check_in_time,
       'Lokasi Check In': a.check_in_lat && a.check_in_lng ? `${a.check_in_lat}, ${a.check_in_lng}` : '-',
       'Catatan Check In': a.check_in_note || '-',
+      'Foto Check In': a.check_in_photo || '-',
       'Check Out': a.check_out_time || '-',
       'Lokasi Check Out': a.check_out_lat && a.check_out_lng ? `${a.check_out_lat}, ${a.check_out_lng}` : '-',
       'Catatan Check Out': a.check_out_note || '-',
+      'Foto Check Out': a.check_out_photo || '-',
       'Durasi (menit)': a.work_duration_minutes || 0,
       'Status': a.status
     }));
@@ -4423,7 +4636,7 @@ router.get('/attendance/export', requireAdminSession, (req, res) => {
 
 // ─── PAYROLL / GAJI KARYAWAN ───────────────────────────────────────────────
 
-router.get('/payroll', requireAdmin, (req, res) => {
+router.get('/payroll', requireAdmin, requireSidebarMenuAccess('payroll'), (req, res) => {
   const now = new Date();
   const month = parseInt(req.query.month) || (now.getMonth() + 1);
   const year = parseInt(req.query.year) || now.getFullYear();

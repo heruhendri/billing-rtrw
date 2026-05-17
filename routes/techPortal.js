@@ -8,6 +8,40 @@ const mikrotikService = require('../services/mikrotikService');
 const db = require('../config/database');
 const oltSvc = require('../services/oltService');
 const attendanceSvc = require('../services/attendanceService');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const { uploadAttendance, removeAttendanceFile } = require('../middleware/attendanceUpload');
+
+// Configure multer for photo uploads
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadDir = path.join(__dirname, '../public/uploads/tickets');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, 'ticket-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB max
+  fileFilter: function (req, file, cb) {
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Hanya file gambar yang diperbolehkan (JPEG, PNG, GIF, WebP)'));
+    }
+  }
+});
 
 const waSendDedup = new Map();
 function normalizeWaDigits(input) {
@@ -137,13 +171,35 @@ router.post('/tickets/:id/take', requireTechSession, (req, res) => {
   res.redirect('/tech');
 });
 
-router.post('/tickets/:id/update', requireTechSession, express.urlencoded({ extended: true }), async (req, res) => {
+router.post('/tickets/:id/update', requireTechSession, upload.array('photos', 10), async (req, res) => {
   try {
-    const { status } = req.body;
+    const { status, notes } = req.body;
     const ticketId = req.params.id;
     const techId = req.session.techId;
     
-    techSvc.updateTicketStatus(ticketId, techId, status);
+    // Prepare photo data
+    let photoPaths = [];
+    let photoMetadata = [];
+    
+    if (req.files && req.files.length > 0) {
+      photoPaths = req.files.map(f => '/uploads/tickets/' + f.filename);
+      photoMetadata = req.files.map((f, idx) => ({
+        filename: f.filename,
+        originalName: f.originalname,
+        size: f.size,
+        uploadedAt: new Date().toISOString(),
+        lat: req.body[`photo_lat_${idx}`] || '',
+        lng: req.body[`photo_lng_${idx}`] || ''
+      }));
+    }
+    
+    // Update ticket with photos and notes
+    techSvc.updateTicketStatus(ticketId, techId, status, {
+      notes: notes || '',
+      photos: JSON.stringify(photoPaths),
+      photoMetadata: JSON.stringify(photoMetadata)
+    });
+    
     req.session._msg = { type: 'success', text: 'Status keluhan berhasil diperbarui.' };
 
     // --- WHATSAPP NOTIFICATION FOR RESOLVED TICKET ---
@@ -158,11 +214,14 @@ router.post('/tickets/:id/update', requireTechSession, express.urlencoded({ exte
           const ticket = ticketSvc.getTicketById(ticketId);
           
           if (ticket) {
+            const photoCount = photoPaths.length;
+            const photoText = photoCount > 0 ? `\n📸 *Foto Pekerjaan:* ${photoCount} foto terlampir` : '';
+            
             const waMsg = `✅ *TIKET KELUHAN SELESAI*\n\n` +
                          `🎫 *ID Tiket:* #${ticket.id}\n` +
                          `👤 *Pelanggan:* ${ticket.customer_name}\n` +
                          `📝 *Subjek:* ${ticket.subject}\n` +
-                         `🛠️ *Teknisi:* ${req.session.techName}\n\n` +
+                         `🛠️ *Teknisi:* ${req.session.techName}${photoText}\n\n` +
                          `Keluhan Anda telah selesai dikerjakan. Terima kasih atas kesabarannya.`;
 
             // Kirim ke Pelanggan
@@ -174,14 +233,15 @@ router.post('/tickets/:id/update', requireTechSession, express.urlencoded({ exte
               }
             }
 
-            // Kirim ke Admin
+            // Kirim ke Admin dengan info foto
             if (settings.whatsapp_admin_numbers && settings.whatsapp_admin_numbers.length > 0) {
+              const notesText = notes ? `\n💬 *Catatan:* ${notes}` : '';
               const adminMsg = `✅ *LAPORAN TIKET SELESAI*\n\n` +
                                `🎫 *ID Tiket:* #${ticket.id}\n` +
                                `👤 *Pelanggan:* ${ticket.customer_name}\n` +
                                `🛠️ *Teknisi:* ${req.session.techName}\n` +
                                `📝 *Subjek:* ${ticket.subject}\n` +
-                               `💬 *Pesan:* ${ticket.message}`;
+                               `💬 *Pesan:* ${ticket.message}${notesText}${photoText}`;
               const recipients = new Set();
               for (const adminPhone of settings.whatsapp_admin_numbers) {
                 const digits = normalizeWaDigits(adminPhone);
@@ -540,15 +600,26 @@ router.get('/attendance', requireTechSession, (req, res) => {
 });
 
 // Check-in
-router.post('/attendance/checkin', requireTechSession, express.json(), (req, res) => {
+router.post('/attendance/checkin', requireTechSession, uploadAttendance.single('photo'), (req, res) => {
   try {
     const techId = req.session.techId;
     const techName = req.session.techName;
+
+    if (!req.file) {
+      return res.json({ success: false, message: 'Foto check-in wajib diunggah' });
+    }
     
     // Check if already checked in today
     const today = attendanceSvc.getTodayAttendance('technician', techId);
     if (today) {
+      removeAttendanceFile(req.file);
       return res.json({ success: false, message: 'Anda sudah melakukan check-in hari ini' });
+    }
+    
+    // Prepare photo path
+    let photoPath = '';
+    if (req.file) {
+      photoPath = '/uploads/attendance/' + req.file.filename;
     }
     
     const result = attendanceSvc.checkIn({
@@ -557,38 +628,54 @@ router.post('/attendance/checkin', requireTechSession, express.json(), (req, res
       employee_name: techName,
       lat: req.body.lat || '',
       lng: req.body.lng || '',
-      note: req.body.note || ''
+      note: req.body.note || '',
+      photo: photoPath
     });
     
     res.json({ success: true, message: 'Check-in berhasil!', id: result.lastInsertRowid });
   } catch (e) {
+    removeAttendanceFile(req.file);
     res.json({ success: false, message: 'Gagal check-in: ' + e.message });
   }
 });
 
 // Check-out
-router.post('/attendance/checkout', requireTechSession, express.json(), (req, res) => {
+router.post('/attendance/checkout', requireTechSession, uploadAttendance.single('photo'), (req, res) => {
   try {
     const techId = req.session.techId;
+
+    if (!req.file) {
+      return res.json({ success: false, message: 'Foto check-out wajib diunggah' });
+    }
     
     // Get today's attendance
     const today = attendanceSvc.getTodayAttendance('technician', techId);
     if (!today) {
+      removeAttendanceFile(req.file);
       return res.json({ success: false, message: 'Anda belum check-in hari ini' });
     }
     
     if (today.status === 'checked_out') {
+      removeAttendanceFile(req.file);
       return res.json({ success: false, message: 'Anda sudah check-out hari ini' });
+    }
+    
+    // Prepare photo path
+    let photoPath = '';
+    if (req.file) {
+      photoPath = '/uploads/attendance/' + req.file.filename;
     }
     
     attendanceSvc.checkOut(today.id, {
       lat: req.body.lat || '',
       lng: req.body.lng || '',
-      note: req.body.note || ''
+      note: req.body.note || '',
+      photo: photoPath
     });
     
     res.json({ success: true, message: 'Check-out berhasil!' });
   } catch (e) {
+    removeAttendanceFile(req.file);
     res.json({ success: false, message: 'Gagal check-out: ' + e.message });
   }
 });

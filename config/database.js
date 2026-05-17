@@ -113,6 +113,11 @@ db.exec(`
     message TEXT NOT NULL,
     status TEXT DEFAULT 'open', -- open, in_progress, resolved
     technician_id INTEGER REFERENCES technicians(id) ON DELETE SET NULL,
+    technician_notes TEXT DEFAULT '',
+    photos TEXT DEFAULT '', -- JSON array of photo paths
+    photo_metadata TEXT DEFAULT '', -- JSON array of metadata (timestamp, gps, etc)
+    customer_photos TEXT DEFAULT '', -- JSON array of customer uploaded photos
+    customer_photo_metadata TEXT DEFAULT '', -- JSON array of customer photo metadata
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
@@ -548,10 +553,12 @@ db.exec(`
     check_in_lat TEXT DEFAULT '',
     check_in_lng TEXT DEFAULT '',
     check_in_note TEXT DEFAULT '',
+    check_in_photo TEXT DEFAULT '', -- Path to check-in photo
     check_out_time DATETIME,
     check_out_lat TEXT DEFAULT '',
     check_out_lng TEXT DEFAULT '',
     check_out_note TEXT DEFAULT '',
+    check_out_photo TEXT DEFAULT '', -- Path to check-out photo
     work_duration_minutes INTEGER DEFAULT 0,
     status TEXT DEFAULT 'checked_in', -- checked_in, checked_out
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
