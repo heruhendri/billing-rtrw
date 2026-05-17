@@ -100,11 +100,131 @@ function saveSettings(newSettings) {
   }
 }
 
+/**
+ * Helper untuk mendapatkan waktu sekarang dalam format lokal
+ * sesuai timezone yang diatur di settings.json
+ */
+function getNowLocal() {
+  const tz = getSetting('timezone', 'Asia/Jakarta');
+  const now = new Date();
+  const options = {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  };
+  const formatter = new Intl.DateTimeFormat('en-US', options);
+  const parts = formatter.formatToParts(now);
+  const p = {};
+  parts.forEach(part => p[part.type] = part.value);
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
+}
+
+/**
+ * Helper untuk mendapatkan objek Date yang sudah disesuaikan dengan timezone di settings.
+ * Mengembalikan objek Date yang "angkanya" sudah sesuai dengan waktu lokal.
+ */
+function getCurrentDateInTimezone() {
+  const tz = getSetting('timezone', 'Asia/Jakarta');
+  const now = new Date();
+  
+  // Ambil string format ISO lokal
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false
+  });
+  
+  const parts = formatter.formatToParts(now);
+  const p = {};
+  parts.forEach(part => p[part.type] = part.value);
+  
+  // Buat objek Date baru dengan nilai lokal tersebut
+  return new Date(`${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}`);
+}
+
+/**
+ * Mendapatkan info waktu sekarang (year, month, day, dll) dalam timezone yang diatur.
+ */
+function getCurrentTimeInfo() {
+  const tz = getSetting('timezone', 'Asia/Jakarta');
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    year: 'numeric', month: 'numeric', day: 'numeric',
+    hour: 'numeric', minute: 'numeric', second: 'numeric',
+    hour12: false
+  });
+  
+  const parts = formatter.formatToParts(now);
+  const p = {};
+  parts.forEach(part => p[part.type] = part.value);
+  
+  return {
+    year: parseInt(p.year),
+    month: parseInt(p.month),
+    day: parseInt(p.day),
+    hour: parseInt(p.hour),
+    minute: parseInt(p.minute),
+    second: parseInt(p.second)
+  };
+}
+
+/**
+ * Mendapatkan string ISO-like tapi dalam waktu lokal (bukan UTC).
+ * Berguna untuk timestamp log/backup.
+ */
+function getNowLocalISO() {
+  const info = getCurrentTimeInfo();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${info.year}-${pad(info.month)}-${pad(info.day)}T${pad(info.hour)}:${pad(info.minute)}:${pad(info.second)}`;
+}
+
+/**
+ * Memparse string tanggal (YYYY-MM-DD HH:mm:ss) menjadi objek Date
+ * dengan asumsi string tersebut adalah waktu lokal sesuai setting timezone.
+ */
+function parseDateInTimezone(dateStr) {
+  if (!dateStr) return null;
+  const tz = getSetting('timezone', 'Asia/Jakarta');
+  
+  const date = new Date(dateStr.replace(' ', 'T'));
+  if (isNaN(date.getTime())) return null;
+
+  const localDateStr = date.toLocaleString('en-US', { timeZone: tz, hour12: false });
+  const localDate = new Date(localDateStr);
+  const diff = localDate.getTime() - date.getTime();
+  
+  return new Date(date.getTime() - diff);
+}
+
+/**
+ * Helper untuk memformat objek Date menjadi string waktu lokal
+ */
+function formatDateLocal(date) {
+  if (!date) return '-';
+  const tz = getSetting('timezone', 'Asia/Jakarta');
+  const d = typeof date === 'string' || typeof date === 'number' ? new Date(date) : date;
+  if (isNaN(d.getTime())) return '-';
+  return d.toLocaleString('id-ID', { timeZone: tz });
+}
+
 module.exports = {
   getSettings,
   getSettingsWithCache,
   getSetting,
   getSettingsByKeys,
   saveSettings,
+  getNowLocal,
+  formatDateLocal,
+  getCurrentDateInTimezone,
+  getCurrentTimeInfo,
+  getNowLocalISO,
+  parseDateInTimezone,
   startSettingsWatcher
 }; 

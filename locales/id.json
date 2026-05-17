@@ -957,6 +957,7 @@
       "office_lng": "Longitude Kantor",
       "operational_hours": "Jam Operasional",
       "server_port": "Port Server",
+      "timezone": "Zona Waktu (WIB/WITA/WIT)",
       "customer_otp_login": "Login OTP Pelanggan",
       "otp_enabled": "Aktif (Kirim via WA)",
       "otp_disabled": "Nonaktif (Langsung)",
@@ -1137,7 +1138,8 @@
       "about": "Tentang Kami",
       "tos": "Ketentuan Layanan",
       "privacy": "Kebijakan Privasi",
-      "contact": "Kontak"
+      "contact": "Kontak",
+      "refund": "Kebijakan Refund"
     },
     "payment": {
       "choose_title": "Pilih Pembayaran",

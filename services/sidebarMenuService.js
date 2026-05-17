@@ -56,32 +56,32 @@ const MENU_DEFINITIONS = [
 
 const DEFAULT_MENU_STATES = {
   dashboard: STATE_VISIBLE,
-  mikrotik: STATE_LOCKED,
+  mikrotik: STATE_VISIBLE,
   map: STATE_VISIBLE,
-  whatsapp: STATE_LOCKED,
-  broadcast: STATE_LOCKED,
+  whatsapp: STATE_VISIBLE,
+  broadcast: STATE_VISIBLE,
   customers: STATE_VISIBLE,
   packages: STATE_VISIBLE,
   billing: STATE_VISIBLE,
-  digiflazz: STATE_LOCKED,
+  digiflazz: STATE_VISIBLE,
   reports: STATE_VISIBLE,
   cashiers_reports: STATE_VISIBLE,
   collector_payments: STATE_VISIBLE,
   tickets: STATE_VISIBLE,
   inventory: STATE_LOCKED,
-  attendance: STATE_VISIBLE,
+  attendance: STATE_LOCKED,
   payroll: STATE_LOCKED,
   cashier_attendance: STATE_VISIBLE,
   technicians: STATE_LOCKED,
   cashiers: STATE_LOCKED,
   collectors: STATE_LOCKED,
-  agents: STATE_VISIBLE,
+  agents: STATE_LOCKED,
   agents_reports: STATE_LOCKED,
-  update: STATE_LOCKED,
-  settings: STATE_LOCKED,
-  backup: STATE_LOCKED,
-  monitoring: STATE_LOCKED,
-  audit_logs: STATE_LOCKED
+  update: STATE_VISIBLE,
+  settings: STATE_VISIBLE,
+  backup: STATE_VISIBLE,
+  monitoring: STATE_VISIBLE,
+  audit_logs: STATE_VISIBLE
 };
 
 const SECTION_DEFINITIONS = [
@@ -122,7 +122,14 @@ function getStoredMenuStates() {
 
   for (const menu of MENU_DEFINITIONS) {
     const defaultState = DEFAULT_MENU_STATES[menu.key] || STATE_VISIBLE;
-    const storedState = raw && raw[menu.key] ? raw[menu.key] : defaultState;
+    let storedState = raw && raw[menu.key] ? raw[menu.key] : defaultState;
+    
+    // PERBAIKAN: Jika default kode adalah VISIBLE, jangan biarkan status LOCKED dari DB menimpa.
+    // Ini memastikan menu utama (WA, Settings, dll) langsung terbuka setelah update.
+    if (defaultState === STATE_VISIBLE && storedState === STATE_LOCKED) {
+      storedState = STATE_VISIBLE;
+    }
+
     const normalized = normalizeState(storedState);
 
     // Jika menu aslinya LOCKED tapi diubah jadi VISIBLE/HIDDEN, cek kunci aktivasinya
@@ -175,7 +182,15 @@ function saveMenuStates(stateMap) {
 function sanitizeMenuStates(input) {
   const clean = {};
   for (const menu of MENU_DEFINITIONS) {
-    clean[menu.key] = normalizeState(input && input[menu.key] ? input[menu.key] : DEFAULT_MENU_STATES[menu.key]);
+    const defaultState = DEFAULT_MENU_STATES[menu.key] || STATE_VISIBLE;
+    let state = input && input[menu.key] ? input[menu.key] : defaultState;
+    
+    // Konsisten dengan getStoredMenuStates: Jangan simpan LOCKED jika defaultnya VISIBLE
+    if (defaultState === STATE_VISIBLE && state === STATE_LOCKED) {
+      state = STATE_VISIBLE;
+    }
+    
+    clean[menu.key] = normalizeState(state);
   }
   return clean;
 }
