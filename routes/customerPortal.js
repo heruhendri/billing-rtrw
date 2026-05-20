@@ -1021,6 +1021,9 @@ router.use((req, res, next) => {
 });
 
 router.get('/dashboard', async (req, res) => {
+  // Debug logging
+  logger.info(`[Dashboard] Session ID: ${req.sessionID}, Phone: ${req.session?.phone || 'TIDAK ADA'}`);
+  
   const loginId = req.session && req.session.phone;
   if (!loginId) return res.redirect('/customer/login');
   
@@ -1682,8 +1685,10 @@ router.get('/payment/create/:invoiceId', async (req, res) => {
     }
 
     const gateway = settings.default_gateway || 'tripay';
-    const method = 'QRIS';
+    const method = req.query.method || 'QRIS';
     const cust = customerSvc.getCustomerById(inv.customer_id);
+    
+    logger.info(`[Payment] Creating payment for INV-${inv.id}, Gateway: ${gateway}, Method: ${method}`);
     
     // Tentukan base URL aplikasi untuk callback
     const protocol = req.headers['x-forwarded-proto'] || req.protocol;
@@ -2025,10 +2030,21 @@ function adjustCustomerBalance(customerId, delta, note = '') {
 // Halaman PPOB & saldo untuk pelanggan (wajib login)
 router.get('/ppob', (req, res) => {
   const settings = getSettingsWithCache();
-  if (!req.session.phone) return res.redirect('/customer/login?next=/customer/ppob');
+  
+  // Debug logging
+  logger.info(`[PPOB] Session ID: ${req.sessionID}, Phone: ${req.session?.phone || 'TIDAK ADA'}`);
+  logger.info(`[PPOB] Session object: ${JSON.stringify(req.session)}`);
+  
+  if (!req.session.phone) {
+    logger.warn('[PPOB] Session phone tidak ditemukan, redirect ke login');
+    return res.redirect('/customer/login?next=/customer/ppob');
+  }
 
   const customer = customerSvc.findCustomerByAny(req.session.phone);
-  if (!customer) return res.redirect('/customer/login');
+  if (!customer) {
+    logger.warn('[PPOB] Customer tidak ditemukan untuk phone: ' + req.session.phone);
+    return res.redirect('/customer/login');
+  }
 
   const digiflazzConfigured = Boolean(
     String(settings.digiflazz_username || '').trim() &&
@@ -2132,13 +2148,47 @@ router.get('/topup', async (req, res) => {
 
   let paymentChannels = [];
   try {
-    if (settings.tripay_enabled) {
+    const gateway = settings.default_gateway || 'tripay';
+    if (gateway === 'tripay' && settings.tripay_enabled) {
       paymentChannels = await paymentSvc.getTripayChannels();
       const qris = paymentChannels.find(c => String(c.code||'').toUpperCase()==='QRIS');
       const others = paymentChannels.filter(c => String(c.code||'').toUpperCase()!=='QRIS');
       paymentChannels = [...(qris?[qris]:[]), ...others];
+    } else if (gateway === 'midtrans' && settings.midtrans_enabled) {
+      paymentChannels = [
+        { code: 'SNAP', name: 'Semua Metode (Snap)', group: 'E-Wallet', active: true },
+        { code: 'QRIS', name: 'QRIS', group: 'E-Wallet', active: true },
+        { code: 'BCAVA', name: 'BCA Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'BNIVA', name: 'BNI Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'BRIVA', name: 'BRI Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'PERMATAVA', name: 'Permata Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'MANDIRIVA', name: 'Mandiri Virtual Account', group: 'Virtual Account', active: true }
+      ];
+    } else if (gateway === 'xendit' && settings.xendit_enabled) {
+      paymentChannels = [
+        { code: 'XENDIT', name: 'Semua Metode', group: 'E-Wallet', active: true },
+        { code: 'QRIS', name: 'QRIS', group: 'E-Wallet', active: true },
+        { code: 'BCAVA', name: 'BCA Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'BNIVA', name: 'BNI Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'BRIVA', name: 'BRI Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'PERMATAVA', name: 'Permata Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'MANDIRIVA', name: 'Mandiri Virtual Account', group: 'Virtual Account', active: true }
+      ];
+    } else if (gateway === 'duitku' && settings.duitku_enabled) {
+      paymentChannels = [
+        { code: 'DUITKU', name: 'Semua Metode', group: 'E-Wallet', active: true },
+        { code: 'QRIS', name: 'QRIS', group: 'E-Wallet', active: true },
+        { code: 'BCAVA', name: 'BCA Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'BNIVA', name: 'BNI Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'BRIVA', name: 'BRI Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'PERMATAVA', name: 'Permata Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'MANDIRIVA', name: 'Mandiri Virtual Account', group: 'Virtual Account', active: true }
+      ];
     }
-  } catch(e) { paymentChannels = []; }
+  } catch(e) {
+    logger.error('[TopUp] Error fetching payment channels:', e.message);
+    paymentChannels = [];
+  }
 
   const history = db.prepare(`SELECT * FROM customer_topup_requests WHERE customer_id = ? ORDER BY id DESC LIMIT 10`).all(customer.id);
 
@@ -2161,6 +2211,7 @@ router.post('/topup/create', express.urlencoded({ extended: true }), async (req,
   if (!customer) return redirectErr('Sesi tidak valid');
 
   const amount = parseInt(req.body.amount || '0');
+  const method = String(req.body.method || 'QRIS').toUpperCase();
   const MIN_TOPUP = 10000;
   if (!amount || amount < MIN_TOPUP) return redirectErr(`Minimal top-up Rp ${MIN_TOPUP.toLocaleString('id-ID')}`);
 
@@ -2184,10 +2235,10 @@ router.post('/topup/create', express.urlencoded({ extended: true }), async (req,
     const returnPath = `/customer/topup?info=${encodeURIComponent('Menunggu konfirmasi pembayaran...')}`;
 
     let result;
-    if (gateway === 'midtrans') result = await paymentSvc.createMidtransTransaction(invoiceLike, buyer, 'snap', appUrl, { returnPath, orderPrefix: 'TOPUP', itemName: invoiceLike.item_name });
-    else if (gateway === 'xendit') result = await paymentSvc.createXenditTransaction(invoiceLike, buyer, 'xendit', appUrl, { returnPath, orderPrefix: 'TOPUP', description: invoiceLike.item_name });
-    else if (gateway === 'duitku') result = await paymentSvc.createDuitkuTransaction(invoiceLike, buyer, 'duitku', appUrl, { returnPath, orderPrefix: 'TOPUP', itemName: invoiceLike.item_name });
-    else result = await paymentSvc.createTripayTransaction(invoiceLike, buyer, 'QRIS', appUrl, { returnPath, orderPrefix: 'TOPUP', itemName: invoiceLike.item_name, sku: invoiceLike.sku, callbackPath: '/customer/payment/callback' });
+    if (gateway === 'midtrans') result = await paymentSvc.createMidtransTransaction(invoiceLike, buyer, method === 'SNAP' ? 'snap' : method, appUrl, { returnPath, orderPrefix: 'TOPUP', itemName: invoiceLike.item_name });
+    else if (gateway === 'xendit') result = await paymentSvc.createXenditTransaction(invoiceLike, buyer, method === 'XENDIT' ? 'xendit' : method, appUrl, { returnPath, orderPrefix: 'TOPUP', description: invoiceLike.item_name });
+    else if (gateway === 'duitku') result = await paymentSvc.createDuitkuTransaction(invoiceLike, buyer, method === 'DUITKU' ? 'duitku' : method, appUrl, { returnPath, orderPrefix: 'TOPUP', itemName: invoiceLike.item_name });
+    else result = await paymentSvc.createTripayTransaction(invoiceLike, buyer, method, appUrl, { returnPath, orderPrefix: 'TOPUP', itemName: invoiceLike.item_name, sku: invoiceLike.sku, callbackPath: '/customer/payment/callback' });
 
     if (!result.success) throw new Error(result.message || 'Gagal membuat transaksi');
 
