@@ -2846,11 +2846,18 @@ router.post('/settings', requireAdminSession, express.urlencoded({ extended: tru
     if (newSettings.midtrans_enabled === 'true') newSettings.midtrans_enabled = true;
     else if (newSettings.midtrans_enabled === 'false') newSettings.midtrans_enabled = false;
 
+    if (newSettings.xendit_enabled === 'true') newSettings.xendit_enabled = true;
+    else if (newSettings.xendit_enabled === 'false') newSettings.xendit_enabled = false;
+
+    if (newSettings.duitku_enabled === 'true') newSettings.duitku_enabled = true;
+    else if (newSettings.duitku_enabled === 'false') newSettings.duitku_enabled = false;
+
     if (newSettings.default_gateway) newSettings.default_gateway = newSettings.default_gateway.toLowerCase();
 
     if (typeof newSettings.whatsapp_admin_numbers === 'string') {
       newSettings.whatsapp_admin_numbers = newSettings.whatsapp_admin_numbers.split(',').map(n => n.trim()).filter(Boolean);
     }
+    // whatsapp_tech_numbers removed - now automatically fetched from technicians table
     if (newSettings.server_port) newSettings.server_port = parseInt(newSettings.server_port);
     if (newSettings.mikrotik_port) newSettings.mikrotik_port = parseInt(newSettings.mikrotik_port);
     if (newSettings.whatsapp_broadcast_delay) newSettings.whatsapp_broadcast_delay = parseInt(newSettings.whatsapp_broadcast_delay);
