@@ -58,8 +58,8 @@ function getCustomerById(id) {
 
 function createCustomer(data) {
   return db.prepare(`
-    INSERT INTO customers (name, phone, email, address, package_id, router_id, olt_id, odp_id, pon_port, lat, lng, genieacs_tag, pppoe_username, isolir_profile, status, install_date, notes, auto_isolate, isolate_day, connection_type, static_ip, mac_address, hotspot_username, hotspot_password, hotspot_profile)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO customers (name, phone, email, address, package_id, router_id, olt_id, odp_id, pon_port, lat, lng, genieacs_tag, pppoe_username, pppoe_password, pppoe_remote_address, isolir_profile, status, install_date, notes, auto_isolate, isolate_day, connection_type, static_ip, mac_address, hotspot_username, hotspot_password, hotspot_profile, collector_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     data.name, data.phone || '', data.email || '', data.address || '',
     data.package_id ? parseInt(data.package_id) : null,
@@ -69,7 +69,9 @@ function createCustomer(data) {
     data.pon_port || '',
     data.lat || '',
     data.lng || '',
-    data.genieacs_tag || '', data.pppoe_username || '', 
+    data.genieacs_tag || '', data.pppoe_username || '',
+    data.pppoe_password || '',
+    data.pppoe_remote_address || '',
     data.isolir_profile || 'isolir',
     data.status || 'active',
     data.install_date || null, data.notes || '',
@@ -80,7 +82,8 @@ function createCustomer(data) {
     data.mac_address || '',
     data.hotspot_username || '',
     data.hotspot_password || '',
-    data.hotspot_profile || ''
+    data.hotspot_profile || '',
+    data.collector_id ? parseInt(data.collector_id) : null
   );
 }
 
@@ -90,7 +93,7 @@ function updateCustomer(id, data) {
   const pkgChanged = prev && Number(prev.package_id || 0) !== Number(newPkgId || 0);
 
   const result = db.prepare(`
-    UPDATE customers SET name=?, phone=?, email=?, address=?, package_id=?, router_id=?, olt_id=?, odp_id=?, pon_port=?, lat=?, lng=?, genieacs_tag=?, pppoe_username=?, isolir_profile=?, status=?, install_date=?, notes=?, auto_isolate=?, isolate_day=?, cable_path=?, connection_type=?, static_ip=?, mac_address=?, hotspot_username=?, hotspot_password=?, hotspot_profile=?
+    UPDATE customers SET name=?, phone=?, email=?, address=?, package_id=?, router_id=?, olt_id=?, odp_id=?, pon_port=?, lat=?, lng=?, genieacs_tag=?, pppoe_username=?, pppoe_password=?, pppoe_remote_address=?, isolir_profile=?, status=?, install_date=?, notes=?, auto_isolate=?, isolate_day=?, cable_path=?, connection_type=?, static_ip=?, mac_address=?, hotspot_username=?, hotspot_password=?, hotspot_profile=?, collector_id=?
     WHERE id=?
   `).run(
     data.name, data.phone || '', data.email || '', data.address || '',
@@ -101,7 +104,9 @@ function updateCustomer(id, data) {
     data.pon_port || '',
     data.lat || '',
     data.lng || '',
-    data.genieacs_tag || '', data.pppoe_username || '', 
+    data.genieacs_tag || '', data.pppoe_username || '',
+    data.pppoe_password || '',
+    data.pppoe_remote_address || '',
     data.isolir_profile || 'isolir',
     data.status || 'active',
     data.install_date || null, data.notes || '',
@@ -114,6 +119,7 @@ function updateCustomer(id, data) {
     data.hotspot_username || '',
     data.hotspot_password || '',
     data.hotspot_profile || '',
+    data.collector_id ? parseInt(data.collector_id) : null,
     id
   );
 
@@ -130,14 +136,72 @@ function updateCustomerCablePath(id, path) {
 
 async function deleteCustomer(id) {
   const customer = getCustomerById(id);
+  const mikrotikSvc = require('./mikrotikService');
+  
+  // Remove static IP if connection type is static
   if (customer && customer.connection_type === 'static' && customer.static_ip) {
-    const mikrotikSvc = require('./mikrotikService');
     try {
       await mikrotikSvc.removeStaticIp(customer.static_ip, customer.router_id);
     } catch (e) {
       console.error('Failed to remove static IP from MikroTik during customer deletion:', e);
     }
   }
+  
+  // Remove PPPoE secret if connection type is pppoe and username exists
+  if (customer && customer.connection_type === 'pppoe' && customer.pppoe_username) {
+    try {
+      console.log(`[DELETE] Attempting to remove PPPoE secret: ${customer.pppoe_username} from router ${customer.router_id}`);
+      
+      // Get PPPoE secrets to find the ID
+      const secrets = await mikrotikSvc.getPppoeSecrets(customer.router_id);
+      console.log(`[DELETE] Found ${secrets.length} PPPoE secrets in MikroTik`);
+      
+      // Try to find by exact name match
+      let secret = secrets.find(s => s.name === customer.pppoe_username);
+      
+      // If not found, try case-insensitive match
+      if (!secret) {
+        const username = String(customer.pppoe_username || '').toLowerCase();
+        secret = secrets.find(s => String(s.name || '').toLowerCase() === username);
+      }
+      
+      if (secret) {
+        // Check both .id and id fields
+        const secretId = secret['.id'] || secret.id;
+        console.log(`[DELETE] Found secret with ID: ${secretId}, name: ${secret.name}`);
+        
+        if (secretId) {
+          await mikrotikSvc.deletePppoeSecret(secretId, customer.router_id);
+          console.log(`[DELETE] Successfully removed PPPoE secret for ${customer.pppoe_username} from MikroTik`);
+        } else {
+          console.warn(`[DELETE] Secret found but no ID available for ${customer.pppoe_username}`);
+        }
+      } else {
+        console.warn(`[DELETE] PPPoE secret for ${customer.pppoe_username} not found in MikroTik`);
+        console.log(`[DELETE] Available usernames: ${secrets.map(s => s.name).join(', ')}`);
+      }
+    } catch (e) {
+      console.error('[DELETE] Failed to remove PPPoE secret from MikroTik during customer deletion:', e);
+    }
+  }
+  
+  // Remove Hotspot user if connection type is hotspot and username exists
+  if (customer && customer.connection_type === 'hotspot' && customer.hotspot_username) {
+    try {
+      // Get hotspot user to find the ID
+      const hotspotUser = await mikrotikSvc.getHotspotUserByName(customer.hotspot_username, customer.router_id);
+      
+      if (hotspotUser && hotspotUser.id) {
+        await mikrotikSvc.deleteHotspotUser(hotspotUser.id, customer.router_id);
+        console.log(`Successfully removed Hotspot user ${customer.hotspot_username} from MikroTik`);
+      } else {
+        console.warn(`Hotspot user ${customer.hotspot_username} not found in MikroTik`);
+      }
+    } catch (e) {
+      console.error('Failed to remove Hotspot user from MikroTik during customer deletion:', e);
+    }
+  }
+  
   return db.prepare('DELETE FROM customers WHERE id=?').run(id);
 }
 
