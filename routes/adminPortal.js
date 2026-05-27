@@ -3203,7 +3203,6 @@ router.get('/backup', requireAdminSession, requireSidebarMenuAccess('backup'), (
     msg: flashMsg(req),
     backups: result.backups || [],
     total: result.total || 0,
-    getSetting
     getSetting,
     settings
   });

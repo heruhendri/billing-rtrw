@@ -103,10 +103,16 @@ function backupSettings() {
 function backupAll() {
   const dbResult = backupDatabase();
   const settingsResult = backupSettings();
+  const success = dbResult.success && settingsResult.success;
 
   return {
+    success,
     database: dbResult,
     settings: settingsResult,
+    fileName: success ? `${dbResult.fileName} & ${settingsResult.fileName}` : null,
+    error: !success 
+      ? `DB: ${dbResult.error || 'Success'}, Settings: ${settingsResult.error || 'Success'}` 
+      : null,
     timestamp: getNowLocalISO()
   };
 }
@@ -238,8 +244,12 @@ function listBackups() {
       });
     }
 
-    // Sort by created date (terbaru dulu)
-    backups.sort((a, b) => b.created - a.created);
+    // Sort by created date (prioritaskan tanggal dari nama file, fallback ke file stats)
+    backups.sort((a, b) => {
+      const dateA = a.createdDate ? a.createdDate.getTime() : a.created.getTime();
+      const dateB = b.createdDate ? b.createdDate.getTime() : b.created.getTime();
+      return dateB - dateA;
+    });
 
     return {
       success: true,
