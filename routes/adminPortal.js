@@ -3171,8 +3171,6 @@ router.post('/settings', requireAdminSession, express.urlencoded({ extended: tru
     newSettings.login_otp_enabled = (newSettings.login_otp_enabled === 'true');
     newSettings.telegram_enabled = (newSettings.telegram_enabled === 'true');
     newSettings.auto_backup_enabled = (newSettings.auto_backup_enabled === 'true');
-    newSettings.auto_backup_telegram = (newSettings.auto_backup_telegram === 'true' || newSettings.auto_backup_telegram === 'on');
-    if (newSettings.auto_backup_interval) newSettings.auto_backup_interval = String(newSettings.auto_backup_interval).trim();
 
     const success = saveSettings(newSettings);
     if (success) {
@@ -3195,7 +3193,6 @@ router.post('/settings', requireAdminSession, express.urlencoded({ extended: tru
 // ─── BACKUP & RECOVERY ──────────────────────────────────────────────────────
 router.get('/backup', requireAdminSession, requireSidebarMenuAccess('backup'), (req, res) => {
   const result = backupSvc.listBackups();
-  const settings = getSettings();
   res.render('admin/backup', {
     title: 'Backup & Recovery',
     company: company(),
@@ -3203,8 +3200,7 @@ router.get('/backup', requireAdminSession, requireSidebarMenuAccess('backup'), (
     msg: flashMsg(req),
     backups: result.backups || [],
     total: result.total || 0,
-    getSetting,
-    settings
+    getSetting
   });
 });
 
@@ -3226,18 +3222,6 @@ router.post('/backup/create', requireAdminSession, express.urlencoded({ extended
 
     if (result.success) {
       req.session._msg = { type: 'success', text: `Backup berhasil dibuat: ${result.fileName}` };
-      
-      // Kirim ke Telegram jika fitur aktif
-      const settings = getSettings();
-      if (settings.auto_backup_telegram && settings.telegram_enabled) {
-        const { sendDocumentToAdmin } = require('../services/telegramBot');
-        const path = require('path');
-        const fs = require('fs');
-        const filePath = path.join(__dirname, '../backups', result.fileName);
-        if (fs.existsSync(filePath)) {
-          sendDocumentToAdmin(filePath, `📁 *Backup Manual System*\n\nFile: \`${result.fileName}\`\nWaktu: ${getNowLocal()}`);
-        }
-      }
     } else {
       req.session._msg = { type: 'error', text: `Gagal backup: ${result.error}` };
     }
@@ -3306,22 +3290,6 @@ router.post('/backup/cleanup', requireAdminSession, express.urlencoded({ extende
     }
   } catch (e) {
     req.session._msg = { type: 'error', text: `Gagal: ${e.message}` };
-  }
-  res.redirect('/admin/backup');
-});
-
-router.post('/backup/settings', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), (req, res) => {
-  try {
-    const { auto_backup_enabled, auto_backup_telegram, auto_backup_interval } = req.body;
-    const update = {
-      auto_backup_enabled: auto_backup_enabled === 'on' || auto_backup_enabled === 'true',
-      auto_backup_telegram: auto_backup_telegram === 'on' || auto_backup_telegram === 'true',
-      auto_backup_interval: String(auto_backup_interval || '1d').trim()
-    };
-    saveSettings(update);
-    req.session._msg = { type: 'success', text: 'Pengaturan backup otomatis berhasil disimpan.' };
-  } catch (e) {
-    req.session._msg = { type: 'error', text: 'Gagal menyimpan: ' + e.message };
   }
   res.redirect('/admin/backup');
 });

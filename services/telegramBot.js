@@ -1,4 +1,4 @@
-wconst TelegramBot = require('node-telegram-bot-api');
+const TelegramBot = require('node-telegram-bot-api');
 const { getSetting, getNowLocal } = require('../config/settingsManager');
 const { logger } = require('../config/logger');
 const customerSvc = require('./customerService');
@@ -630,21 +630,5 @@ function initTelegram() {
   });
 }
 
-/**
- * Mengirim dokumen/file backup ke Admin Telegram
- */
-async function sendDocumentToAdmin(filePath, caption = '') {
-  if (!bot) return;
-  const adminId = getSetting('telegram_admin_id', '');
-  if (!adminId) return;
-  try {
-    await bot.sendDocument(adminId, filePath, { caption });
-    logger.info(`Telegram Bot: Dokumen backup berhasil dikirim ke admin ${adminId}`);
-  } catch (e) {
-    logger.error(`Telegram Bot Error (sendDocument): ${e.message}`);
-  }
-}
-
 // Export for manual re-init from settings
 module.exports = { initTelegram };
-module.exports = { initTelegram, sendDocumentToAdmin };
