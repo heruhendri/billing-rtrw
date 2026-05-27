@@ -6,6 +6,7 @@ const billingSvc = require('../services/billingService');
 const paymentSvc = require('../services/paymentService');
 const customerSvc = require('../services/customerService');
 const mikrotikService = require('../services/mikrotikService');
+const { parseMikhmonOnLogin } = require('../utils/mikhmonParser');
 const { logger } = require('../config/logger');
 const ticketSvc = require('../services/ticketService');
 const crypto = require('crypto');
@@ -168,52 +169,8 @@ function verifyPublicToken(token, secret) {
   }
 }
 
-function parseMikhmonOnLogin(script) {
-  if (!script) return null;
-  const s = String(script).trim();
-  
-  // Format: :put (",rem,COST,VALIDITY,PRICE,...)
-  // Support ROS6 dan ROS7 (script bisa berbeda struktur)
-  
-  // Cari pattern :put (",rem, ... , ... , ...
-  // Bisa ada di mana saja dalam script
-  // Updated regex untuk support format: :put (",rem,4000,2d,5000,,Disable,");
-  const putMatch = s.match(/:\s*put\s*\(\s*[",]rem[",]?\s*,\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^,]+)/i);
-  if (putMatch) {
-    const cost = String(putMatch[1] || '').trim();
-    const validity = String(putMatch[2] || '').trim();
-    const priceStr = String(putMatch[3] || '').trim();
-    const price = Number(priceStr.replace(/[^\d]/g, '')) || 0;
-    
-    if (validity && price > 0) {
-      return { validity, price, cost: Number(cost.replace(/[^\d]/g, '')) || 0 };
-    }
-  }
-  
-  // Fallback: split by comma (untuk format lama)
-  const parts = s.split(',').map(p => String(p).trim());
-  let remIdx = -1;
-  for (let i = 0; i < parts.length; i++) {
-    const norm = String(parts[i] || '').toLowerCase().replace(/[^a-z]/g, '');
-    if (norm === 'rem') {
-      remIdx = i;
-      break;
-    }
-  }
-  
-  if (remIdx >= 0 && remIdx + 3 < parts.length) {
-    const cost = String(parts[remIdx + 1] || '').trim();
-    const validity = String(parts[remIdx + 2] || '').trim();
-    const priceStr = String(parts[remIdx + 3] || '').trim();
-    const price = Number(priceStr.replace(/[^\d]/g, '')) || 0;
-    
-    if (validity && price > 0) {
-      return { validity, price, cost: Number(cost.replace(/[^\d]/g, '')) || 0 };
-    }
-  }
-  
-  return null;
-}
+// parseMikhmonOnLogin dipindahkan ke utils/mikhmonParser.js (shared utility)
+// Dipakai oleh route handler dan voucherCacheWarmer agar konsisten
 
 function normalizeBuyerPhone(input) {
   const digits = String(input || '').replace(/\D/g, '');
@@ -856,86 +813,214 @@ router.get('/voucher', async (req, res) => {
     }
   };
 
+  /**
+   * Ambil voucher profiles — OPTIMASI: cek cache dulu, fallback live query
+   * Cache di-isi oleh voucherCacheWarmer.js setiap 3 menit
+   */
+  const VOUCHER_PROFILES_CACHE_KEY = 'voucher_profiles_cache';
+  const VOUCHER_PROFILES_CACHE_TTL = 5 * 60 * 1000; // 5 menit
+
   const getVoucherProfiles = async () => {
-    const routers = mikrotikService.getAllRouters().filter(r => r.is_active);
-    const routerList = routers.length > 0 ? routers : [{ id: null, name: '' }];
-
-    const allRows = [];
-    const results = await Promise.allSettled(routerList.map(r => mikrotikService.getHotspotUserProfiles(r.id)));
-    for (let i = 0; i < results.length; i++) {
-      const result = results[i];
-      const router = routerList[i];
-      if (result.status !== 'fulfilled' || !Array.isArray(result.value)) continue;
-      for (const p of result.value) {
-        allRows.push({ routerId: router.id ?? null, name: p?.name, onLogin: p?.onLogin ?? p?.['on-login'] });
+    try {
+      // 1. Cek global cache dari VoucherCacheWarmer
+      const cached = global[VOUCHER_PROFILES_CACHE_KEY];
+      if (cached && cached.data && Array.isArray(cached.data) && cached.data.length > 0) {
+        const age = Date.now() - Number(cached.timestamp || 0);
+        if (age < VOUCHER_PROFILES_CACHE_TTL) {
+          logger.debug(`[Voucher] Using cached profiles (${cached.data.length} profiles, age ${Math.round(age/1000)}s)`);
+          return cached.data;
+        }
+        logger.info('[Voucher] Cache expired, falling back to live query');
       }
-    }
 
-    const bestByName = new Map();
-    for (const row of allRows) {
-      const name = String(row.name || '').trim();
-      if (!name) continue;
+      // 2. Cache miss/expired — query MikroTik live (dengan timeout 4 detik)
+      const mikrotikHost = settings.mikrotik_host;
+      const mikrotikUser = settings.mikrotik_user;
+      const mikrotikPassword = settings.mikrotik_password;
 
-      const meta = parseMikhmonOnLogin(row.onLogin || '');
-      let price = Number(meta?.price || 0) || 0;
-      let validity = String(meta?.validity || '').trim();
-      if (price <= 0 || !validity) {
-        const configured = getConfiguredVoucherPrice(row.routerId, name);
-        if (configured) {
-          price = Number(configured.price || 0) || 0;
-          validity = String(configured.validity || '').trim();
+      if (!mikrotikHost || !mikrotikUser || !mikrotikPassword) {
+        logger.error('[Voucher] MikroTik settings not configured in settings.json');
+        return [];
+      }
+
+      logger.info(`[Voucher] Live querying MikroTik (cache miss)...`);
+
+      let profiles;
+      try {
+        profiles = await Promise.race([
+          mikrotikService.getHotspotUserProfiles(null),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout 4s')), 4000))
+        ]);
+      } catch (e) {
+        logger.warn('[Voucher] MikroTik live query timeout/error: ' + e.message);
+        // Jika timeout, coba return cache lama (stale) daripada kosong
+        if (cached && cached.data && Array.isArray(cached.data) && cached.data.length > 0) {
+          logger.info(`[Voucher] Returning stale cache (${cached.data.length} profiles) due to MikroTik error`);
+          return cached.data;
+        }
+        return [];
+      }
+
+      if (!Array.isArray(profiles) || profiles.length === 0) {
+        logger.warn('[Voucher] No profiles found from MikroTik');
+        return [];
+      }
+
+      logger.info(`[Voucher] Found ${profiles.length} raw profiles from MikroTik`);
+
+      // 3. Load configured prices dari voucher_batches (DB fallback)
+      let configuredPrices = new Map();
+      try {
+        const rows = db.prepare(`
+          SELECT router_id, profile_name, price, validity
+          FROM voucher_batches
+          WHERE price > 0
+          GROUP BY router_id, profile_name
+          HAVING id = MAX(id)
+        `).all();
+        for (const row of rows) {
+          const key = `${row.router_id}_${row.profile_name}`;
+          configuredPrices.set(key, { price: row.price, validity: row.validity });
+        }
+      } catch (e) {
+        logger.warn('[Voucher] Error loading configured prices: ' + e.message);
+      }
+
+      // 4. Parse dan filter profiles
+      const validProfiles = [];
+      for (const p of profiles) {
+        const name = String(p?.name || '').trim();
+        if (!name) continue;
+
+        const onLogin = String(p?.onLogin || p?.['on-login'] || '').trim();
+        const meta = parseMikhmonOnLogin(onLogin);
+
+        let price = Number(meta?.price || 0) || 0;
+        let validity = String(meta?.validity || '').trim();
+
+        // Fallback ke voucher_batches jika tidak ada metadata Mikhmon
+        if (price <= 0 || !validity) {
+          const key = `null_${name}`;
+          const configured = configuredPrices.get(key);
+          if (configured) {
+            price = Number(configured.price || 0) || 0;
+            validity = String(configured.validity || '').trim();
+          }
+        }
+
+        if (price > 0) {
+          validProfiles.push({
+            name: name,
+            price: price,
+            validity: validity || '-',
+            router_id: null
+          });
+        } else {
+          logger.debug(`[Voucher] Skipped profile "${name}" - no price (onLogin: ${onLogin || 'empty'})`);
         }
       }
-      if (price <= 0) continue;
-      if (!validity) validity = '-';
 
-      const existing = bestByName.get(name);
-      if (!existing || Number(price) < Number(existing.price || 0)) {
-        bestByName.set(name, { name, validity, price, router_id: row.routerId });
+      logger.info(`[Voucher] ${validProfiles.length} profiles with valid price data`);
+
+      // Sort by price dan simpan ke cache (agar request berikutnya cepat)
+      const sorted = validProfiles.sort((a, b) => a.price - b.price);
+      global[VOUCHER_PROFILES_CACHE_KEY] = {
+        data: sorted,
+        timestamp: Date.now()
+      };
+
+      return sorted;
+
+    } catch (e) {
+      logger.error('[Voucher] Error loading profiles: ' + e.message);
+      // Last resort: return stale cache
+      const stale = global[VOUCHER_PROFILES_CACHE_KEY];
+      if (stale && stale.data && Array.isArray(stale.data) && stale.data.length > 0) {
+        return stale.data;
       }
+      return [];
     }
-
-    return Array.from(bestByName.values()).sort((a, b) => Number(a.price || 0) - Number(b.price || 0));
   };
 
   const resolveVoucherGateway = () => {
     return resolveConfiguredGateway(settings);
   };
 
+  // Cache untuk payment channels
+  // Set PAYMENT_CACHE_DURATION = 0 untuk disable cache
+  const PAYMENT_CACHE_KEY = 'voucher_payment_channels_cache';
+  const PAYMENT_CACHE_DURATION = 60 * 1000; // 1 menit (payment channels jarang berubah)
+  
   const getVoucherPaymentChannels = async () => {
+    // Cek apakah ada gateway yang aktif
     const gateway = resolveVoucherGateway();
-    if (!gateway) return [];
-    if (gateway === 'tripay') {
-      try {
-        return await paymentSvc.getTripayChannels();
-      } catch {
-        return [];
+    if (!gateway) {
+      return [];
+    }
+    
+    // Cek cache terlebih dahulu (skip jika PAYMENT_CACHE_DURATION = 0)
+    const cacheKey = `${PAYMENT_CACHE_KEY}_${gateway}`;
+    if (PAYMENT_CACHE_DURATION > 0) {
+      const cached = global[cacheKey];
+      if (cached && (Date.now() - cached.timestamp) < PAYMENT_CACHE_DURATION) {
+        logger.debug('[Voucher] Using cached payment channels');
+        return cached.data;
       }
     }
-    const base = [
-      { code: 'QRIS', name: 'QRIS', group: 'QRIS', active: true },
-      { code: 'BCAVA', name: 'BCA Virtual Account', group: 'Virtual Account', active: true },
-      { code: 'BNIVA', name: 'BNI Virtual Account', group: 'Virtual Account', active: true },
-      { code: 'BRIVA', name: 'BRI Virtual Account', group: 'Virtual Account', active: true },
-      { code: 'PERMATAVA', name: 'Permata Virtual Account', group: 'Virtual Account', active: true },
-      { code: 'MANDIRIVA', name: 'Mandiri Virtual Account', group: 'Virtual Account', active: true }
-    ];
-    if (gateway === 'midtrans') return [{ code: 'SNAP', name: 'Semua Metode (Snap)', group: 'E-Wallet', active: true }, ...base];
-    if (gateway === 'xendit') return [{ code: 'XENDIT', name: 'Semua Metode', group: 'E-Wallet', active: true }, ...base];
-    if (gateway === 'duitku') return [{ code: 'DUITKU', name: 'Semua Metode', group: 'E-Wallet', active: true }, ...base];
-    return base;
+    
+    let channels = [];
+    
+    if (gateway === 'tripay') {
+      try {
+        // Timeout 1.5 detik untuk Tripay (lebih agresif)
+        channels = await Promise.race([
+          paymentSvc.getTripayChannels(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 1500))
+        ]);
+      } catch (e) {
+        logger.warn('[Voucher] Tripay channels fetch failed or timeout: ' + e.message);
+        channels = [];
+      }
+    } else {
+      // Gateway lain tidak perlu query API, langsung return hardcoded
+      const base = [
+        { code: 'QRIS', name: 'QRIS', group: 'QRIS', active: true },
+        { code: 'BCAVA', name: 'BCA Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'BNIVA', name: 'BNI Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'BRIVA', name: 'BRI Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'PERMATAVA', name: 'Permata Virtual Account', group: 'Virtual Account', active: true },
+        { code: 'MANDIRIVA', name: 'Mandiri Virtual Account', group: 'Virtual Account', active: true }
+      ];
+      if (gateway === 'midtrans') channels = [{ code: 'SNAP', name: 'Semua Metode (Snap)', group: 'E-Wallet', active: true }, ...base];
+      else if (gateway === 'xendit') channels = [{ code: 'XENDIT', name: 'Semua Metode', group: 'E-Wallet', active: true }, ...base];
+      else if (gateway === 'duitku') channels = [{ code: 'DUITKU', name: 'Semua Metode', group: 'E-Wallet', active: true }, ...base];
+      else channels = base;
+    }
+    
+    // Simpan ke cache (jika enabled)
+    if (PAYMENT_CACHE_DURATION > 0) {
+      global[cacheKey] = {
+        data: channels,
+        timestamp: Date.now()
+      };
+      logger.debug(`[Voucher] Cached ${channels.length} payment channels for ${PAYMENT_CACHE_DURATION/1000}s`);
+    }
+    
+    return channels;
   };
 
-  let profiles = [];
-  try {
-    profiles = await getVoucherProfiles();
-  } catch (e) {
-    logger.error('[Voucher] Error getting profiles: ' + e.message);
-    profiles = [];
-  }
-
-  let paymentChannels = [];
-  paymentChannels = await getVoucherPaymentChannels();
+  // OPTIMASI UTAMA: Parallel execution untuk profiles dan payment channels
+  // Tidak perlu menunggu satu selesai baru eksekusi yang lain
+  const [profiles, paymentChannels] = await Promise.all([
+    getVoucherProfiles().catch(e => {
+      logger.error('[Voucher] Error getting profiles: ' + e.message);
+      return [];
+    }),
+    getVoucherPaymentChannels().catch(e => {
+      logger.error('[Voucher] Error getting payment channels: ' + e.message);
+      return [];
+    })
+  ]);
 
   let order = null;
   let orderToken = null;
@@ -1352,25 +1437,30 @@ router.post('/login', async (req, res) => {
   const startTime = Date.now();
 
   let device = null;
-  let effectiveTag = phone;
+  let pppoeUsername = null;
+  let customerPhone = phone;
 
   // 1. Tahap 1: Cari Data di Billing DB
   const customer = customerSvc.findCustomerByAny(phone);
   
   if (customer) {
-    logger.info(`[Login] Pelanggan ditemukan di DB (customerId=${customer.id || '-'}).`);
+    logger.info(`[Login] Pelanggan ditemukan di DB (customerId=${customer.id || '-'}, pppoe=${customer.pppoe_username || '-'}).`);
     
-    // Kumpulkan semua token yang mungkin untuk mencari perangkat
+    // Use customer's actual phone number and PPPoE username
+    customerPhone = customer.phone || phone;
+    pppoeUsername = customer.pppoe_username || null;
+    
+    // Prioritas: PPPoE username > genieacs_tag > phone
     const searchTokens = [
-      customer.genieacs_tag, 
-      customer.pppoe_username, 
+      customer.pppoe_username,
+      customer.genieacs_tag,
       customer.phone
     ].filter(Boolean);
 
     // Cari secara paralel dengan allSettled untuk tidak blocking jika ada error
     const results = await Promise.allSettled(searchTokens.map(async (token) => {
-      let d = await customerDevice.findDeviceByTag(token);
-      if (!d) d = await customerDevice.findDeviceByPppoe(token);
+      let d = await customerDevice.findDeviceByPppoe(token); // Prioritas PPPoE
+      if (!d) d = await customerDevice.findDeviceByTag(token);
       if (!d) {
         const variants = await customerDevice.findDeviceWithTagVariants(token);
         if (variants) d = variants.device;
@@ -1381,7 +1471,11 @@ router.post('/login', async (req, res) => {
     device = results.find(r => r.status === 'fulfilled' && r.value !== null)?.value;
     if (device) {
       logger.info('[Login] Perangkat terdeteksi di GenieACS (matched).');
-      effectiveTag = device._id;
+      // Extract PPPoE username from device if not in customer data
+      if (!pppoeUsername && device.pppoeUsername) {
+        pppoeUsername = device.pppoeUsername;
+        logger.info(`[Login] PPPoE username dari device: ${pppoeUsername}`);
+      }
     }
   }
 
@@ -1390,7 +1484,9 @@ router.post('/login', async (req, res) => {
     const directResult = await customerDevice.findDeviceWithTagVariants(phone);
     if (directResult) {
       device = directResult.device;
-      effectiveTag = directResult.canonicalTag;
+      if (device.pppoeUsername) {
+        pppoeUsername = device.pppoeUsername;
+      }
       logger.info('[Login] Perangkat ditemukan secara langsung di GenieACS (fallback).');
     }
   }
@@ -1399,8 +1495,8 @@ router.post('/login', async (req, res) => {
   if (!device && !customer) {
     logger.warn('[Login] Gagal: pelanggan tidak ditemukan.');
     const packages = customerSvc.getAllPackages().filter(p => p.is_active !== 0);
-    return res.render('login', { 
-      error: 'Data pelanggan tidak ditemukan. Pastikan nomor WhatsApp sudah benar.', 
+    return res.render('login', {
+      error: 'Data pelanggan tidak ditemukan. Pastikan nomor WhatsApp sudah benar.',
       settings,
       packages
     });
@@ -1413,15 +1509,15 @@ router.post('/login', async (req, res) => {
   const loginTime = Date.now() - startTime;
   logger.info(`[Login] Proses login selesai dalam ${loginTime}ms`);
 
-  // --- OTP LOGIC --- (Hanya jika perangkat ditemukan)
+  // --- OTP LOGIC ---
   if (settings.login_otp_enabled) {
     const otp = Math.floor(1000 + Math.random() * 9000).toString();
     const expiry = Date.now() + 5 * 60 * 1000; // 5 menit
     
     // Simpan ke session sementara
     req.session.pending_login = {
-      phone: phone,
-      effectiveTag: effectiveTag,
+      phone: customerPhone,
+      pppoeUsername: pppoeUsername,
       otp: otp,
       expiry: expiry
     };
@@ -1438,7 +1534,7 @@ router.post('/login', async (req, res) => {
         }
 
         const msg = `🛡️ *KODE VERIFIKASI (OTP)*\n\nKode Anda adalah: *${otp}*\n\nJangan berikan kode ini kepada siapapun. Kode berlaku selama 5 menit.`;
-        const sent = await sendWA(phone, msg);
+        const sent = await sendWA(customerPhone, msg);
         
         if (!sent) {
           throw new Error('Gagal mengirim kode OTP melalui WhatsApp. Pastikan nomor Anda terdaftar di WhatsApp.');
@@ -1457,7 +1553,8 @@ router.post('/login', async (req, res) => {
 
   // --- DIRECT LOGIN ---
   logger.info('[Login] Login direct berhasil.');
-  req.session.phone = effectiveTag;
+  req.session.phone = customerPhone; // Nomor telepon untuk findCustomerByAny()
+  req.session.pppoe_username = pppoeUsername; // PPPoE username untuk GenieACS & MikroTik
   if (customer && customer.status === 'suspended') {
     return res.redirect('/isolated');
   }
@@ -1485,7 +1582,8 @@ router.post('/login-otp', (req, res) => {
 
   if (otp === pending.otp) {
     logger.info('[Login] OTP berhasil diverifikasi.');
-    req.session.phone = pending.effectiveTag;
+    req.session.phone = pending.phone; // Nomor telepon customer
+    req.session.pppoe_username = pending.pppoeUsername; // PPPoE username untuk GenieACS & MikroTik
     delete req.session.pending_login;
     const custAfterOtp = customerSvc.findCustomerByAny(pending.phone);
     if (custAfterOtp && custAfterOtp.status === 'suspended') {
@@ -1516,7 +1614,7 @@ router.use((req, res, next) => {
 
 router.get('/dashboard', async (req, res) => {
   // Debug logging
-  logger.info(`[Dashboard] Session ID: ${req.sessionID}, Phone: ${req.session?.phone || 'TIDAK ADA'}`);
+  logger.info(`[Dashboard] Session ID: ${req.sessionID}, Phone: ${req.session?.phone || 'TIDAK ADA'}, PPPoE: ${req.session?.pppoe_username || 'TIDAK ADA'}`);
   
   const loginId = req.session && req.session.phone;
   if (!loginId) return res.redirect('/customer/login');
@@ -1528,8 +1626,9 @@ router.get('/dashboard', async (req, res) => {
     delete req.session._msg;
   }
   
-  // Data dari GenieACS
-  const deviceData = await getCustomerDeviceData(loginId);
+  // Data dari GenieACS - use PPPoE username if available, fallback to phone
+  const pppoeUsername = req.session.pppoe_username || loginId;
+  const deviceData = await getCustomerDeviceData(pppoeUsername);
   
   // Data dari Billing DB (Coba cari pakai loginId atau pppoeUsername)
   let searchToken = loginId;
