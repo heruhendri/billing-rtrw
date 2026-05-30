@@ -437,7 +437,7 @@ router.get('/api/odps/:id/ports', requireTechSession, (req, res) => {
 
 router.get('/api/devices', requireTechSession, async (req, res) => {
   try {
-    const { search, status, acs, limit = 100, offset = 0 } = req.query;
+    const { search, status, acs, limit = 999999, offset = 0 } = req.query;
     const customers = db.prepare('SELECT id, name, phone, pppoe_username, genieacs_tag FROM customers').all();
     const byPppoe = new Map();
     const byTag = new Map();
@@ -448,7 +448,7 @@ router.get('/api/devices', requireTechSession, async (req, res) => {
       if (tg) byTag.set(tg, c);
     }
 
-    const result = await customerDevice.listAllDevices(1000);
+    const result = await customerDevice.listAllDevices(999999);
     if (!result.ok) return res.json({ error: result.message });
     
     let devices = result.devices.map(d => {
@@ -502,7 +502,7 @@ router.get('/api/devices', requireTechSession, async (req, res) => {
 
     if (status && status !== 'all') devices = devices.filter(d => d.status === status);
     
-    res.json({ devices: devices.slice(0, 100), total: devices.length });
+    res.json({ devices: devices, total: devices.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
