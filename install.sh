@@ -64,7 +64,12 @@ PORT=4000
 
 if [[ $use_default =~ ^([nN][oO]|[nN])$ ]]; then
     read -p "Masukkan port custom (sesuaikan dengan port NAT Anda): " custom_port < /dev/tty
-    PORT=$custom_port
+    if [ -z "$custom_port" ]; then
+        echo "⚠️ Port tidak diisi, menggunakan default: 4000"
+        PORT=4000
+    else
+        PORT=$custom_port
+    fi
 fi
 echo "Aplikasi akan berjalan pada port: $PORT"
 echo "----------------------------"
@@ -87,7 +92,7 @@ if [ ! -f "settings.json" ]; then
 EOF
 else
     # Update port di file yang sudah ada menggunakan Node.js
-    node -e "const fs = require('fs'); const s = JSON.parse(fs.readFileSync('settings.json', 'utf8')); s.server_port = $PORT; fs.writeFileSync('settings.json', JSON.stringify(s, null, 2));"
+    node -e "const fs = require('fs'); const s = JSON.parse(fs.readFileSync('settings.json', 'utf8')); s.server_port = parseInt('$PORT') || 4000; fs.writeFileSync('settings.json', JSON.stringify(s, null, 2));"
 fi
 
 # 6. Install NPM Packages
