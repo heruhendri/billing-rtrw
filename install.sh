@@ -34,8 +34,14 @@ else
 fi
 
 # 3. Clone Repository
-REPO_DIR="billing-rtrw"
+echo ""
+echo "--- KONFIGURASI DIREKTORI ---"
+read -p "Masukkan nama folder instalasi [default: billing-rtrw]: " CUSTOM_DIR < /dev/tty
+REPO_DIR=${CUSTOM_DIR:-"billing-rtrw"}
+PM2_NAME=$REPO_DIR
+
 REINSTALL_APP="n"
+
 if [ -d "$REPO_DIR" ]; then
     echo ""
     echo "[3/6] Direktori $REPO_DIR sudah tersedia."
@@ -112,9 +118,9 @@ if [[ ! $use_pm2 =~ ^([nN][oO]|[nN])$ ]]; then
     fi
     
     # Hentikan proses lama jika ada dan jalankan yang baru
-    pm2 stop billing-rtrw 2>/dev/null || true
-    pm2 delete billing-rtrw 2>/dev/null || true
-    pm2 start app-customer.js --name billing-rtrw
+    pm2 stop $PM2_NAME 2>/dev/null || true
+    pm2 delete $PM2_NAME 2>/dev/null || true
+    pm2 start app-customer.js --name $PM2_NAME
     pm2 save
     echo "✓ Aplikasi sekarang berjalan di background via PM2."
 else
@@ -126,11 +132,12 @@ echo ""
 echo "===================================================="
 echo "             INSTALASI SELESAI                      "
 echo "===================================================="
-echo "Akses Admin    : http://[IP-VPS]:$PORT/admin/login"
+echo "Direktori      : $REPO_DIR"
+echo "Akses Admin    : http://[IP-VPS-ANDA]:$PORT/admin/login"
 echo "User Default   : admin"
 echo "Pass Default   : admin123"
 echo "----------------------------------------------------"
 echo "Cek status aplikasi: pm2 status"
-echo "Restart aplikasi   : pm2 restart billing-rtrw"
-echo "Lihat log          : pm2 logs billing-rtrw"
+echo "Restart aplikasi   : pm2 restart $PM2_NAME"
+echo "Lihat log          : pm2 logs $PM2_NAME"
 echo "===================================================="
