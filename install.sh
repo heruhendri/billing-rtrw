@@ -95,11 +95,27 @@ echo "[5/6] Menginstal dependensi aplikasi (ini mungkin memakan waktu)..."
 npm install --omit=dev
 
 # 7. Setup PM2 (Process Manager)
-echo "[6/6] Mengonfigurasi PM2 untuk menjalankan aplikasi di background..."
-sudo npm install -g pm2
-pm2 stop billing-rtrw || true
-pm2 start app-customer.js --name billing-rtrw
-pm2 save
+echo ""
+echo "--- KONFIGURASI PROSES ---"
+read -p "Gunakan PM2 untuk menjalankan aplikasi otomatis (Background)? [Y/n]: " use_pm2 < /dev/tty
+
+if [[ ! $use_pm2 =~ ^([nN][oO]|[nN])$ ]]; then
+    echo "[6/6] Mengonfigurasi PM2..."
+    if ! command -v pm2 &> /dev/null; then
+        echo "Menginstal PM2 secara global..."
+        sudo npm install -g pm2
+    fi
+    
+    # Hentikan proses lama jika ada dan jalankan yang baru
+    pm2 stop billing-rtrw 2>/dev/null || true
+    pm2 delete billing-rtrw 2>/dev/null || true
+    pm2 start app-customer.js --name billing-rtrw
+    pm2 save
+    echo "✓ Aplikasi sekarang berjalan di background via PM2."
+else
+    echo "[6/6] PM2 dilewati. Instalasi selesai."
+    echo "Anda dapat menjalankan aplikasi secara manual dengan perintah: npm start"
+fi
 
 echo ""
 echo "===================================================="
