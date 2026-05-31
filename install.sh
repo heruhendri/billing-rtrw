@@ -15,7 +15,7 @@ echo "----------------------------------------------------"
 # 1. Update & Install Dependencies Dasar
 echo "[1/6] Memperbarui sistem dan menginstal paket dasar..."
 sudo apt-get update -y
-sudo apt-get install -y git curl build-essential sqlite3 openssl
+sudo apt-get install -y git curl build-essential sqlite3 openssl iproute2
 
 # 2. Instalasi Node.js 20
 REINSTALL_NODE="n"
@@ -65,18 +65,29 @@ fi
 # 4. Konfigurasi Port (Penting untuk NAT VPS)
 echo ""
 echo "--- KONFIGURASI JARINGAN ---"
-read -p "Gunakan port default (4000)? [Y/n]: " use_default < /dev/tty
-PORT=4000
+echo "Pilih metode pengaturan port:"
+echo "1) Default (4000)"
+echo "2) Custom (Input manual)"
+echo "3) Otomatis (Cari port yang tersedia mulai dari 4000)"
+read -p "Pilihan Anda [1/2/3, default 1]: " port_choice < /dev/tty
 
-if [[ $use_default =~ ^([nN][oO]|[nN])$ ]]; then
-    read -p "Masukkan port custom (sesuaikan dengan port NAT Anda): " custom_port < /dev/tty
-    if [ -z "$custom_port" ]; then
-        echo "⚠️ Port tidak diisi, menggunakan default: 4000"
+case ${port_choice:-1} in
+    2)
+        read -p "Masukkan port custom: " custom_port < /dev/tty
+        PORT=${custom_port:-4000}
+        ;;
+    3)
+        echo "Mencari port yang tersedia..."
         PORT=4000
-    else
-        PORT=$custom_port
-    fi
-fi
+        while ss -tuln | grep -q ":$PORT " 2>/dev/null; do
+            PORT=$((PORT + 1))
+        done
+        echo "✓ Port ditemukan: $PORT"
+        ;;
+    *)
+        PORT=4000
+        ;;
+esac
 echo "Aplikasi akan berjalan pada port: $PORT"
 echo "----------------------------"
 
