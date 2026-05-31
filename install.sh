@@ -17,6 +17,17 @@ echo "[1/6] Memperbarui sistem dan menginstal paket dasar..."
 sudo apt-get update -y
 sudo apt-get install -y git curl build-essential sqlite3 openssl iproute2
 
+# Deteksi IP dan Lingkungan Jaringan
+echo "Mendeteksi konfigurasi jaringan..."
+PUBLIC_IP=$(curl -s -m 10 https://ifconfig.me || curl -s -m 10 https://api.ipify.org || echo "IP-ANDA")
+LOCAL_IP=$(hostname -I | awk '{print $1}')
+
+if [[ "$PUBLIC_IP" == "$LOCAL_IP" ]] || [[ "$PUBLIC_IP" == "IP-ANDA" ]]; then
+    SERVER_TYPE="VPS Standar (Public IP)"
+else
+    SERVER_TYPE="NAT VPS (Port Forwarding)"
+fi
+
 # 2. Instalasi Node.js 20
 REINSTALL_NODE="n"
 if command -v node &> /dev/null; then
@@ -144,7 +155,8 @@ echo "===================================================="
 echo "             INSTALASI SELESAI                      "
 echo "===================================================="
 echo "Direktori      : $REPO_DIR"
-echo "Akses Admin    : http://[IP-VPS-ANDA]:$PORT/admin/login"
+echo "Tipe Server    : $SERVER_TYPE"
+echo "Akses Admin    : http://$PUBLIC_IP:$PORT/admin/login"
 echo "User Default   : admin"
 echo "Pass Default   : admin123"
 echo "----------------------------------------------------"
