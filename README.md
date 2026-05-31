@@ -118,6 +118,18 @@ Sistem manajemen ISP yang mengintegrasikan **penagihan**, **GenieACS**, **OLT (S
 
 ---
 
+## Instalasi Cepat (VPS / NAT VPS)
+
+Bagi Anda yang menggunakan VPS dengan OS Ubuntu atau Debian, gunakan perintah otomatis di bawah ini:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/heruhendri/billing-rtrw/main/install.sh | bash
+```
+
+Skrip ini akan menginstal Node.js, dependensi, dan mengonfigurasi port (mendukung port custom untuk NAT VPS) serta mengatur PM2 agar aplikasi berjalan otomatis saat server restart.
+
+---
+
 ## Ringkasan tech stack
 
 - **Runtime**: Node.js **≥ 20** (disarankan LTS terbaru 20.x)
@@ -215,4 +227,3 @@ Fork, buat branch fitur, lalu kirim Pull Request.
 
 Dibuat untuk operasional ISP lokal & RTRW-Net.  
 Managed by [Ali Jaya Net](https://github.com/alijayanet)
-
