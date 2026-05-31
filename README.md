@@ -123,7 +123,7 @@ Sistem manajemen ISP yang mengintegrasikan **penagihan**, **GenieACS**, **OLT (S
 Bagi Anda yang menggunakan VPS dengan OS Ubuntu atau Debian, gunakan perintah otomatis di bawah ini:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/heruhendri/billing-rtrw/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/heruhendri/billing-rtrw/public/install.sh | bash
 ```
 
 Skrip ini akan menginstal Node.js, dependensi, dan mengonfigurasi port (mendukung port custom untuk NAT VPS) serta mengatur PM2 agar aplikasi berjalan otomatis saat server restart.
