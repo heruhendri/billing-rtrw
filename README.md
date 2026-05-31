@@ -122,6 +122,14 @@ Sistem manajemen ISP yang mengintegrasikan **penagihan**, **GenieACS**, **OLT (S
 
 Bagi Anda yang menggunakan VPS dengan OS Ubuntu atau Debian, gunakan perintah otomatis di bawah ini:
 
+### 1. Pastikan Curl Terinstal
+Jika sistem Anda belum memiliki `curl`, silakan instal terlebih dahulu dengan perintah:
+```bash
+sudo apt update && sudo apt install curl -y
+```
+
+### 2. Jalankan Perintah Instalasi
+Salin dan tempel perintah berikut ke terminal SSH Anda untuk memulai proses instalasi otomatis:
 ```bash
 curl -sSL https://raw.githubusercontent.com/heruhendri/billing-rtrw/public/install.sh | bash
 ```

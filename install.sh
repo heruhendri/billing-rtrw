@@ -18,22 +18,40 @@ sudo apt-get update -y
 sudo apt-get install -y git curl build-essential sqlite3 openssl
 
 # 2. Instalasi Node.js 20
-if ! command -v node &> /dev/null || [ "$(node -v | cut -d'.' -f1)" != "v20" ]; then
-    echo "[2/6] Menginstal Node.js 20..."
+REINSTALL_NODE="n"
+if command -v node &> /dev/null; then
+    echo "[2/6] Node.js $(node -v) sudah terinstal."
+    read -p "Apakah Anda ingin menginstal ulang/memperbarui Node.js 20? [y/N]: " REINSTALL_NODE < /dev/tty
+fi
+
+if [[ $REINSTALL_NODE =~ ^([yY][eE][sS]|[yY])$ ]] || ! command -v node &> /dev/null || [ "$(node -v | cut -d'.' -f1)" != "v20" ]; then
+    echo "[2/6] Menginstal/Memperbarui Node.js 20..."
+    sudo rm -f /etc/apt/sources.list.d/nodesource.list || true
     curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
     sudo apt-get install -y nodejs
 else
-    echo "[2/6] Node.js $(node -v) sudah terinstal."
+    echo "[2/6] Menggunakan versi Node.js yang sudah ada."
 fi
 
 # 3. Clone Repository
 REPO_DIR="billing-rtrw"
+REINSTALL_APP="n"
+if [ -d "$REPO_DIR" ]; then
+    echo ""
+    echo "[3/6] Direktori $REPO_DIR sudah tersedia."
+    read -p "Apakah Anda ingin melakukan instalasi ulang aplikasi (Hapus data lama)? [y/N]: " REINSTALL_APP < /dev/tty
+    if [[ $REINSTALL_APP =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        echo "Menghapus direktori lama..."
+        rm -rf "$REPO_DIR"
+    fi
+fi
+
 if [ ! -d "$REPO_DIR" ]; then
     echo "[3/6] Mengunduh source code..."
     git clone https://github.com/heruhendri/billing-rtrw.git $REPO_DIR
     cd $REPO_DIR
 else
-    echo "[3/6] Direktori $REPO_DIR sudah ada. Memperbarui source code..."
+    echo "[3/6] Memperbarui source code (git pull)..."
     cd $REPO_DIR
     git pull
 fi
@@ -41,11 +59,11 @@ fi
 # 4. Konfigurasi Port (Penting untuk NAT VPS)
 echo ""
 echo "--- KONFIGURASI JARINGAN ---"
-read -p "Gunakan port default (4000)? [Y/n]: " use_default
+read -p "Gunakan port default (4000)? [Y/n]: " use_default < /dev/tty
 PORT=4000
 
 if [[ $use_default =~ ^([nN][oO]|[nN])$ ]]; then
-    read -p "Masukkan port custom (sesuaikan dengan port NAT Anda): " custom_port
+    read -p "Masukkan port custom (sesuaikan dengan port NAT Anda): " custom_port < /dev/tty
     PORT=$custom_port
 fi
 echo "Aplikasi akan berjalan pada port: $PORT"
