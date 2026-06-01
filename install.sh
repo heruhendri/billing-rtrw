@@ -215,13 +215,13 @@ if [[ $install_backup =~ ^([yY][eE][sS]|[yY])$ ]]; then
     export TG_CHAT_ID="$ADMIN_ID"
     export BACKUP_DIRS="$(pwd)/database $(pwd)/backups"
 
-    # Gunakan flag -f untuk mendeteksi 404 dan mencoba branch alternatif (master)
-    if curl -fsSL https://raw.githubusercontent.com/heruhendri/Installer-Backup-Vps-Bot-Telegram/main/install.sh | bash; then
-        echo "✓ Auto Backup Telegram telah dikonfigurasi."
-    elif curl -fsSL https://raw.githubusercontent.com/heruhendri/Installer-Backup-Vps-Bot-Telegram/master/install.sh | bash; then
-        echo "✓ Auto Backup Telegram telah dikonfigurasi."
+    echo "Mengunduh script backup dari repository..."
+    
+    # Menggunakan URL terbaru yang merujuk ke file install-backupvps-telegram.sh di branch master
+    if curl -fsSL https://raw.githubusercontent.com/heruhendri/Installer-Backup-Vps-Bot-Telegram/master/install-backupvps-telegram.sh | bash; then
+        echo "✓ Auto Backup Telegram telah berhasil dikonfigurasi."
     else
-        echo "❌ Gagal mengunduh script backup (404). Silakan cek URL repository atau hubungi support."
+        echo "❌ Gagal mengunduh script backup. Pastikan URL benar atau cek koneksi internet VPS Anda."
     fi
 fi
 
