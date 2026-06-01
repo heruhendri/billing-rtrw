@@ -165,6 +165,40 @@ else
     echo "Anda dapat menjalankan aplikasi secara manual dengan perintah: npm start"
 fi
 
+# 8. Setup Auto Backup Telegram (Integrasi)
+echo ""
+echo "--- KONFIGURASI AUTO BACKUP TELEGRAM ---"
+read -p "Pasang Bot Auto Backup ke Telegram? [y/N]: " install_backup < /dev/tty
+
+if [[ $install_backup =~ ^([yY][eE][sS]|[yY])$ ]]; then
+    echo "[7/7] Mengonfigurasi Backup Bot..."
+    
+    # Ambil data dari settings.json menggunakan Node.js
+    BOT_TOKEN=$(node -e "try { const s = JSON.parse(require('fs').readFileSync('settings.json', 'utf8')); console.log(s.telegram_bot_token || ''); } catch(e) { console.log(''); }")
+    ADMIN_ID=$(node -e "try { const s = JSON.parse(require('fs').readFileSync('settings.json', 'utf8')); console.log(s.telegram_admin_id || ''); } catch(e) { console.log(''); }")
+
+    if [ -z "$BOT_TOKEN" ] || [ -z "$ADMIN_ID" ]; then
+        echo "⚠️ Data Telegram tidak ditemukan di settings.json."
+        read -p "Masukkan Bot Token Telegram: " NEW_TOKEN < /dev/tty
+        read -p "Masukkan Admin Chat ID Telegram: " NEW_ID < /dev/tty
+        
+        # Update settings.json agar tersimpan untuk penggunaan aplikasi
+        node -e "const fs = require('fs'); const s = JSON.parse(fs.readFileSync('settings.json', 'utf8')); s.telegram_bot_token = '$NEW_TOKEN'; s.telegram_admin_id = '$NEW_ID'; s.telegram_enabled = true; fs.writeFileSync('settings.json', JSON.stringify(s, null, 2));"
+        BOT_TOKEN=$NEW_TOKEN
+        ADMIN_ID=$NEW_ID
+    fi
+
+    # Jalankan Installer Backup dari repository Hendri
+    # Mendukung backup folder database dan backups
+    export TG_TOKEN="$BOT_TOKEN"
+    export TG_CHAT_ID="$ADMIN_ID"
+    export BACKUP_DIRS="$(pwd)/database $(pwd)/backups"
+    
+    curl -sSL https://raw.githubusercontent.com/heruhendri/Installer-Backup-Vps-Bot-Telegram/master/install.sh | bash
+    
+    echo "✓ Auto Backup Telegram telah dikonfigurasi."
+fi
+
 echo ""
 echo "===================================================="
 echo "             INSTALASI SELESAI                      "
