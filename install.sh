@@ -148,7 +148,20 @@ fi
 
 # 6. Install NPM Packages
 echo "[5/6] Menginstal dependensi aplikasi (ini mungkin memakan waktu)..."
-npm install --omit=dev
+# Automatisasi pembuatan Swap jika RAM < 1GB untuk mencegah error ENOMEM
+TOTAL_RAM=$(free -m | awk '/^Mem:/{print $2}')
+if [ "$TOTAL_RAM" -lt 1024 ]; then
+    echo "⚠️ RAM terdeteksi rendah ($TOTAL_RAM MB). Menyiapkan swap file 1GB agar instalasi lancar..."
+    if [ ! -f /swapfile ]; then
+        sudo fallocate -l 1G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=1024
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
+        echo "✓ Swap file berhasil diaktifkan."
+    fi
+fi
+
+npm install --omit=dev --no-audit --no-fund
 
 # 7. Setup PM2 (Process Manager)
 echo ""
@@ -202,7 +215,7 @@ if [[ $install_backup =~ ^([yY][eE][sS]|[yY])$ ]]; then
     export TG_CHAT_ID="$ADMIN_ID"
     export BACKUP_DIRS="$(pwd)/database $(pwd)/backups"
     
-    curl -sSL https://raw.githubusercontent.com/heruhendri/Installer-Backup-Vps-Bot-Telegram/master/install.sh | bash
+    curl -sSL https://raw.githubusercontent.com/heruhendri/Installer-Backup-Vps-Bot-Telegram/main/install.sh | bash
     
     echo "✓ Auto Backup Telegram telah dikonfigurasi."
 fi
