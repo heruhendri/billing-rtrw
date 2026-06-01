@@ -7,6 +7,13 @@ set -e
 
 clear
 
+# Fungsi penanganan error
+failure() {
+  echo -e "\n${RED}${BOLD}❌ Terjadi kesalahan saat instalasi!${NC}"
+  echo -e "Jika butuh bantuan, hubungi: ${CYAN}https://t.me/GbtTapiPngnSndiri${NC}"
+}
+trap failure ERR
+
 # Definisi Warna
 CYAN='\033[0;36m'
 GREEN='\033[0;32m'
@@ -23,6 +30,7 @@ echo " ██║  ██║███████╗██║ ╚████║�
 echo " ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝╚═╝"
 echo -e "       ${GREEN}RTRWNET MANAGEMENT & BILLING SYSTEM${NC}"
 echo -e "            ${YELLOW}${BOLD}Installer by Hendri${NC}"
+echo -e "      ${CYAN}Support: https://t.me/GbtTapiPngnSndiri${NC}"
 echo -e "${CYAN}----------------------------------------------------${NC}"
 echo -e " Sistem: Ubuntu/Debian Support"
 echo -e "${CYAN}----------------------------------------------------${NC}"
@@ -214,4 +222,5 @@ echo "Restart aplikasi   : pm2 restart $PM2_NAME"
 echo "Lihat log          : pm2 logs $PM2_NAME"
 echo -e "${CYAN}----------------------------------------------------${NC}"
 echo -e "       ${GREEN}${BOLD}Enjoy your system - By Hendri${NC}"
+echo -e "       ${CYAN}Support: https://t.me/GbtTapiPngnSndiri${NC}"
 echo -e "${CYAN}====================================================${NC}"
