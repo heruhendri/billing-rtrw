@@ -35,6 +35,7 @@ const crypto = require('crypto');
 const Jimp = require('jimp');
 const jsQR = require('jsqr');
 const { MultiFormatReader, BarcodeFormat, DecodeHintType, BinaryBitmap, HybridBinarizer, RGBLuminanceSource } = require('@zxing/library');
+const QRCode = require('qrcode');
 const acsPortal = require('./acsPortal');
 const { uploadAttendance, removeAttendanceFile } = require('../middleware/attendanceUpload');
 
@@ -2369,13 +2370,18 @@ router.post('/billing/:id/qris-clear', requireAdminSession, (req, res) => {
 
 router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
   try {
+    const waEnabled = getSetting('whatsapp_enabled', false);
+    const billingEnabled = getSetting('whatsapp_billing_to_customer_enabled', true);
+    if (!waEnabled) throw new Error('Notifikasi WhatsApp sedang dinonaktifkan di Pengaturan.');
+    if (!billingEnabled) throw new Error('Notifikasi tagihan WhatsApp ke pelanggan sedang dinonaktifkan.');
+
     const inv = billingSvc.getInvoiceById(req.params.id);
     if (!inv) throw new Error('Tagihan tidak ditemukan');
     
     const customer = customerSvc.getCustomerById(inv.customer_id);
     if (!customer || !customer.phone) throw new Error('Nomor WhatsApp pelanggan tidak ditemukan');
 
-    const { sendWA, whatsappStatus } = await import('../services/whatsappBot.mjs');
+    const { sendWA, sendWAImage, whatsappStatus } = await import('../services/whatsappBot.mjs');
     
     if (whatsappStatus.connection !== 'open') {
       throw new Error('Bot WhatsApp belum terhubung. Silakan cek status WhatsApp di menu Admin.');
@@ -2384,10 +2390,12 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
     let qrisAmountUnique = Number(inv.qris_amount_unique || 0) || 0;
     let qrisCode = Number(inv.qris_unique_code || 0) || 0;
     const qrisQrUrl = String(getSetting('qris_static_qr_url', '') || '').trim();
+    const qrisPayloadSetting = String(getSetting('qris_static_payload', '') || '');
     const qrisEnabledRaw = getSetting('qris_static_enabled', true);
     const qrisEnabled = !(qrisEnabledRaw === false || qrisEnabledRaw === 'false' || qrisEnabledRaw === 0 || qrisEnabledRaw === '0');
+    const hasStaticQris = qrisEnabled && (!!qrisQrUrl || !!String(qrisPayloadSetting || '').trim());
 
-    if (qrisEnabled && qrisQrUrl && String(inv.status) === 'unpaid' && (!qrisAmountUnique || !qrisCode)) {
+    if (hasStaticQris && String(inv.status) === 'unpaid' && (!qrisAmountUnique || !qrisCode)) {
       const invId = Number(inv.id);
       const baseAmount = Number(inv.amount || 0);
       if (Number.isFinite(invId) && invId > 0 && Number.isFinite(baseAmount) && baseAmount > 0) {
@@ -2427,15 +2435,147 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
       }
     }
 
+    const normalizeQrisPayload = (raw) => {
+      let s = String(raw || '').replace(/[\r\n\t]+/g, '').trim();
+      const idx = s.indexOf('000201');
+      if (idx > 0) s = s.slice(idx);
+      const lastCrc = s.lastIndexOf('6304');
+      if (lastCrc >= 0 && s.length >= lastCrc + 8) {
+        s = s.slice(0, lastCrc + 8);
+      }
+      return s;
+    };
+    const crc16CcittFalse = (input) => {
+      const s = String(input || '');
+      let crc = 0xffff;
+      for (let i = 0; i < s.length; i++) {
+        crc ^= (s.charCodeAt(i) & 0xff) << 8;
+        for (let b = 0; b < 8; b++) {
+          if (crc & 0x8000) crc = ((crc << 1) ^ 0x1021) & 0xffff;
+          else crc = (crc << 1) & 0xffff;
+        }
+      }
+      return crc & 0xffff;
+    };
+    const parseEmvTlvString = (input) => {
+      const raw = String(input || '').replace(/[\r\n\t]+/g, '').trim();
+      if (!raw) throw new Error('QRIS payload kosong');
+      if (raw.length < 8) throw new Error('QRIS payload terlalu pendek');
+      const items = [];
+      let i = 0;
+      while (i < raw.length) {
+        if (i + 4 > raw.length) throw new Error('QRIS payload TLV tidak valid');
+        const tag = raw.slice(i, i + 2);
+        const lenStr = raw.slice(i + 2, i + 4);
+        if (!/^\d{2}$/.test(lenStr)) throw new Error('QRIS payload TLV length tidak valid');
+        const len = Number(lenStr);
+        const start = i + 4;
+        const end = start + len;
+        if (end > raw.length) throw new Error('QRIS payload TLV length melebihi data');
+        const value = raw.slice(start, end);
+        items.push({ tag, value });
+        i = end;
+      }
+      return items;
+    };
+    const buildEmvTlvString = (items) => {
+      const list = Array.isArray(items) ? items : [];
+      let out = '';
+      for (const it of list) {
+        const tag = String(it?.tag || '');
+        const value = String(it?.value ?? '');
+        const len = value.length;
+        if (!/^\d{2}$/.test(tag)) throw new Error('Tag TLV tidak valid');
+        if (len > 99) throw new Error('TLV length > 99 tidak didukung');
+        out += tag + String(len).padStart(2, '0') + value;
+      }
+      return out;
+    };
+    const convertStaticQrisToDynamic = (staticPayload, amount) => {
+      const amt = Math.max(0, Math.floor(Number(amount || 0) || 0));
+      if (!amt) throw new Error('Nominal QRIS dinamis tidak valid');
+      const source = parseEmvTlvString(staticPayload)
+        .filter(x => x && x.tag)
+        .map(x => ({ tag: String(x.tag), value: String(x.value ?? '') }));
+      const managed = new Set(['54', '55', '56', '57', '63']);
+      const result = [];
+      let amountInserted = false;
+      for (const el of source) {
+        if (managed.has(el.tag)) continue;
+        if (el.tag === '01') {
+          result.push({ tag: '01', value: '12' });
+          continue;
+        }
+        if (el.tag === '58' && !amountInserted) {
+          result.push({ tag: '54', value: String(amt) });
+          amountInserted = true;
+        }
+        result.push(el);
+      }
+      if (!amountInserted) result.push({ tag: '54', value: String(amt) });
+      const body = buildEmvTlvString(result);
+      const partial = body + '6304';
+      const crc = crc16CcittFalse(partial).toString(16).toUpperCase().padStart(4, '0');
+      return partial + crc;
+    };
+
+    let _decodedCache = global.__adminQrisDecodedCache || { file: '', mtimeMs: 0, payload: '' };
+    const decodeQrisPayloadFromUploadedQr = async () => {
+      const m = String(qrisQrUrl || '').match(/^\/uploads\/qris\/([^/?#]+)$/i);
+      if (!m || !m[1]) return '';
+      const safeName = path.basename(String(m[1]));
+      const filePath = path.join(__dirname, '../public/uploads/qris', safeName);
+      let st = null;
+      try {
+        st = await fs.promises.stat(filePath);
+      } catch {
+        return '';
+      }
+      if (_decodedCache.file === safeName && _decodedCache.mtimeMs === st.mtimeMs && _decodedCache.payload) {
+        return _decodedCache.payload;
+      }
+      try {
+        const buf = await fs.promises.readFile(filePath);
+        const img = await Jimp.read(buf);
+        const rgba = new Uint8ClampedArray(img.bitmap.data.buffer, img.bitmap.data.byteOffset, img.bitmap.data.byteLength);
+        const source = new RGBLuminanceSource(rgba, img.bitmap.width, img.bitmap.height);
+        const bitmap = new BinaryBitmap(new HybridBinarizer(source));
+        const reader = new MultiFormatReader();
+        const hints = new Map();
+        hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.QR_CODE]);
+        reader.setHints(hints);
+        const decoded = reader.decode(bitmap);
+        const text = typeof decoded?.getText === 'function' ? decoded.getText() : String(decoded?.text || '');
+        const payload = normalizeQrisPayload(text);
+        if (!payload) return '';
+        _decodedCache = { file: safeName, mtimeMs: st.mtimeMs, payload };
+        global.__adminQrisDecodedCache = _decodedCache;
+        return payload;
+      } catch {
+        return '';
+      }
+    };
+
+    const resolveQrisStaticPayload = async () => {
+      const fromSetting = normalizeQrisPayload(qrisPayloadSetting);
+      if (fromSetting) return fromSetting;
+      return await decodeQrisPayloadFromUploadedQr();
+    };
+
     // Hitung Tagihan
     const unpaidInvoices = billingSvc.getUnpaidInvoicesByCustomerId(customer.id);
     const totalTagihan = unpaidInvoices.reduce((sum, i) => sum + i.amount, 0);
     const rincianBulan = unpaidInvoices.map(i => `${i.period_month}/${i.period_year}`).join(', ');
     
     // Generate Link Login
-    const protocol = req.protocol;
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
     const host = req.get('host');
-    const loginLink = `${protocol}://${host}/customer/login`;
+    let baseUrl = String(getSetting('app_url', '') || `${protocol}://${host}`).replace(/\/+$/, '');
+    try {
+      const parsed = new URL(baseUrl);
+      baseUrl = parsed.origin;
+    } catch {}
+    const loginLink = `${baseUrl}/customer/login`;
 
     const comp = company();
     const defaultAutoBilling = `Yth. Pelanggan {{nama}},\n\nIni adalah pengingat sebelum tanggal jatuh tempo/isolir.\n\n📦 *Paket:* {{paket}}\n💰 *Total Tagihan:* Rp {{tagihan}}\n📅 *Periode:* {{rincian}}\n\nMohon segera melakukan pembayaran melalui portal pelanggan: {{link}}\n\nTerima kasih atas kerja samanya.\nSalam,\nAdmin ${comp}`;
@@ -2445,14 +2585,27 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
     const templateQris = db.getAppSetting('whatsapp_billing_qris_message', defaultQris);
     const template = db.getAppSetting('whatsapp_auto_billing_message', defaultAutoBilling);
 
-    const formattedMsg = (qrisAmountUnique > 0 && qrisCode > 0)
+    const isQrisCase = (qrisAmountUnique > 0 && qrisCode > 0);
+    const qrisJpgLink = `${baseUrl}/customer/qris/static.jpg?amount=${encodeURIComponent(String(qrisAmountUnique))}`;
+    const qrisPortalLink = `${baseUrl}/customer/payment/create/${encodeURIComponent(String(inv.id))}?method=QRIS_STATIC`;
+    const qrisJpgCaption = isQrisCase
       ? templateQris
           .replace(/{{nama}}/gi, customer.name || 'Pelanggan')
           .replace(/{{periode}}/gi, `${inv.period_month}/${inv.period_year}`)
           .replace(/{{paket}}/gi, inv.package_name || '-')
           .replace(/{{qris_nominal}}/gi, Number(qrisAmountUnique).toLocaleString('id-ID'))
           .replace(/{{qris_kode}}/gi, String(qrisCode).padStart(3, '0'))
-          .replace(/{{qris_qr}}/gi, qrisQrUrl ? `🔗 QRIS: ${qrisQrUrl}` : '')
+          .replace(/{{qris_qr}}/gi, `QRIS terlampir (gambar).\n🔗 QRIS JPG: ${qrisJpgLink}\n🔐 Portal (Download): ${qrisPortalLink}`)
+      : '';
+
+    const formattedMsg = isQrisCase
+      ? templateQris
+          .replace(/{{nama}}/gi, customer.name || 'Pelanggan')
+          .replace(/{{periode}}/gi, `${inv.period_month}/${inv.period_year}`)
+          .replace(/{{paket}}/gi, inv.package_name || '-')
+          .replace(/{{qris_nominal}}/gi, Number(qrisAmountUnique).toLocaleString('id-ID'))
+          .replace(/{{qris_kode}}/gi, String(qrisCode).padStart(3, '0'))
+          .replace(/{{qris_qr}}/gi, `🔗 QRIS JPG: ${qrisJpgLink}\n🔐 Portal (Download): ${qrisPortalLink}`)
       : template
           .replace(/{{nama}}/gi, customer.name || 'Pelanggan')
           .replace(/{{tagihan}}/gi, totalTagihan.toLocaleString('id-ID'))
@@ -2460,7 +2613,23 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
           .replace(/{{paket}}/gi, inv.package_name || '-')
           .replace(/{{link}}/gi, loginLink);
 
-    const sent = await sendWA(customer.phone, formattedMsg);
+    let sent = false;
+    if (isQrisCase) {
+      try {
+        const payloadNorm = await resolveQrisStaticPayload();
+        if (payloadNorm) {
+          const dynamic = convertStaticQrisToDynamic(payloadNorm, qrisAmountUnique);
+          const png = await QRCode.toBuffer(dynamic, { errorCorrectionLevel: 'M', margin: 1, width: 420, type: 'png' });
+          const jpg = await Jimp.read(png).then(img => img.quality(90).background(0xffffffff).getBufferAsync(Jimp.MIME_JPEG));
+          sent = await sendWAImage(customer.phone, jpg, qrisJpgCaption);
+        }
+      } catch (e) {
+        sent = false;
+      }
+    }
+    if (!sent) {
+      sent = await sendWA(customer.phone, formattedMsg);
+    }
     if (!sent) throw new Error('Gagal mengirim pesan melalui WhatsApp Bot.');
 
     req.session._msg = { type: 'success', text: `Tagihan WhatsApp berhasil dikirim ke ${customer.name}.` };
@@ -4805,8 +4974,9 @@ router.post('/whatsapp/broadcast', requireAdminSession, express.urlencoded({ ext
 router.post('/whatsapp/auto-billing', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
   try {
     const enabled = req.body && req.body.enabled ? true : false;
+    const billingEnabled = req.body && req.body.billing_enabled ? true : false;
     const delay = req.body && req.body.delay ? parseInt(req.body.delay) : null;
-    const next = { whatsapp_auto_billing_enabled: enabled };
+    const next = { whatsapp_auto_billing_enabled: enabled, whatsapp_billing_to_customer_enabled: billingEnabled };
     if (delay != null && Number.isFinite(delay) && delay >= 1 && delay <= 60) {
       next.whatsapp_broadcast_delay = delay;
     }
@@ -4815,7 +4985,7 @@ router.post('/whatsapp/auto-billing', requireAdminSession, express.urlencoded({ 
       db.saveAppSetting('whatsapp_auto_billing_message', msg);
     }
     saveSettings(next);
-    req.session._msg = { type: 'success', text: `Pengingat tagihan otomatis ${enabled ? 'diaktifkan' : 'dimatikan'}.` };
+    req.session._msg = { type: 'success', text: `Pengingat tagihan otomatis ${enabled ? 'diaktifkan' : 'dimatikan'}. Notifikasi tagihan ke pelanggan ${billingEnabled ? 'diaktifkan' : 'dimatikan'}.` };
   } catch (e) {
     req.session._msg = { type: 'error', text: 'Gagal menyimpan pengaturan: ' + e.message };
   }

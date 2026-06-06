@@ -368,7 +368,7 @@ function parseCommand(text, isAdmin) {
 
   // Admin Billing & Pelanggan
   if (isAdmin && cmd === 'ringkasan') return { cmd: 'ringkasan', admin: true };
-  if (isAdmin && cmd === 'lunas' && parts.length >= 2) return { cmd: 'lunas', admin: true, targetId: parts[1] };
+  if (isAdmin && cmd === 'lunas' && parts.length >= 2) return { cmd: 'lunas', admin: true, targetId: rest || parts.slice(1).join(' ') };
   if (isAdmin && cmd === 'generate' && parts.length >= 3) return { cmd: 'generate', admin: true, month: parts[1], year: parts[2] };
   if (isAdmin && cmd === 'isolir' && parts.length >= 2) return { cmd: 'isolir', admin: true, targetId: parts[1] };
   if (isAdmin && cmd === 'buka' && parts.length >= 2) return { cmd: 'buka', admin: true, targetId: parts[1] };
@@ -471,6 +471,13 @@ function splitWaChunks(text, maxLen = 3500) {
 async function notifyCustomer(sock, lidStore, tag, message) {
   try {
     const text = waAutoWrap(message);
+    const normalizeDigitsTo62 = (raw) => {
+      let digits = String(raw || '').replace(/\D/g, '');
+      if (!digits) return '';
+      if (digits.startsWith('0')) digits = '62' + digits.slice(1);
+      else if (!digits.startsWith('62')) digits = '62' + digits;
+      return digits;
+    };
     // Cari JID pelanggan berdasarkan tag
     const customerJid = lidStore.getByTag(tag);
     if (customerJid) {
@@ -478,10 +485,10 @@ async function notifyCustomer(sock, lidStore, tag, message) {
       return true;
     }
     // Jika tidak ditemukan di lidStore, coba kirim ke nomor tag langsung
-    let phoneNumber = tag.replace(/\D/g, '');
+    let phoneNumber = normalizeDigitsTo62(tag);
     if (phoneNumber.length < 10) {
       const cust = customerSvc.findCustomerByAny(tag);
-      if (cust && cust.phone) phoneNumber = String(cust.phone).replace(/\D/g, '');
+      if (cust && cust.phone) phoneNumber = normalizeDigitsTo62(cust.phone);
     }
     if (phoneNumber.length >= 10) {
       const directJid = `${phoneNumber}@s.whatsapp.net`;
@@ -685,6 +692,27 @@ export async function sendWA(to, text) {
     return true;
   } catch (e) {
     logger.error('Gagal kirim WA:', e.message);
+    return false;
+  }
+}
+
+export async function sendWAImage(to, imageBuffer, caption = '') {
+  if (!currentSock || whatsappStatus.connection !== 'open') {
+    logger.warn('WhatsApp: Gagal kirim pesan, bot belum terhubung.');
+    return false;
+  }
+  try {
+    let digits = String(to || '').replace(/\D/g, '');
+    if (digits.startsWith('0')) {
+      digits = '62' + digits.slice(1);
+    }
+    const jid = String(to || '').includes('@') ? String(to) : `${digits}@s.whatsapp.net`;
+    const img = Buffer.isBuffer(imageBuffer) ? imageBuffer : Buffer.from(imageBuffer || []);
+    if (!img.length) return false;
+    await currentSock.sendMessage(jid, { image: img, caption: String(caption || '') });
+    return true;
+  } catch (e) {
+    logger.error('Gagal kirim WA image:', e.message);
     return false;
   }
 }
@@ -998,16 +1026,40 @@ export async function startWhatsAppBot() {
 
         if (parsed.admin && parsed.cmd === 'lunas') {
           try {
-            let targetInvId = parsed.targetId;
-            let targetInv = billingSvc.getInvoiceById(targetInvId);
+            const keyRaw = String(parsed.targetId || '').trim();
+            if (!keyRaw) return await reply('❌ Format: `lunas IDTAGIHAN` atau `lunas nama/nohp/pppoe/tag`');
+
+            let targetInvId = null;
+            let targetInv = null;
+            const isNumeric = /^\d+$/.test(keyRaw);
+            if (isNumeric) {
+              targetInvId = Number(keyRaw);
+              targetInv = billingSvc.getInvoiceById(targetInvId);
+            }
 
             // If not found by ID, try find customer and their oldest unpaid invoice
             if (!targetInv) {
-              const cust = customerSvc.findCustomerByAny(parsed.targetId);
+              let cust =
+                (isNumeric ? customerSvc.getCustomerById(Number(keyRaw)) : null) ||
+                customerSvc.findCustomerByAny(keyRaw);
+
+              if (!cust) {
+                const candidates = customerSvc.getAllCustomers(keyRaw) || [];
+                const unique = Array.from(new Map(candidates.map(c => [c.id, c])).values());
+                if (unique.length === 1) {
+                  cust = customerSvc.getCustomerById(unique[0].id);
+                } else if (unique.length > 1) {
+                  const top = unique.slice(0, 5).map(c =>
+                    `- ID:${c.id} • ${c.name || '-'} • ${c.phone || '-'} • PPPoE:${c.pppoe_username || '-'}`
+                  ).join('\n');
+                  return await reply(`⚠️ Nama/ID tidak spesifik. Ditemukan ${unique.length} pelanggan:\n\n${top}\n\nKirim ulang: \`lunas IDPELANGGAN\` atau \`lunas NOHP/PPPOE/TAG\``);
+                }
+              }
+
               if (cust) {
                 const unpaid = billingSvc.getUnpaidInvoicesByCustomerId(cust.id);
                 if (unpaid && unpaid.length > 0) {
-                  targetInv = unpaid[0]; // Take the oldest one
+                  targetInv = unpaid[0];
                   targetInvId = targetInv.id;
                 } else {
                   return await reply(`✅ Pelanggan *${cust.name}* tidak memiliki tagihan menunggak.`);
@@ -1015,21 +1067,73 @@ export async function startWhatsAppBot() {
               }
             }
 
-            if (!targetInv) return await reply(`❌ Tagihan atau Pelanggan *${parsed.targetId}* tidak ditemukan.`);
+            if (!targetInv) return await reply(`❌ Tagihan atau Pelanggan *${keyRaw}* tidak ditemukan.`);
+            if (targetInvId != null) {
+              const enriched = billingSvc.getInvoiceById(targetInvId);
+              if (enriched) targetInv = enriched;
+            }
+            if (targetInv && targetInv.status === 'paid') {
+              return await reply(`✅ Invoice *#${targetInv.id}* sudah berstatus LUNAS.`);
+            }
 
             billingSvc.markAsPaid(targetInvId, 'WA Bot Admin', 'Paid via WhatsApp Command');
 
             const customer = customerSvc.getCustomerById(targetInv.customer_id);
+            const formatter = new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 });
+            const customerName = String(targetInv.customer_name || customer?.name || targetInv.customer_name || '-');
+            const notifyTag = customer?.genieacs_tag || customer?.pppoe_username || customer?.phone || targetInv.customer_phone || targetInv.genieacs_tag || '';
             if (customer && customer.status === 'suspended') {
               const freshCustomer = customerSvc.getAllCustomers().find(c => c.id === targetInv.customer_id);
-              if (freshCustomer && freshCustomer.unpaid_count === 0) {
+              const unpaidCount = freshCustomer && Number.isFinite(Number(freshCustomer.unpaid_count)) ? Number(freshCustomer.unpaid_count) : 1;
+              if (unpaidCount === 0) {
                 await customerSvc.activateCustomer(targetInv.customer_id);
-                await reply(`✅ Invoice *#${targetInvId}* LUNAS. Pelanggan *${targetInv.customer_name}* otomatis diaktifkan kembali.`);
+                const ok = await notifyCustomer(
+                  sock,
+                  lidStore,
+                  notifyTag,
+                  waWrap(
+                    '✅ *PEMBAYARAN BERHASIL*',
+                    `Invoice *#${targetInvId}* sudah *LUNAS*.\n` +
+                      `👤 *Nama:* ${customerName}\n` +
+                      `📅 *Periode:* ${targetInv.period_month}/${targetInv.period_year}\n` +
+                      `💰 *Total:* ${formatter.format(Number(targetInv.amount || 0))}\n\n` +
+                      `🟢 Layanan internet Anda sudah aktif kembali.\n\n` +
+                      `Terima kasih.`
+                  )
+                );
+                await reply(`✅ Invoice *#${targetInvId}* LUNAS. Pelanggan *${customerName}* otomatis diaktifkan kembali.\n📩 Notif pelanggan: ${ok ? 'terkirim' : 'gagal'}`);
               } else {
-                await reply(`✅ Invoice *#${targetInvId}* LUNAS. (Masih ada ${freshCustomer.unpaid_count} tagihan lain, isolir tetap aktif)`);
+                const ok = await notifyCustomer(
+                  sock,
+                  lidStore,
+                  notifyTag,
+                  waWrap(
+                    '✅ *PEMBAYARAN BERHASIL*',
+                    `Invoice *#${targetInvId}* sudah *LUNAS*.\n` +
+                      `👤 *Nama:* ${customerName}\n` +
+                      `📅 *Periode:* ${targetInv.period_month}/${targetInv.period_year}\n` +
+                      `💰 *Total:* ${formatter.format(Number(targetInv.amount || 0))}\n\n` +
+                      `⚠️ Masih ada ${unpaidCount} tagihan lain yang belum dibayar.\n\n` +
+                      `Terima kasih.`
+                  )
+                );
+                await reply(`✅ Invoice *#${targetInvId}* LUNAS. (Masih ada ${unpaidCount} tagihan lain, isolir tetap aktif)\n📩 Notif pelanggan: ${ok ? 'terkirim' : 'gagal'}`);
               }
             } else {
-              await reply(`✅ Invoice *#${targetInvId}* (a.n ${targetInv.customer_name}) berhasil ditandai LUNAS.`);
+              const ok = await notifyCustomer(
+                sock,
+                lidStore,
+                notifyTag,
+                waWrap(
+                  '✅ *PEMBAYARAN BERHASIL*',
+                  `Invoice *#${targetInvId}* sudah *LUNAS*.\n` +
+                    `👤 *Nama:* ${customerName}\n` +
+                    `📅 *Periode:* ${targetInv.period_month}/${targetInv.period_year}\n` +
+                    `💰 *Total:* ${formatter.format(Number(targetInv.amount || 0))}\n\n` +
+                    `Terima kasih.`
+                )
+              );
+              await reply(`✅ Invoice *#${targetInvId}* (a.n ${customerName}) berhasil ditandai LUNAS.\n📩 Notif pelanggan: ${ok ? 'terkirim' : 'gagal'}`);
             }
           } catch (e) {
             await reply('❌ Gagal update status: ' + e.message);

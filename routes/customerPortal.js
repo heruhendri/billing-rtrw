@@ -16,6 +16,8 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const QRCode = require('qrcode');
+const Jimp = require('jimp');
+const { BinaryBitmap, HybridBinarizer, RGBLuminanceSource, MultiFormatReader, BarcodeFormat, DecodeHintType } = require('@zxing/library');
 
 // Configure multer for customer photo uploads
 const storage = multer.diskStorage({
@@ -302,11 +304,8 @@ function getStaticQrisQrUrl(settings) {
   return url || '';
 }
 
-function getStaticQrisPayload(settings) {
-  const enabledRaw = settings?.qris_static_enabled;
-  if (enabledRaw === false || enabledRaw === 'false' || enabledRaw === 0 || enabledRaw === '0') return '';
-  const raw = String(settings?.qris_static_payload || '');
-  let s = raw.replace(/[\r\n\t]+/g, '').trim();
+function normalizeQrisPayloadRaw(raw) {
+  let s = String(raw || '').replace(/[\r\n\t]+/g, '').trim();
   const idx = s.indexOf('000201');
   if (idx > 0) s = s.slice(idx);
   const lastCrc = s.lastIndexOf('6304');
@@ -314,6 +313,12 @@ function getStaticQrisPayload(settings) {
     s = s.slice(0, lastCrc + 8);
   }
   return s;
+}
+
+function getStaticQrisPayload(settings) {
+  const enabledRaw = settings?.qris_static_enabled;
+  if (enabledRaw === false || enabledRaw === 'false' || enabledRaw === 0 || enabledRaw === '0') return '';
+  return normalizeQrisPayloadRaw(settings?.qris_static_payload || '');
 }
 
 function crc16CcittFalse(input) {
@@ -401,11 +406,51 @@ function convertStaticQrisToDynamic(staticPayload, amount) {
   return partial + crc;
 }
 
+let qrisDecodedCache = { file: '', mtimeMs: 0, payload: '' };
+async function tryDecodeQrisPayloadFromUploadedQr(settings) {
+  const url = getStaticQrisQrUrl(settings);
+  const match = url.match(/^\/uploads\/qris\/([^/?#]+)$/i);
+  if (!match || !match[1]) return '';
+  const safeName = path.basename(String(match[1]));
+  const filePath = path.join(__dirname, '../public/uploads/qris', safeName);
+  let st = null;
+  try {
+    st = await fs.promises.stat(filePath);
+  } catch {
+    return '';
+  }
+  if (qrisDecodedCache.file === safeName && qrisDecodedCache.mtimeMs === st.mtimeMs && qrisDecodedCache.payload) {
+    return qrisDecodedCache.payload;
+  }
+  try {
+    const buf = await fs.promises.readFile(filePath);
+    const img = await Jimp.read(buf);
+    const rgba = new Uint8ClampedArray(img.bitmap.data.buffer, img.bitmap.data.byteOffset, img.bitmap.data.byteLength);
+    const source = new RGBLuminanceSource(rgba, img.bitmap.width, img.bitmap.height);
+    const bitmap = new BinaryBitmap(new HybridBinarizer(source));
+    const reader = new MultiFormatReader();
+    const hints = new Map();
+    hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.QR_CODE]);
+    reader.setHints(hints);
+    const decoded = reader.decode(bitmap);
+    const text = typeof decoded?.getText === 'function' ? decoded.getText() : String(decoded?.text || '');
+    const payload = normalizeQrisPayloadRaw(text);
+    if (!payload) return '';
+    qrisDecodedCache = { file: safeName, mtimeMs: st.mtimeMs, payload };
+    return payload;
+  } catch {
+    return '';
+  }
+}
+
 async function getStaticQrisQrUrlForAmount(settings, amountUnique) {
-  const payload = getStaticQrisPayload(settings);
+  const amt = Math.max(0, Math.floor(Number(amountUnique || 0) || 0));
+  if (!amt) return '';
+  let payload = getStaticQrisPayload(settings);
+  if (!payload) payload = await tryDecodeQrisPayloadFromUploadedQr(settings);
   if (payload) {
     try {
-      const dynamic = convertStaticQrisToDynamic(payload, amountUnique);
+      const dynamic = convertStaticQrisToDynamic(payload, amt);
       return await QRCode.toDataURL(dynamic, { errorCorrectionLevel: 'M', margin: 1, width: 320 });
     } catch (e) {
       const msg = String(e?.message || e || '');
@@ -447,6 +492,58 @@ function isQrisAmountAvailable(amount, opts = {}) {
 
   return true;
 }
+
+router.get('/qris/static.jpg', async (req, res) => {
+  const wantsHtml = () => String(req.get('accept') || '').toLowerCase().includes('text/html');
+  const sendPretty = (status, title, detail) => {
+    if (!wantsHtml()) return res.status(status).send(title);
+    const baseUrl = getBaseUrl(req, getSettingsWithCache());
+    const loginLink = `${baseUrl}/customer/login`;
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    return res.status(status).send(`<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{font-family:system-ui,Segoe UI,Arial; margin:0; background:#0b1220; color:#e5e7eb} .wrap{max-width:520px;margin:0 auto;padding:24px} .card{background:#0f172a;border:1px solid rgba(148,163,184,.18);border-radius:14px;padding:18px} h1{font-size:18px;margin:0 0 8px} p{margin:0 0 12px;color:#cbd5e1;line-height:1.45} a{display:inline-block;background:#1d4ed8;color:#fff;text-decoration:none;padding:10px 14px;border-radius:10px}</style></head><body><div class="wrap"><div class="card"><h1>${title}</h1><p>${detail || ''}</p><a href="${loginLink}">Buka Portal Pelanggan</a></div></div></body></html>`);
+  };
+  try {
+    const amount = Math.max(0, Math.floor(Number(req.query.amount || 0) || 0));
+    if (!amount) return sendPretty(400, 'Nominal belum ada', 'Tambahkan parameter amount, contoh: ?amount=3948');
+    const settings = getSettingsWithCache();
+
+    let payload = getStaticQrisPayload(settings);
+    if (!payload) payload = await tryDecodeQrisPayloadFromUploadedQr(settings);
+    if (payload) {
+      try {
+        const dynamic = convertStaticQrisToDynamic(payload, amount);
+        const png = await QRCode.toBuffer(dynamic, { errorCorrectionLevel: 'M', margin: 1, width: 420, type: 'png' });
+        const jpg = await Jimp.read(png).then(img => img.quality(90).background(0xffffffff).getBufferAsync(Jimp.MIME_JPEG));
+        res.set('Content-Type', 'image/jpeg');
+        res.set('Cache-Control', 'no-store');
+        return res.status(200).send(jpg);
+      } catch (e) {
+        const msg = String(e?.message || e || '');
+        const head = payload.slice(0, 24);
+        const tail = payload.slice(Math.max(0, payload.length - 24));
+        logger.error(`[QRIS] Dynamic QR build failed: ${msg} (payload_len=${payload.length} head=${head} tail=${tail})`);
+      }
+    }
+
+    const url = getStaticQrisQrUrl(settings);
+    if (url) {
+      const match = url.match(/^\/uploads\/qris\/([^/?#]+)$/i);
+      if (match && match[1]) {
+        const safeName = path.basename(match[1]);
+        const filePath = path.join(__dirname, '../public/uploads/qris', safeName);
+        try {
+          await fs.promises.access(filePath, fs.constants.R_OK);
+          return res.sendFile(filePath);
+        } catch {}
+      }
+      return res.redirect(url);
+    }
+
+    return sendPretty(404, 'QRIS tidak ditemukan', 'QRIS belum diatur oleh admin atau payload QRIS tidak valid.');
+  } catch {
+    return sendPretty(404, 'QRIS tidak ditemukan', 'Gagal memuat QRIS.');
+  }
+});
 
 function ensureInvoiceQrisUnique(inv, force = false) {
   const invId = Number(inv?.id || 0);
@@ -1962,10 +2059,20 @@ router.get('/api/pppoe-traffic', async (req, res) => {
 });
 
 router.post('/change-ssid', async (req, res) => {
-  const phone = req.session && req.session.phone;
-  if (!phone) return res.redirect('/customer/login');
+  const loginId = String(req.session?.phone ?? '').replace(/[\r\n\t]+/g, '').trim();
+  if (!loginId) return res.redirect('/customer/login');
   const { ssid } = req.body;
-  const ok = await updateSSID(phone, ssid);
+  const profile = findCustomerProfileByLoginId(loginId);
+  const tokenCandidates = [];
+  for (const v of [loginId, profile?.phone, profile?.pppoe_username, profile?.genieacs_tag]) {
+    const s = String(v ?? '').replace(/[\r\n\t]+/g, '').trim();
+    if (s && !tokenCandidates.includes(s)) tokenCandidates.push(s);
+  }
+  let ok = false;
+  for (const token of tokenCandidates) {
+    ok = await updateSSID(token, ssid);
+    if (ok) break;
+  }
   
   req.session._msg = ok 
     ? { type: 'success', text: 'Nama WiFi (SSID) berhasil diubah.' }
@@ -1999,14 +2106,30 @@ router.post('/change-ssid', async (req, res) => {
 });
 
 router.post('/change-password', async (req, res) => {
-  const phone = req.session && req.session.phone;
-  if (!phone) return res.redirect('/customer/login');
-  const { password } = req.body;
-  const ok = await updatePassword(phone, password);
+  const loginId = String(req.session?.phone ?? '').replace(/[\r\n\t]+/g, '').trim();
+  if (!loginId) return res.redirect('/customer/login');
+  const passwordRaw = req.body ? req.body.password : '';
+  const password = String(passwordRaw ?? '').replace(/[\r\n\t]+/g, '').trim();
+  if (password.length < 8) {
+    req.session._msg = { type: 'danger', text: 'Gagal mengubah password. Pastikan minimal 8 karakter.' };
+    return res.redirect('/customer/dashboard');
+  }
+
+  const profile = findCustomerProfileByLoginId(loginId);
+  const tokenCandidates = [];
+  for (const v of [loginId, profile?.phone, profile?.pppoe_username, profile?.genieacs_tag]) {
+    const s = String(v ?? '').replace(/[\r\n\t]+/g, '').trim();
+    if (s && !tokenCandidates.includes(s)) tokenCandidates.push(s);
+  }
+  let ok = false;
+  for (const token of tokenCandidates) {
+    ok = await updatePassword(token, password);
+    if (ok) break;
+  }
   
   req.session._msg = ok
     ? { type: 'success', text: 'Password WiFi berhasil diubah.' }
-    : { type: 'danger', text: 'Gagal mengubah password. Pastikan minimal 8 karakter.' };
+    : { type: 'danger', text: 'Gagal mengubah password. Perangkat mungkin offline atau sedang sibuk, silakan coba lagi.' };
 
   // Kirim notifikasi WhatsApp ke pelanggan
   if (ok) {
