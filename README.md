@@ -171,6 +171,7 @@ Skrip ini akan menginstal Node.js, dependensi, dan mengonfigurasi port (mendukun
 # Clone repository
 git clone https://github.com/heruhendri/billing-rtrw.git
 cd billing-rtrw
+cp env-example.txt .env
 npm install
 ```
 
