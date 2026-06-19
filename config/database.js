@@ -202,6 +202,21 @@ db.exec(`
     created_at DATETIME DEFAULT (NOW_LOCAL())
   );
 
+  CREATE TABLE IF NOT EXISTS promo_slides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT DEFAULT '',
+    description TEXT DEFAULT '',
+    image_path TEXT NOT NULL,
+    url TEXT DEFAULT '',
+    open_in_new_tab INTEGER DEFAULT 0,
+    sort_order INTEGER DEFAULT 0,
+    is_active INTEGER DEFAULT 1,
+    start_date DATE,
+    end_date DATE,
+    created_at DATETIME DEFAULT (NOW_LOCAL()),
+    updated_at DATETIME DEFAULT (NOW_LOCAL())
+  );
+
   CREATE TABLE IF NOT EXISTS olts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -640,6 +655,9 @@ try {
 } catch (e) { /* ignore if already exists */ }
 try {
   db.exec("ALTER TABLE customers ADD COLUMN pppoe_remote_address TEXT DEFAULT ''");
+} catch (e) { /* ignore if already exists */ }
+try {
+  db.exec("ALTER TABLE customers ADD COLUMN wifi_ssid TEXT DEFAULT ''");
 } catch (e) { /* ignore if already exists */ }
 try {
   db.exec("ALTER TABLE customers ADD COLUMN collector_id INTEGER REFERENCES collectors(id) ON DELETE SET NULL");
