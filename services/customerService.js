@@ -57,13 +57,24 @@ function getEffectiveRouterId(customerRouterId) {
 }
 
 // ─── CUSTOMERS ───────────────────────────────────────────────
-function getAllCustomers(search = '') {
+function calculateExpiredAt(startDateStr, durationDays = 30) {
+  const d = startDateStr ? new Date(startDateStr) : new Date();
+  if (isNaN(d.getTime())) return null;
+  d.setDate(d.getDate() + (parseInt(durationDays, 10) || 30));
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day} 23:59:59`;
+}
+
+function getAllCustomers(search = '', routerId = null, filterStatus = '', filterArea = '') {
   const now = getCurrentDateInTimezone();
   const month = now.getMonth() + 1;
   const year = now.getFullYear();
 
   const base = `
     SELECT c.*, p.name as package_name, p.price as package_price,
+           p.billing_type as package_billing_type, p.duration_days as package_duration_days,
            p.promo_cycles as package_promo_cycles,
            p.prorate_first_invoice as package_prorate_first_invoice,
            p.speed_down, p.speed_up, p.fup_limit_gb, p.use_fup,
@@ -79,11 +90,56 @@ function getAllCustomers(search = '') {
     LEFT JOIN odps odp ON c.odp_id = odp.id
     LEFT JOIN customer_usage u ON u.customer_id = c.id AND u.period_month = ${month} AND u.period_year = ${year}
   `;
+
+  const whereClauses = [];
+  const params = [];
+
   if (search) {
     const s = `%${search}%`;
-    return db.prepare(base + ` WHERE c.name LIKE ? OR c.phone LIKE ? OR c.genieacs_tag LIKE ? OR c.address LIKE ? ORDER BY c.name ASC`).all(s, s, s, s);
+    whereClauses.push(`(c.name LIKE ? OR c.phone LIKE ? OR c.nik LIKE ? OR c.genieacs_tag LIKE ? OR c.address LIKE ? OR c.area LIKE ? OR c.pppoe_username LIKE ? OR c.static_ip LIKE ? OR c.hotspot_username LIKE ?)`);
+    params.push(s, s, s, s, s, s, s, s, s);
   }
-  return db.prepare(base + ` ORDER BY c.name ASC`).all();
+
+  const rId = routerId ? Number(routerId) : null;
+  if (rId && rId > 0) {
+    whereClauses.push(`c.router_id = ?`);
+    params.push(rId);
+  }
+
+  if (filterStatus) {
+    whereClauses.push(`c.status = ?`);
+    params.push(filterStatus);
+  }
+
+  if (filterArea) {
+    whereClauses.push(`LOWER(TRIM(c.area)) = LOWER(TRIM(?))`);
+    params.push(filterArea);
+  }
+
+  const whereSql = whereClauses.length > 0 ? ` WHERE ` + whereClauses.join(' AND ') : '';
+  return db.prepare(base + whereSql + ` ORDER BY c.name ASC`).all(...params);
+}
+
+function getAllCustomerAreas() {
+  try {
+    const hasCustArea = db.prepare("PRAGMA table_info(customers)").all().some(c => c.name === 'area');
+    const hasColArea = db.prepare("PRAGMA table_info(collectors)").all().some(c => c.name === 'area');
+    const hasTechArea = db.prepare("PRAGMA table_info(technicians)").all().some(c => c.name === 'area');
+
+    const queries = [];
+    if (hasCustArea) queries.push("SELECT area FROM customers WHERE area IS NOT NULL AND TRIM(area) != ''");
+    if (hasColArea) queries.push("SELECT area FROM collectors WHERE area IS NOT NULL AND TRIM(area) != ''");
+    if (hasTechArea) queries.push("SELECT area FROM technicians WHERE area IS NOT NULL AND TRIM(area) != ''");
+
+    if (queries.length === 0) return [];
+
+    const unionSql = `SELECT DISTINCT TRIM(area) as area FROM (` + queries.join(' UNION ') + `) ORDER BY area ASC`;
+    const rows = db.prepare(unionSql).all();
+    return rows.map(r => r.area).filter(Boolean);
+  } catch (e) {
+    logger.warn('[CustomerService] getAllCustomerAreas error:', e.message);
+    return [];
+  }
 }
 
 function resetPromoCyclesUsed(customerId) {
@@ -95,6 +151,7 @@ function resetPromoCyclesUsed(customerId) {
 function getCustomerById(id) {
   return db.prepare(`
     SELECT c.*, p.name as package_name, p.price as package_price,
+           p.billing_type as package_billing_type, p.duration_days as package_duration_days,
            p.promo_cycles as package_promo_cycles,
            p.prorate_first_invoice as package_prorate_first_invoice,
            r.name as router_name, o.name as olt_name, odp.name as odp_name
@@ -108,11 +165,22 @@ function getCustomerById(id) {
 }
 
 function createCustomer(data) {
+  let expiredAt = data.expired_at || null;
+  if (!expiredAt && data.package_id) {
+    const pkg = db.prepare('SELECT billing_type, duration_days FROM packages WHERE id=?').get(data.package_id);
+    if (pkg && pkg.billing_type === 'prepaid') {
+      const baseDate = data.install_date || new Date().toISOString().slice(0, 10);
+      expiredAt = calculateExpiredAt(baseDate, pkg.duration_days || 30);
+    }
+  }
+
   return db.prepare(`
-    INSERT INTO customers (name, phone, email, address, package_id, router_id, olt_id, odp_id, pon_port, lat, lng, genieacs_tag, pppoe_username, pppoe_password, pppoe_remote_address, isolir_profile, status, install_date, notes, auto_isolate, isolate_day, connection_type, static_ip, mac_address, hotspot_username, hotspot_password, hotspot_profile, collector_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO customers (nik, name, phone, email, address, area, package_id, router_id, olt_id, odp_id, pon_port, lat, lng, genieacs_tag, pppoe_username, pppoe_password, pppoe_remote_address, isolir_profile, status, install_date, expired_at, notes, auto_isolate, isolate_day, connection_type, static_ip, mac_address, hotspot_username, hotspot_password, hotspot_profile, collector_id, is_radius)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
+    data.nik ? String(data.nik).trim() : '',
     data.name, data.phone || '', data.email || '', data.address || '',
+    data.area ? String(data.area).trim() : '',
     data.package_id ? parseInt(data.package_id) : null,
     data.router_id ? parseInt(data.router_id) : null,
     data.olt_id ? parseInt(data.olt_id) : null,
@@ -125,7 +193,9 @@ function createCustomer(data) {
     data.pppoe_remote_address || '',
     data.isolir_profile || 'isolir',
     data.status || 'active',
-    data.install_date || null, data.notes || '',
+    data.install_date || null,
+    expiredAt,
+    data.notes || '',
     data.auto_isolate !== undefined ? parseInt(data.auto_isolate) : 1,
     data.isolate_day !== undefined ? parseInt(data.isolate_day) : 10,
     data.connection_type || 'pppoe',
@@ -134,20 +204,32 @@ function createCustomer(data) {
     data.hotspot_username || '',
     data.hotspot_password || '',
     data.hotspot_profile || '',
-    data.collector_id ? parseInt(data.collector_id) : null
+    data.collector_id ? parseInt(data.collector_id) : null,
+    data.is_radius !== undefined ? parseInt(data.is_radius) : 1
   );
 }
 
 function updateCustomer(id, data) {
-  const prev = db.prepare('SELECT package_id FROM customers WHERE id=?').get(id);
+  const prev = db.prepare('SELECT package_id, expired_at, install_date FROM customers WHERE id=?').get(id);
   const newPkgId = data.package_id ? parseInt(data.package_id, 10) : null;
   const pkgChanged = prev && Number(prev.package_id || 0) !== Number(newPkgId || 0);
 
+  let expiredAt = data.expired_at !== undefined ? data.expired_at : (prev ? prev.expired_at : null);
+  if (!expiredAt && newPkgId) {
+    const pkg = db.prepare('SELECT billing_type, duration_days FROM packages WHERE id=?').get(newPkgId);
+    if (pkg && pkg.billing_type === 'prepaid') {
+      const baseDate = data.install_date || (prev ? prev.install_date : null) || new Date().toISOString().slice(0, 10);
+      expiredAt = calculateExpiredAt(baseDate, pkg.duration_days || 30);
+    }
+  }
+
   const result = db.prepare(`
-    UPDATE customers SET name=?, phone=?, email=?, address=?, package_id=?, router_id=?, olt_id=?, odp_id=?, pon_port=?, lat=?, lng=?, genieacs_tag=?, pppoe_username=?, pppoe_password=?, pppoe_remote_address=?, isolir_profile=?, status=?, install_date=?, notes=?, auto_isolate=?, isolate_day=?, cable_path=?, connection_type=?, static_ip=?, mac_address=?, hotspot_username=?, hotspot_password=?, hotspot_profile=?, collector_id=?
+    UPDATE customers SET nik=?, name=?, phone=?, email=?, address=?, area=?, package_id=?, router_id=?, olt_id=?, odp_id=?, pon_port=?, lat=?, lng=?, genieacs_tag=?, pppoe_username=?, pppoe_password=?, pppoe_remote_address=?, isolir_profile=?, status=?, install_date=?, expired_at=?, notes=?, auto_isolate=?, isolate_day=?, cable_path=?, connection_type=?, static_ip=?, mac_address=?, hotspot_username=?, hotspot_password=?, hotspot_profile=?, collector_id=?, is_radius=?
     WHERE id=?
   `).run(
+    data.nik !== undefined ? (data.nik ? String(data.nik).trim() : '') : (prev.nik || ''),
     data.name, data.phone || '', data.email || '', data.address || '',
+    data.area ? String(data.area).trim() : '',
     data.package_id ? parseInt(data.package_id) : null,
     data.router_id ? parseInt(data.router_id) : null,
     data.olt_id ? parseInt(data.olt_id) : null,
@@ -160,7 +242,9 @@ function updateCustomer(id, data) {
     data.pppoe_remote_address || '',
     data.isolir_profile || 'isolir',
     data.status || 'active',
-    data.install_date || null, data.notes || '',
+    data.install_date || null,
+    expiredAt,
+    data.notes || '',
     data.auto_isolate !== undefined ? parseInt(data.auto_isolate) : 1,
     data.isolate_day !== undefined ? parseInt(data.isolate_day) : 10,
     data.cable_path || null,
@@ -171,6 +255,7 @@ function updateCustomer(id, data) {
     data.hotspot_password || '',
     data.hotspot_profile || '',
     data.collector_id ? parseInt(data.collector_id) : null,
+    data.is_radius !== undefined ? parseInt(data.is_radius) : 1,
     id
   );
 
@@ -277,12 +362,37 @@ function getCustomerStats() {
 }
 
 // ─── PACKAGES ────────────────────────────────────────────────
-function getAllPackages() {
-  return db.prepare(`
-    SELECT p.*, COUNT(c.id) as customer_count
-    FROM packages p LEFT JOIN customers c ON c.package_id = p.id
-    GROUP BY p.id ORDER BY p.price ASC
-  `).all();
+function getAllPackages(routerId = null) {
+  const rId = routerId ? Number(routerId) : null;
+  try {
+    if (rId && rId > 0) {
+      return db.prepare(`
+        SELECT p.*, r.name as router_name, COUNT(c.id) as customer_count
+        FROM packages p 
+        LEFT JOIN customers c ON c.package_id = p.id
+        LEFT JOIN routers r ON p.router_id = r.id
+        WHERE p.router_id IS NULL OR p.router_id = ?
+        GROUP BY p.id ORDER BY p.price ASC
+      `).all(rId);
+    }
+    return db.prepare(`
+      SELECT p.*, r.name as router_name, COUNT(c.id) as customer_count
+      FROM packages p 
+      LEFT JOIN customers c ON c.package_id = p.id
+      LEFT JOIN routers r ON p.router_id = r.id
+      GROUP BY p.id ORDER BY p.price ASC
+    `).all();
+  } catch (e) {
+    if (String(e?.message || '').includes('no such column')) {
+      return db.prepare(`
+        SELECT p.*, NULL as router_name, COUNT(c.id) as customer_count
+        FROM packages p 
+        LEFT JOIN customers c ON c.package_id = p.id
+        GROUP BY p.id ORDER BY p.price ASC
+      `).all();
+    }
+    throw e;
+  }
 }
 
 function getPackageById(id) {
@@ -292,6 +402,8 @@ function getPackageById(id) {
 function createPackage(data) {
   const down = Math.round(parseFloat(data.speed_down || 0) * 1000);
   const up = Math.round(parseFloat(data.speed_up || 0) * 1000);
+  const down_upto = Math.round(parseFloat(data.speed_down_upto || 0) * 1000);
+  const up_upto = Math.round(parseFloat(data.speed_up_upto || 0) * 1000);
   const n_down = Math.round(parseFloat(data.night_speed_down || 0) * 1000);
   const n_up = Math.round(parseFloat(data.night_speed_up || 0) * 1000);
   const f_down = Math.round(parseFloat(data.fup_speed_down || 0) * 1000);
@@ -304,24 +416,29 @@ function createPackage(data) {
   const ppnPercentage = parseFloat(data.ppn_percentage || 11.0);
   const useUso = data.use_uso ? 1 : 0;
   const usoPercentage = parseFloat(data.uso_percentage || 1.75);
+  const routerId = data.router_id ? parseInt(data.router_id, 10) : null;
+  const billingType = (data.billing_type === 'prepaid') ? 'prepaid' : 'postpaid';
+  const durationDays = Math.max(1, parseInt(data.duration_days, 10) || 30);
 
   return db.prepare(`
     INSERT INTO packages (
       name, price, promo_price, promo_cycles, prorate_first_invoice,
-      speed_down, speed_up, 
+      speed_down, speed_up, speed_down_upto, speed_up_upto,
       use_night_speed, night_profile_name, night_speed_down, night_speed_up, 
       use_fup, fup_profile_name, fup_limit_gb, fup_speed_down, 
       description,
-      use_ppn, ppn_percentage, use_uso, uso_percentage
+      billing_type, duration_days,
+      use_ppn, ppn_percentage, use_uso, uso_percentage, router_id
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     data.name, parseInt(data.price) || 0, promoPrice, promoCycles, prorateFirst,
-    down, up,
+    down, up, down_upto, up_upto,
     data.use_night_speed ? 1 : 0, data.night_profile_name || null, n_down, n_up,
     data.use_fup ? 1 : 0, data.fup_profile_name || null, f_limit, f_down,
     data.description || '',
-    usePpn, ppnPercentage, useUso, usoPercentage
+    billingType, durationDays,
+    usePpn, ppnPercentage, useUso, usoPercentage, routerId
   );
 }
 
@@ -334,6 +451,8 @@ function parsePromoPrice(raw) {
 function updatePackage(id, data) {
   const down = Math.round(parseFloat(data.speed_down || 0) * 1000);
   const up = Math.round(parseFloat(data.speed_up || 0) * 1000);
+  const down_upto = Math.round(parseFloat(data.speed_down_upto || 0) * 1000);
+  const up_upto = Math.round(parseFloat(data.speed_up_upto || 0) * 1000);
   const n_down = Math.round(parseFloat(data.night_speed_down || 0) * 1000);
   const n_up = Math.round(parseFloat(data.night_speed_up || 0) * 1000);
   const f_down = Math.round(parseFloat(data.fup_speed_down || 0) * 1000);
@@ -345,23 +464,28 @@ function updatePackage(id, data) {
   const ppnPercentage = parseFloat(data.ppn_percentage || 11.0);
   const useUso = data.use_uso ? 1 : 0;
   const usoPercentage = parseFloat(data.uso_percentage || 1.75);
+  const routerId = data.router_id ? parseInt(data.router_id, 10) : null;
+  const billingType = (data.billing_type === 'prepaid') ? 'prepaid' : 'postpaid';
+  const durationDays = Math.max(1, parseInt(data.duration_days, 10) || 30);
 
   return db.prepare(`
     UPDATE packages 
     SET name=?, price=?, promo_price=?, promo_cycles=?, prorate_first_invoice=?,
-        speed_down=?, speed_up=?, 
+        speed_down=?, speed_up=?, speed_down_upto=?, speed_up_upto=?,
         use_night_speed=?, night_profile_name=?, night_speed_down=?, night_speed_up=?, 
         use_fup=?, fup_profile_name=?, fup_limit_gb=?, fup_speed_down=?, 
         description=?, is_active=?,
-        use_ppn=?, ppn_percentage=?, use_uso=?, uso_percentage=?
+        billing_type=?, duration_days=?,
+        use_ppn=?, ppn_percentage=?, use_uso=?, uso_percentage=?, router_id=?
     WHERE id=?
   `).run(
     data.name, parseInt(data.price) || 0, promoPrice, promoCycles, prorateFirst,
-    down, up,
+    down, up, down_upto, up_upto,
     data.use_night_speed ? 1 : 0, data.night_profile_name || null, n_down, n_up,
     data.use_fup ? 1 : 0, data.fup_profile_name || null, f_limit, f_down,
     data.description || '', data.is_active == '1' ? 1 : 0,
-    usePpn, ppnPercentage, useUso, usoPercentage,
+    billingType, durationDays,
+    usePpn, ppnPercentage, useUso, usoPercentage, routerId,
     id
   );
 }
@@ -587,7 +711,7 @@ async function activateCustomer(id) {
 }
 
 module.exports = {
-  getAllCustomers, getCustomerById, createCustomer, updateCustomer, deleteCustomer, getCustomerStats,
+  getAllCustomers, getAllCustomerAreas, getCustomerById, createCustomer, updateCustomer, deleteCustomer, getCustomerStats,
   getAllPackages, getPackageById, createPackage, updatePackage, deletePackage,
   suspendCustomer, activateCustomer, findCustomerByAny, updateCustomerCablePath,
   resetPromoCyclesUsed, getEffectiveRouterId

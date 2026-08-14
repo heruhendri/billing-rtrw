@@ -84,7 +84,8 @@ const BRAND_PROFILES = {
       status_table: '1.3.6.1.4.1.3902.1082.500.10.2.3.3.1.9',
       name_table:   '1.3.6.1.4.1.3902.1082.500.10.2.3.3.1.2',
       sn_table:     '1.3.6.1.4.1.3902.1082.500.10.2.3.3.1.6',
-      rx_power_table: '1.3.6.1.4.1.3902.1015.1010.11.2.1.2', // 0.01 dBm
+      tx_power_table: '1.3.6.1.4.1.3902.1015.1010.11.2.1.1', // TX Optical power (0.01 dBm)
+      rx_power_table: '1.3.6.1.4.1.3902.1015.1010.11.2.1.2', // RX Optical power (0.01 dBm)
       offline_reason_table: '1.3.6.1.4.1.3902.1082.500.10.2.3.8.1.7',
       probe_oid:    '1.3.6.1.4.1.3902.1082.500.10.2.3.3.1.9',
       unauth_sn_table: '1.3.6.1.4.1.3902.1012.3.13.3.1.2',
@@ -99,6 +100,7 @@ const BRAND_PROFILES = {
       status_table: '1.3.6.1.4.1.3902.1082.500.12.2.3.3.1.10',
       name_table:   '1.3.6.1.4.1.3902.1082.500.12.2.3.3.1.2',
       sn_table:     '1.3.6.1.4.1.3902.1082.500.12.2.3.3.1.3',
+      tx_power_table: '1.3.6.1.4.1.3902.1082.500.12.2.3.7.1.2',
       rx_power_table: '1.3.6.1.4.1.3902.1082.500.12.2.3.7.1.3',
       offline_reason_table: '1.3.6.1.4.1.3902.1082.500.12.2.3.8.1.7',
       probe_oid:    '1.3.6.1.4.1.3902.1082.500.12.2.3.3.1.10',
@@ -110,6 +112,7 @@ const BRAND_PROFILES = {
       status_table: '1.3.6.1.4.1.3902.1012.3.28.2.1.4',
       name_table:   '1.3.6.1.4.1.3902.1082.500.10.2.3.3.1.2',
       sn_table:     '1.3.6.1.4.1.3902.1082.500.10.2.3.3.1.6',
+      tx_power_table: '1.3.6.1.4.1.3902.1015.1010.11.2.1.1',
       rx_power_table: '1.3.6.1.4.1.3902.1015.1010.11.2.1.2',
       probe_oid:    '1.3.6.1.4.1.3902.1012.3.28.2.1.4',
       unauth_sn_table: '1.3.6.1.4.1.3902.1012.3.13.3.1.2',
@@ -121,6 +124,7 @@ const BRAND_PROFILES = {
       status_table: '1.3.6.1.4.1.37950.1.1.5.13.1.1.4',
       name_table:   '1.3.6.1.4.1.37950.1.1.5.13.1.1.10',
       sn_table:     '1.3.6.1.4.1.37950.1.1.5.13.1.1.2',
+      tx_power_table: '1.3.6.1.4.1.37950.1.1.5.13.1.1.20', // 0.1 dBm
       rx_power_table: '1.3.6.1.4.1.37950.1.1.5.13.1.1.21', // 0.1 dBm
       probe_oid:    '1.3.6.1.4.1.37950.1.1.5.13.1.1.4',
     },
@@ -131,6 +135,7 @@ const BRAND_PROFILES = {
       status_table: '1.3.6.1.4.1.2011.6.128.1.1.2.43.1.11',
       name_table:   '1.3.6.1.4.1.2011.6.128.1.1.2.43.1.3',
       sn_table:     '1.3.6.1.4.1.2011.6.128.1.1.2.43.1.9',
+      tx_power_table: '1.3.6.1.4.1.2011.6.128.1.1.2.46.1.3', // 0.01 dBm
       rx_power_table: '1.3.6.1.4.1.2011.6.128.1.1.2.46.1.4', // 0.01 dBm
       offline_reason_table: '1.3.6.1.4.1.2011.6.128.1.1.2.46.1.24',
       probe_oid:    '1.3.6.1.4.1.2011.6.128.1.1.2.43.1.11',
@@ -148,6 +153,7 @@ const BRAND_PROFILES = {
       status_table: '1.3.6.1.4.1.27332.1.1.1.8.1.7',
       name_table:   '1.3.6.1.4.1.27332.1.1.1.8.1.3',
       sn_table:     '1.3.6.1.4.1.27332.1.1.1.8.1.4',
+      tx_power_table: '1.3.6.1.4.1.27332.1.1.1.11.1.3',
       rx_power_table: '1.3.6.1.4.1.27332.1.1.1.11.1.4',
       probe_oid:    '1.3.6.1.4.1.27332.1.1.1.8.1.7',
       unauth_sn_table: '1.3.6.1.4.1.27332.1.1.1.1.1.1.10',
@@ -159,6 +165,7 @@ const BRAND_PROFILES = {
       status_table: '1.3.6.1.4.1.3320.101.10.1.1.7',
       name_table:   '1.3.6.1.4.1.3320.101.10.1.1.3',
       sn_table:     '1.3.6.1.4.1.3320.101.10.1.1.4',
+      tx_power_table: '1.3.6.1.4.1.3320.101.10.3.1.3',
       rx_power_table: '1.3.6.1.4.1.3320.101.10.3.1.4',
       probe_oid:    '1.3.6.1.4.1.3320.101.10.1.1.7',
     }
@@ -168,9 +175,30 @@ const BRAND_PROFILES = {
       name: 'CDATA_EPON',
       status_table: '1.3.6.1.4.1.34592.1.3.100.12.1.1.1.15',
       name_table:   '1.3.6.1.4.1.34592.1.3.100.12.1.1.1.10',
-      sn_table:     '1.3.6.1.4.1.34592.1.3.100.12.1.1.1.10',
+      sn_table:     '1.3.6.1.4.1.34592.1.3.100.12.1.1.1.2', // LLID / MAC table (bukan .10)
+      tx_power_table: '1.3.6.1.4.1.34592.1.3.100.12.1.1.1.20',
       rx_power_table: '1.3.6.1.4.1.34592.1.3.100.12.1.1.1.21', // 0.1 dBm
       probe_oid:    '1.3.6.1.4.1.34592.1.3.100.12.1.1.1.15',
+    }
+  ],
+  generic: [
+    {
+      name: 'GENERIC_EPON_CTC',
+      status_table: '1.3.6.1.4.1.3320.101.10.1.1.26',
+      name_table:   '1.3.6.1.4.1.3320.101.10.1.1.79',
+      sn_table:     '1.3.6.1.4.1.3320.101.10.1.1.3',
+      tx_power_table: '1.3.6.1.4.1.3320.101.10.5.1.5',
+      rx_power_table: '1.3.6.1.4.1.3320.101.10.5.1.6',
+      probe_oid:    '1.3.6.1.4.1.3320.101.10.1.1.26',
+    },
+    {
+      name: 'GENERIC_GPON_STD',
+      status_table: '1.3.6.1.4.1.2011.6.128.1.1.2.43.1.11',
+      name_table:   '1.3.6.1.4.1.2011.6.128.1.1.2.43.1.3',
+      sn_table:     '1.3.6.1.4.1.2011.6.128.1.1.2.43.1.9',
+      tx_power_table: '1.3.6.1.4.1.2011.6.128.1.1.2.46.1.3',
+      rx_power_table: '1.3.6.1.4.1.2011.6.128.1.1.2.46.1.4',
+      probe_oid:    '1.3.6.1.4.1.2011.6.128.1.1.2.43.1.11',
     }
   ]
 };
@@ -180,11 +208,12 @@ const ONLINE_VALUES = {
   hioso: [1, 3, 4],
   hsgq:  [1, 3, 4],
   zte:   [1, 3, 'working', 'online'],
-  vsol:  [1],
+  vsol:  [1, 3, 4],
   huawei: [5, 1, 'active', 'online'], // 5: operation
   fiberhome: [1, 2, 3],
   bdcom: [1, 2, 3],
   cdata: [1, 3],
+  generic: [1, 2, 3, 4, 5, 'online', 'active', 'working'],
 };
 
 const getOnlineValues = (brandKey, profile) => {
@@ -210,9 +239,9 @@ const SYSTEM_OIDS = {
     uplink_tx: '1.3.6.1.2.1.31.1.1.1.10.1',      // ifHCOutOctets (uplink port 1)
   },
   hsgq: {
-    temp:      '1.3.6.1.4.1.3320.101.11.1.13.1',
-    cpu:       '1.3.6.1.4.1.3320.101.11.1.13.1',
-    ram:       '1.3.6.1.4.1.3320.101.11.1.14.1',
+    temp:      '1.3.6.1.4.1.3320.101.11.1.12.1', // Temp sensor
+    cpu:       '1.3.6.1.4.1.3320.101.11.1.13.1', // CPU Usage
+    ram:       '1.3.6.1.4.1.3320.101.11.1.14.1', // RAM Usage
     uplink_rx: '1.3.6.1.2.1.31.1.1.1.6.1',
     uplink_tx: '1.3.6.1.2.1.31.1.1.1.10.1',
   },
@@ -231,23 +260,23 @@ const SYSTEM_OIDS = {
     uplink_tx: '1.3.6.1.2.1.31.1.1.1.10.1',
   },
   huawei: {
-    temp:      '1.3.6.1.4.1.2011.6.128.1.1.2.23.1.14.0.0',
-    cpu:       '1.3.6.1.4.1.2011.6.128.1.1.2.23.1.14.0.0',
-    ram:       '1.3.6.1.4.1.2011.6.128.1.1.2.23.1.15.0.0',
+    temp:      '1.3.6.1.4.1.2011.6.128.1.1.2.23.1.13.0.0', // Suhu (°C)
+    cpu:       '1.3.6.1.4.1.2011.6.128.1.1.2.23.1.14.0.0', // CPU (%)
+    ram:       '1.3.6.1.4.1.2011.6.128.1.1.2.23.1.15.0.0', // RAM (%)
     uplink_rx: '1.3.6.1.2.1.31.1.1.1.6.1',
     uplink_tx: '1.3.6.1.2.1.31.1.1.1.10.1',
   },
   fiberhome: {
-    temp:      '1.3.6.1.4.1.27332.1.1.1.9.1.12.1.1',
-    cpu:       '1.3.6.1.4.1.27332.1.1.1.9.1.12.1.1',
-    ram:       '1.3.6.1.4.1.27332.1.1.1.9.1.14.1.1',
+    temp:      '1.3.6.1.4.1.27332.1.1.1.9.1.11.1.1', // Suhu (°C)
+    cpu:       '1.3.6.1.4.1.27332.1.1.1.9.1.12.1.1', // CPU (%)
+    ram:       '1.3.6.1.4.1.27332.1.1.1.9.1.14.1.1', // RAM (%)
     uplink_rx: '1.3.6.1.2.1.31.1.1.1.6.1',
     uplink_tx: '1.3.6.1.2.1.31.1.1.1.10.1',
   },
   bdcom: {
-    temp:      '1.3.6.1.4.1.3320.101.11.1.13.1',
-    cpu:       '1.3.6.1.4.1.3320.101.11.1.13.1',
-    ram:       '1.3.6.1.4.1.3320.101.11.1.14.1',
+    temp:      '1.3.6.1.4.1.3320.101.11.1.12.1', // Suhu (°C)
+    cpu:       '1.3.6.1.4.1.3320.101.11.1.13.1', // CPU (%)
+    ram:       '1.3.6.1.4.1.3320.101.11.1.14.1', // RAM (%)
     uplink_rx: '1.3.6.1.2.1.31.1.1.1.6.1',
     uplink_tx: '1.3.6.1.2.1.31.1.1.1.10.1',
   },
@@ -1482,6 +1511,10 @@ async function getOltStatsInternal(id, full = false) {
     version:  snmp.Version2c,
   });
 
+  session.on('error', (err) => {
+    logger.warn(`[SNMP Session Error] OLT ${olt.host}: ${err.message}`);
+  });
+
   let isResolved = false;
 
   return new Promise((resolve) => {
@@ -1493,12 +1526,9 @@ async function getOltStatsInternal(id, full = false) {
       resolve(data);
     };
 
-    // OPTIMIZATION: Reduce timeout for faster UI response
-    // Full data: 15s (was 60s), Summary: 10s (was 25s)
-    // If OLT offline, fail fast instead of hanging
     const timeoutMs = full ? 15000 : 10000;
     const globalTimeout = setTimeout(() => {
-      stats.error = `Request Timeout (${Math.round(timeoutMs / 1000)}s)`;
+      stats.error = `Koneksi Timeout (${Math.round(timeoutMs / 1000)}s) - OLT ${olt.host} tidak merespons SNMP/Telnet`;
       safeResolve(stats);
     }, timeoutMs);
 
@@ -1515,7 +1545,36 @@ async function getOltStatsInternal(id, full = false) {
         });
 
         if (!uptimeVbs[0] || uptimeVbs[0].type === snmp.ObjectType.NoSuchObject || uptimeVbs[0].type === snmp.ObjectType.EndOfMibView) {
-          if (!stats.error) stats.error = 'SNMP Agent not responding / Wrong Community String';
+          // Telnet Fallback for HIOSO/HSGQ if SNMP is not enabled
+          if (brandKey === 'hioso' || brandKey === 'hsgq') {
+            const telnetData = await fetchHiosoOnuDetailViaTelnet(olt);
+            if (telnetData && telnetData.length > 0) {
+              stats.status = 'Online';
+              stats.error = null;
+              stats.onus_total = telnetData.length;
+              stats.onus_online = telnetData.filter(r => String(r.status).toLowerCase().includes('on')).length;
+              stats.onus_offline = stats.onus_total - stats.onus_online;
+              if (full) {
+                stats.onus = telnetData.map((r, idx) => ({
+                  index: r.id || idx,
+                  id: r.id || '-',
+                  name: r.name || r.mac || `ONU-${idx+1}`,
+                  sn: r.mac || '-',
+                  status: String(r.status).toLowerCase().includes('on') ? 'Online' : 'Offline',
+                  offline_reason: translateOfflineReason(brandKey, r.offlineReason),
+                  tx: r.txPower || 'N/A',
+                  rx: r.rxPower || 'N/A',
+                  distance: r.distance || '-',
+                  firmware: r.fwVersion || '-',
+                  uptime: r.onlineTime || '-'
+                }));
+              }
+              safeResolve(stats);
+              return;
+            }
+          }
+
+          stats.error = `Tidak dapat terhubung ke OLT ${olt.host}:${olt.snmp_port || 161} (${stats.error || 'Offline / Socket Closed'}). Pastikan IP OLT aktif & Community string ('${community}') benar.`;
           safeResolve(stats);
           return;
         }
@@ -1534,12 +1593,50 @@ async function getOltStatsInternal(id, full = false) {
         }
 
         if (!activeProfile) {
-          stats.error = 'Brand/Profile OID tidak cocok dengan perangkat ini';
+          // Telnet Fallback if profile not matched
+          if (brandKey === 'hioso' || brandKey === 'hsgq') {
+            const telnetData = await fetchHiosoOnuDetailViaTelnet(olt);
+            if (telnetData && telnetData.length > 0) {
+              stats.status = 'Online';
+              stats.error = null;
+              stats.onus_total = telnetData.length;
+              stats.onus_online = telnetData.filter(r => String(r.status).toLowerCase().includes('on')).length;
+              stats.onus_offline = stats.onus_total - stats.onus_online;
+              if (full) {
+                stats.onus = telnetData.map((r, idx) => ({
+                  index: r.id || idx,
+                  id: r.id || '-',
+                  name: r.name || r.mac || `ONU-${idx+1}`,
+                  sn: r.mac || '-',
+                  status: String(r.status).toLowerCase().includes('on') ? 'Online' : 'Offline',
+                  offline_reason: translateOfflineReason(brandKey, r.offlineReason),
+                  tx: r.txPower || 'N/A',
+                  rx: r.rxPower || 'N/A',
+                  distance: r.distance || '-',
+                  firmware: r.fwVersion || '-',
+                  uptime: r.onlineTime || '-'
+                }));
+              }
+              safeResolve(stats);
+              return;
+            }
+          }
+
+          stats.error = `Brand/Profile OID tidak cocok dengan perangkat OLT ${olt.host}. Silakan ganti Brand di menu 'Edit OLT'.`;
           safeResolve(stats);
           return;
         }
 
         const detectedBrandKey = activeProfile.__brandKey || brandKey;
+        stats.activeProfile = activeProfile;
+        stats.systemOids = SYSTEM_OIDS[detectedBrandKey] || null;
+        stats.cardOids = CARD_OIDS[detectedBrandKey] || null;
+        stats.snmpConfig = {
+          host: olt.host,
+          port: olt.snmp_port || 161,
+          community: olt.snmp_community || 'public',
+          brand: olt.brand
+        };
         const onlineVals = getOnlineValues(detectedBrandKey, activeProfile);
 
         // Start system metrics concurrently
@@ -1698,7 +1795,7 @@ async function getOltStatsInternal(id, full = false) {
         }
 
         stats.onus_weak = weakCount;
-        stats.onus = onus.sort((a, b) => a.name.localeCompare(b.name));
+        stats.onus = enrichOnusWithCustomerData(onus.sort((a, b) => a.name.localeCompare(b.name)));
         safeResolve(stats);
       } catch (err) {
         stats.error = err.message;
@@ -1706,6 +1803,59 @@ async function getOltStatsInternal(id, full = false) {
       }
     })();
   });
+}
+
+function enrichOnusWithCustomerData(onus) {
+  if (!Array.isArray(onus) || onus.length === 0) return onus;
+  try {
+    const custs = db.prepare(`
+      SELECT id, name, pppoe_username, mac_address, genieacs_tag, phone
+      FROM customers
+    `).all() || [];
+
+    const pppoeMap = new Map();
+    const macMap = new Map();
+    const tagMap = new Map();
+    const nameMap = new Map();
+
+    for (const c of custs) {
+      if (c.pppoe_username) pppoeMap.set(String(c.pppoe_username).trim().toLowerCase(), c);
+      if (c.mac_address) {
+        const rawMac = String(c.mac_address).replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+        if (rawMac) macMap.set(rawMac, c);
+      }
+      if (c.genieacs_tag) tagMap.set(String(c.genieacs_tag).trim().toLowerCase(), c);
+      if (c.name) nameMap.set(String(c.name).trim().toLowerCase(), c);
+    }
+
+    for (const onu of onus) {
+      const snClean = String(onu.sn || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+      const nameClean = String(onu.name || '').trim().toLowerCase();
+
+      let matched = null;
+      if (snClean && macMap.has(snClean)) matched = macMap.get(snClean);
+      else if (snClean && tagMap.has(snClean)) matched = tagMap.get(snClean);
+      else if (nameClean && pppoeMap.has(nameClean)) matched = pppoeMap.get(nameClean);
+      else if (nameClean && nameMap.has(nameClean)) matched = nameMap.get(nameClean);
+      else if (snClean.length >= 6) {
+        for (const [mac, c] of macMap.entries()) {
+          if (mac.length >= 8 && (snClean.includes(mac) || mac.includes(snClean))) {
+            matched = c;
+            break;
+          }
+        }
+      }
+
+      if (matched) {
+        onu.customer_id = matched.id;
+        onu.customer_name = matched.name;
+        onu.customer_phone = matched.phone || null;
+      }
+    }
+  } catch (e) {
+    logger.warn(`[OLT] Error enriching ONUs with customer data: ${e.message}`);
+  }
+  return onus;
 }
 
 // ─── ONU ACTIONS ─────────────────────────────────────────────────────────────
@@ -2174,6 +2324,7 @@ async function configureWanViaAcs(sn, data) {
     cmds.push('exit');
     cmds.push('end');
     cmds.push('write');
+    return await telnetLoginAndRun(olt.host, olt.web_user, olt.web_password, cmds, telnetOptsFromOlt(olt));
   } else if (brand === 'huawei') {
      cmds.push('enable');
      cmds.push('config');
@@ -2191,7 +2342,88 @@ async function configureWanViaAcs(sn, data) {
    return await telnetLoginAndRun(olt.host, olt.web_user, olt.web_password, cmds, telnetOptsFromOlt(olt));
  }
  
+ async function getAllOltsStats(full = false) {
+   const olts = getActiveOlts();
+   if (!olts || olts.length === 0) {
+     return {
+       is_all: true,
+       onus_total: 0,
+       onus_online: 0,
+       onus_offline: 0,
+       onus_weak: 0,
+       onus: [],
+       unauth_onus: [],
+       olts_summary: [],
+       error: 'Tidak ada OLT aktif'
+     };
+   }
+
+   const results = await Promise.all(olts.map(o => getOltStats(o.id, full)));
+
+   let onus_total = 0;
+   let onus_online = 0;
+   let onus_offline = 0;
+   let onus_weak = 0;
+   const allOnus = [];
+   const allUnauth = [];
+   const olts_summary = [];
+
+   for (let i = 0; i < results.length; i++) {
+     const s = results[i];
+     const oltInfo = olts[i];
+     if (s) {
+       onus_total += (s.onus_total || 0);
+       onus_online += (s.onus_online || 0);
+       onus_offline += (s.onus_offline || 0);
+       onus_weak += (s.onus_weak || 0);
+
+       olts_summary.push({
+         id: oltInfo.id,
+         name: oltInfo.name,
+         host: oltInfo.host,
+         brand: oltInfo.brand,
+         status: s.status,
+         onus_total: s.onus_total,
+         onus_online: s.onus_online,
+         onus_offline: s.onus_offline,
+         onus_weak: s.onus_weak,
+         temp: s.temp,
+         cpu: s.cpu,
+         ram: s.ram,
+         uptime: s.uptime,
+         error: s.error,
+         activeProfile: s.activeProfile || null,
+         systemOids: s.systemOids || null,
+         snmpConfig: s.snmpConfig || null
+       });
+
+       if (Array.isArray(s.onus)) {
+         s.onus.forEach(onu => {
+           allOnus.push({ ...onu, olt_id: oltInfo.id, olt_name: oltInfo.name });
+         });
+       }
+
+       if (Array.isArray(s.unauth_onus)) {
+         s.unauth_onus.forEach(u => {
+           allUnauth.push({ ...u, olt_id: oltInfo.id, olt_name: oltInfo.name });
+         });
+       }
+     }
+   }
+
+   return {
+     is_all: true,
+     onus_total,
+     onus_online,
+     onus_offline,
+     onus_weak,
+     onus: allOnus,
+     unauth_onus: allUnauth,
+     olts_summary
+   };
+ }
+
  module.exports = {
-  getAllOlts, getActiveOlts, getOltById, createOlt, updateOlt, deleteOlt, getOltStats, rebootOnu, renameOnu, authorizeOnu,
+  getAllOlts, getActiveOlts, getOltById, createOlt, updateOlt, deleteOlt, getOltStats, getAllOltsStats, rebootOnu, renameOnu, authorizeOnu,
   configureOnuWan, configureZteWanViaGoApi, configureWanViaAcs
 };

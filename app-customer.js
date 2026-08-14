@@ -6,7 +6,9 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 const crypto = require('crypto');
 const multer = require('multer');
 const QRCode = require('qrcode');
-const Jimp = require('jimp');
+const _jimpMod = require('jimp');
+const Jimp = _jimpMod.Jimp || _jimpMod;
+const qrisUtil = require('./utils/qrisUtil');
 const { logger } = require('./config/logger');
 const db = require('./config/database');
 const customerSvc = require('./services/customerService');
@@ -44,10 +46,8 @@ const app = express();
 
 const isProduction = process.env.NODE_ENV === 'production';
 const cookieSecure = getSetting('cookie_secure', isProduction);
-const trustProxy = getSetting('trust_proxy', false);
-if (trustProxy) {
-  app.set('trust proxy', 1);
-}
+const trustProxySetting = getSetting('trust_proxy', true);
+app.set('trust proxy', trustProxySetting ? 1 : true);
 
 // Middleware dasar
 app.use(express.json({
@@ -330,6 +330,20 @@ function genRandomCode(len = 6) {
   return out;
 }
 
+function genCustomCode(len, charset) {
+  const n = Math.max(4, Math.min(16, Number(len) || 6));
+  let chars = '0123456789';
+  if (charset === 'letters') chars = 'abcdefghjkmnpqrstuvwxyz';
+  else if (charset === 'mixed') chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let out = '';
+  for (let i = 0; i < n; i++) {
+    out += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  if (charset === 'numbers' && out[0] === '0') out = '1' + out.slice(1);
+  return out;
+}
+
+
 function normalizeQrisPayload(raw) {
   let s = String(raw || '').replace(/[\r\n\t]+/g, '').trim();
   const idx = s.indexOf('000201');
@@ -473,13 +487,28 @@ async function fulfillVoucherOrder(settings, orderId) {
   if (String(ord.status) === 'fulfilled' && ord.voucher_code) return { ok: true, already: true };
   if (String(ord.status) !== 'paid') return { ok: false, reason: 'not_paid' };
 
+  let prefix = '';
+  let codeLength = 6;
+  let charset = 'mixed';
+  try {
+    const pkg = db.prepare('SELECT * FROM voucher_packages WHERE router_id IS ? AND profile_name = ?').get(ord.router_id ?? null, ord.profile_name);
+    if (pkg) {
+      prefix = String(pkg.prefix || '').trim();
+      codeLength = Math.max(4, Math.min(16, Number(pkg.code_length) || 6));
+      charset = String(pkg.charset || 'mixed');
+    }
+  } catch (e) {
+    logger.error('[Fulfillment] Gagal query voucher_packages: ' + e.message);
+  }
+
   let created = null;
   let attempt = 0;
   while (attempt < 10) {
     attempt++;
-    const code = genRandomCode(6);
+    const coreLen = Math.max(4, codeLength - prefix.length);
+    const code = prefix + genCustomCode(coreLen, charset);
     const pass = code;
-    const comment = `vc-online-${orderId}-${code}-${ord.profile_name}`;
+    const comment = `vc-${code}-${ord.profile_name}`;
     const userData = {
       server: 'all',
       name: code,
@@ -516,6 +545,11 @@ async function fulfillVoucherOrder(settings, orderId) {
   await trySendWaToBuyer(settings, ord.buyer_phone, msg, orderId);
   return { ok: true, created };
 }
+
+// Meta WhatsApp Cloud API Public Webhook Endpoints
+const metaWAService = require('./services/metaWhatsappService');
+app.get('/api/meta-webhook', (req, res) => metaWAService.verifyWebhook(req, res));
+app.post('/api/meta-webhook', (req, res) => metaWAService.processWebhookEvent(req, res));
 
 app.post('/api/webhook/v1/payment-notif', multer().any(), async (req, res) => {
   let body = req.body || {};
@@ -662,12 +696,22 @@ app.post('/api/webhook/v1/payment-notif', multer().any(), async (req, res) => {
               try { updateWebhookPaymentNotifMatchInvoice.run(invId, notifId); } catch {}
             }
 
-            if (custId > 0 && String(inv.customer_status || '') === 'suspended') {
-              const cnt = countUnpaidInvoicesForCustomer.get(custId);
-              const unpaid = Number(cnt?.c || 0);
-              if (unpaid === 0) {
-                try { await customerSvc.activateCustomer(custId); } catch (e) {
-                  logger.error(`[WEBHOOK][payment-notif] Activate customer failed: ${e && e.message ? e.message : String(e)}`);
+            if (custId > 0) {
+              const otherUnpaid = db.prepare("SELECT id FROM invoices WHERE customer_id=? AND status='unpaid' AND id!=?").all(custId, invId);
+              if (otherUnpaid && otherUnpaid.length > 0) {
+                const oNote = `AUTO-QRIS: lunas dari pembayaran gabungan QRIS Rp ${amount}`;
+                for (const other of otherUnpaid) {
+                  markInvoicePaidAppendNote.run('QRIS', oNote, oNote, notifId || null, other.id);
+                }
+              }
+
+              if (String(inv.customer_status || '') === 'suspended') {
+                const cnt = countUnpaidInvoicesForCustomer.get(custId);
+                const unpaid = Number(cnt?.c || 0);
+                if (unpaid === 0) {
+                  try { await customerSvc.activateCustomer(custId); } catch (e) {
+                    logger.error(`[WEBHOOK][payment-notif] Activate customer failed: ${e && e.message ? e.message : String(e)}`);
+                  }
                 }
               }
             }
@@ -1089,7 +1133,8 @@ app.get('/uploads/qris/:filename', async (req, res) => {
     const payload = normalizeQrisPayload(String(settings?.qris_static_payload || ''));
     if (payload) {
       const png = await QRCode.toBuffer(payload, { errorCorrectionLevel: 'M', margin: 1, width: 420, type: 'png' });
-      const jpg = await Jimp.read(png).then(img => img.quality(90).background(0xffffffff).getBufferAsync(Jimp.MIME_JPEG));
+      const img = await Jimp.read(png);
+      const jpg = await img.getBuffer('image/jpeg');
       res.set('Content-Type', 'image/jpeg');
       res.set('Cache-Control', 'no-store');
       return res.status(200).send(jpg);
@@ -1224,6 +1269,12 @@ startCronJobs();
 
 // Mulai auto backup
 scheduleAutoBackup();
+
+// Inisialisasi RADIUS Server jika diaktifkan di settings
+const radiusSvc = require('./services/radiusServerService');
+if (getSetting('radius_enabled', '0') === '1') {
+  radiusSvc.start();
+}
 
 // Error handling middleware (harus di akhir setelah semua routes)
 app.use(notFoundHandler);

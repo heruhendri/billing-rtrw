@@ -3,6 +3,7 @@ const router = express.Router();
 const customerDevice = require('../services/customerDeviceService');
 const { getSettingsWithCache, getNowLocal, getCurrentTimeInfo, getNowLocalISO, formatDateLocal } = require('../config/settingsManager');
 const billingSvc = require('../services/billingService');
+const pdfSvc = require('../services/pdfInvoiceService');
 const paymentSvc = require('../services/paymentService');
 const customerSvc = require('../services/customerService');
 const mikrotikService = require('../services/mikrotikService');
@@ -16,8 +17,17 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const QRCode = require('qrcode');
-const Jimp = require('jimp');
+const _jimpMod = require('jimp');
+const Jimp = _jimpMod.Jimp || _jimpMod;
+const qrisUtil = require('../utils/qrisUtil');
 const { BinaryBitmap, HybridBinarizer, RGBLuminanceSource, MultiFormatReader, BarcodeFormat, DecodeHintType } = require('@zxing/library');
+let loginRateLimiter = (req, res, next) => next();
+try {
+  const rlMod = require('../middleware/rateLimiter');
+  if (rlMod && typeof rlMod.loginRateLimiter === 'function') {
+    loginRateLimiter = rlMod.loginRateLimiter;
+  }
+} catch (e) {}
 
 // Configure multer for customer photo uploads
 const storage = multer.diskStorage({
@@ -450,17 +460,7 @@ async function tryDecodeQrisPayloadFromUploadedQr(settings) {
   }
   try {
     const buf = await fs.promises.readFile(filePath);
-    const img = await Jimp.read(buf);
-    const rgba = new Uint8ClampedArray(img.bitmap.data.buffer, img.bitmap.data.byteOffset, img.bitmap.data.byteLength);
-    const source = new RGBLuminanceSource(rgba, img.bitmap.width, img.bitmap.height);
-    const bitmap = new BinaryBitmap(new HybridBinarizer(source));
-    const reader = new MultiFormatReader();
-    const hints = new Map();
-    hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.QR_CODE]);
-    reader.setHints(hints);
-    const decoded = reader.decode(bitmap);
-    const text = typeof decoded?.getText === 'function' ? decoded.getText() : String(decoded?.text || '');
-    const payload = normalizeQrisPayloadRaw(text);
+    const payload = await qrisUtil.decodeQrisPayloadFromBuffer(buf);
     if (!payload) return '';
     qrisDecodedCache = { file: safeName, mtimeMs: st.mtimeMs, payload };
     return payload;
@@ -537,9 +537,7 @@ router.get('/qris/static.jpg', async (req, res) => {
     if (!payload) payload = await tryDecodeQrisPayloadFromUploadedQr(settings);
     if (payload) {
       try {
-        const dynamic = convertStaticQrisToDynamic(payload, amount);
-        const png = await QRCode.toBuffer(dynamic, { errorCorrectionLevel: 'M', margin: 1, width: 420, type: 'png' });
-        const jpg = await Jimp.read(png).then(img => img.quality(90).background(0xffffffff).getBufferAsync(Jimp.MIME_JPEG));
+        const jpg = await qrisUtil.buildDynamicQrisJpgBuffer(payload, amount);
         res.set('Content-Type', 'image/jpeg');
         res.set('Cache-Control', 'no-store');
         return res.status(200).send(jpg);
@@ -576,12 +574,22 @@ function ensureInvoiceQrisUnique(inv, force = false) {
   if (!Number.isFinite(invId) || invId <= 0) throw new Error('Invoice ID tidak valid');
   if (String(inv?.status) !== 'unpaid') throw new Error('Hanya tagihan BELUM BAYAR yang bisa dibuat kode QRIS.');
 
-  const baseAmount = Number(inv?.amount || 0);
+  const custId = Number(inv?.customer_id || 0);
+  let baseAmount = Number(inv?.amount || 0);
+
+  if (custId > 0) {
+    const unpaidInvoices = db.prepare("SELECT amount FROM invoices WHERE customer_id=? AND status='unpaid'").all(custId);
+    if (unpaidInvoices && unpaidInvoices.length > 0) {
+      const sumAll = unpaidInvoices.reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
+      if (sumAll > 0) baseAmount = sumAll;
+    }
+  }
+
   if (!Number.isFinite(baseAmount) || baseAmount <= 0) throw new Error('Nominal tagihan tidak valid');
 
   const currentAmount = Number(inv?.qris_amount_unique || 0) || 0;
   const currentCode = Number(inv?.qris_unique_code || 0) || 0;
-  if (!force && currentAmount > 0 && currentCode > 0) {
+  if (!force && currentAmount > 0 && currentCode > 0 && (currentAmount - currentCode === baseAmount)) {
     return { uniqueCode: currentCode, amountUnique: currentAmount };
   }
 
@@ -594,18 +602,31 @@ function ensureInvoiceQrisUnique(inv, force = false) {
   let chosenCode = 0;
   let chosenAmount = 0;
 
-  for (let i = 0; i < 50; i++) {
-    const code = 1 + Math.floor(Math.random() * 999);
-    const amount = baseAmount + code;
-    if (isQrisAmountAvailable(amount, { excludeInvoiceId: invId })) {
-      chosenCode = code;
-      chosenAmount = amount;
-      break;
+  // 1. Prioritaskan ID Pelanggan sebagai kode unik utama (selalu di bawah 500)
+  if (custId > 0) {
+    const prefCode = (custId % 499 === 0) ? 499 : (custId % 499);
+    const prefAmount = baseAmount + prefCode;
+    if (isQrisAmountAvailable(prefAmount, { excludeInvoiceId: invId })) {
+      chosenCode = prefCode;
+      chosenAmount = prefAmount;
     }
   }
 
+  // 2. Jika kode ID Pelanggan sudah terpakai, cari kode terendah yang tersedia (1 s/d 499)
   if (!chosenAmount) {
-    for (let code = 1; code <= 999; code++) {
+    for (let code = 1; code <= 499; code++) {
+      const amount = baseAmount + code;
+      if (isQrisAmountAvailable(amount, { excludeInvoiceId: invId })) {
+        chosenCode = code;
+        chosenAmount = amount;
+        break;
+      }
+    }
+  }
+
+  // 3. Fallback keamanan jika slot 1-499 penuh (500 s/d 999)
+  if (!chosenAmount) {
+    for (let code = 500; code <= 999; code++) {
       const amount = baseAmount + code;
       if (isQrisAmountAvailable(amount, { excludeInvoiceId: invId })) {
         chosenCode = code;
@@ -644,8 +665,8 @@ function ensureVoucherOrderQrisUnique(order, force = false) {
   let chosenCode = 0;
   let chosenAmount = 0;
 
-  for (let i = 0; i < 50; i++) {
-    const code = 1 + Math.floor(Math.random() * 999);
+  // Search sequentially from 1 to 499 (always under 500)
+  for (let code = 1; code <= 499; code++) {
     const amount = baseAmount + code;
     if (isQrisAmountAvailable(amount, { excludeVoucherOrderId: orderId })) {
       chosenCode = code;
@@ -654,8 +675,9 @@ function ensureVoucherOrderQrisUnique(order, force = false) {
     }
   }
 
+  // Safety fallback if 1-499 full
   if (!chosenAmount) {
-    for (let code = 1; code <= 999; code++) {
+    for (let code = 500; code <= 999; code++) {
       const amount = baseAmount + code;
       if (isQrisAmountAvailable(amount, { excludeVoucherOrderId: orderId })) {
         chosenCode = code;
@@ -1637,7 +1659,7 @@ router.post('/register', async (req, res) => {
   }
 });
 
-router.post('/login', async (req, res) => {
+router.post('/login', loginRateLimiter, async (req, res) => {
   const { phone } = req.body;
   const settings = getSettingsWithCache();
   const startTime = Date.now();
@@ -1663,21 +1685,27 @@ router.post('/login', async (req, res) => {
       customer.phone
     ].filter(Boolean);
 
-    // Cari secara paralel dengan allSettled untuk tidak blocking jika ada error
-    const results = await Promise.allSettled(searchTokens.map(async (token) => {
-      let d = await customerDevice.findDeviceByPppoe(token); // Prioritas PPPoE
-      if (!d) d = await customerDevice.findDeviceByTag(token);
-      if (!d) {
-        const variants = await customerDevice.findDeviceWithTagVariants(token);
-        if (variants) d = variants.device;
-      }
-      return d;
-    }));
+    // Cari secara paralel dengan timeout 2.0s agar tidak menggantung jika GenieACS offline/lambat
+    const acsSearchPromise = (async () => {
+      const results = await Promise.allSettled(searchTokens.map(async (token) => {
+        let d = await customerDevice.findDeviceByPppoe(token); // Prioritas PPPoE
+        if (!d) d = await customerDevice.findDeviceByTag(token);
+        if (!d) {
+          const variants = await customerDevice.findDeviceWithTagVariants(token);
+          if (variants) d = variants.device;
+        }
+        return d;
+      }));
+      return results.find(r => r.status === 'fulfilled' && r.value !== null)?.value || null;
+    })();
 
-    device = results.find(r => r.status === 'fulfilled' && r.value !== null)?.value;
+    device = await Promise.race([
+      acsSearchPromise,
+      new Promise(resolve => setTimeout(() => resolve(null), 2000))
+    ]);
+
     if (device) {
       logger.info('[Login] Perangkat terdeteksi di GenieACS (matched).');
-      // Extract PPPoE username from device if not in customer data
       if (!pppoeUsername && device.pppoeUsername) {
         pppoeUsername = device.pppoeUsername;
         logger.info(`[Login] PPPoE username dari device: ${pppoeUsername}`);
@@ -1687,14 +1715,20 @@ router.post('/login', async (req, res) => {
 
   // 2. Tahap 2: Fallback (Jika DB tidak ketemu atau perangkat belum link)
   if (!device) {
-    const directResult = await customerDevice.findDeviceWithTagVariants(phone);
-    if (directResult) {
-      device = directResult.device;
-      if (device.pppoeUsername) {
-        pppoeUsername = device.pppoeUsername;
+    try {
+      const directPromise = customerDevice.findDeviceWithTagVariants(phone);
+      const directResult = await Promise.race([
+        directPromise,
+        new Promise(resolve => setTimeout(() => resolve(null), 1500))
+      ]);
+      if (directResult && directResult.device) {
+        device = directResult.device;
+        if (device.pppoeUsername) {
+          pppoeUsername = device.pppoeUsername;
+        }
+        logger.info('[Login] Perangkat ditemukan secara langsung di GenieACS (fallback).');
       }
-      logger.info('[Login] Perangkat ditemukan secara langsung di GenieACS (fallback).');
-    }
+    } catch (e) {}
   }
 
   // 3. Tahap 3: Verifikasi Akhir
@@ -1773,7 +1807,7 @@ router.get('/login-otp', (req, res) => {
   res.render('login_otp', { error: null, settings, phone: req.session.pending_login.phone });
 });
 
-router.post('/login-otp', (req, res) => {
+router.post('/login-otp', loginRateLimiter, (req, res) => {
   const { otp } = req.body;
   const settings = getSettingsWithCache();
   const pending = req.session.pending_login;
@@ -1843,7 +1877,14 @@ router.get('/dashboard', async (req, res) => {
 
   let deviceData = null;
   for (const token of uniqueCandidates) {
-    deviceData = await getCustomerDeviceData(token);
+    try {
+      deviceData = await Promise.race([
+        getCustomerDeviceData(token),
+        new Promise(resolve => setTimeout(() => resolve(null), 2500))
+      ]);
+    } catch (e) {
+      deviceData = null;
+    }
     if (deviceData) break;
   }
   
@@ -2360,6 +2401,97 @@ router.post('/logout', (req, res) => {
   });
 });
 
+router.get('/invoice/:id/pdf', async (req, res) => {
+  try {
+    const inv = billingSvc.getInvoiceById(req.params.id);
+    if (!inv) return res.status(404).send('Invoice tidak ditemukan');
+
+    const sessionCustId = req.session && req.session.customer ? Number(req.session.customer.id) : 0;
+    if (sessionCustId > 0 && Number(inv.customer_id) !== sessionCustId) {
+      return res.status(403).send('Akses ditolak');
+    }
+
+    const customer = customerSvc.getCustomerById(inv.customer_id);
+    if (!customer) return res.status(404).send('Data pelanggan tidak ditemukan');
+
+    const settings = getSettingsWithCache();
+    const pdfBuffer = await pdfSvc.generateInvoicePdfBuffer(inv, customer, settings);
+
+    const safeName = (customer.name || 'Pelanggan').replace(/[^a-zA-Z0-9]/g, '_');
+    const filename = `Invoice_INV-${String(inv.id).padStart(4, '0')}_${safeName}.pdf`;
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `inline; filename="${filename}"`,
+      'Content-Length': pdfBuffer.length
+    });
+    return res.send(pdfBuffer);
+  } catch (err) {
+    logger.error(`[Customer PDF Download] Error: ${err.message}`);
+    return res.status(500).send('Gagal generate PDF invoice: ' + err.message);
+  }
+});
+
+router.get('/invoice/:id/print', async (req, res) => {
+  try {
+    const inv = billingSvc.getInvoiceById(req.params.id);
+    if (!inv) return res.status(404).send('Invoice tidak ditemukan');
+
+    const sessionCustId = req.session && req.session.customer ? Number(req.session.customer.id) : 0;
+    if (sessionCustId > 0 && Number(inv.customer_id) !== sessionCustId) {
+      return res.status(403).send('Akses ditolak');
+    }
+
+    const customer = customerSvc.getCustomerById(inv.customer_id);
+    if (!customer) return res.status(404).send('Data pelanggan tidak ditemukan');
+
+    const settings = getSettingsWithCache();
+    return res.render('admin/print_invoice', {
+      invoice: inv,
+      customer,
+      company: settings.company_header || 'ALIJAYA DIGITAL NETWORK',
+      settings,
+      lang: 'id',
+      t: (key, def) => def || key,
+      getCurrentTimeInfo,
+      formatDateLocal,
+      getNowLocal
+    });
+  } catch (err) {
+    logger.error(`[Customer Print Invoice] Error: ${err.message}`);
+    return res.status(500).send('Gagal memuat invoice: ' + err.message);
+  }
+});
+
+router.get('/invoice/:id/print-thermal', async (req, res) => {
+  try {
+    const inv = billingSvc.getInvoiceById(req.params.id);
+    if (!inv) return res.status(404).send('Invoice tidak ditemukan');
+
+    const sessionCustId = req.session && req.session.customer ? Number(req.session.customer.id) : 0;
+    if (sessionCustId > 0 && Number(inv.customer_id) !== sessionCustId) {
+      return res.status(403).send('Akses ditolak');
+    }
+
+    const customer = customerSvc.getCustomerById(inv.customer_id);
+    if (!customer) return res.status(404).send('Data pelanggan tidak ditemukan');
+
+    const settings = getSettingsWithCache();
+    return res.render('collector/print_thermal', {
+      invoice: inv,
+      customer,
+      company: settings.company_header || 'ALIJAYA DIGITAL NETWORK',
+      settings,
+      collectorName: 'Portal Pelanggan',
+      formatDateLocal,
+      formatTimeLocal,
+      getNowLocal
+    });
+  } catch (err) {
+    logger.error(`[Customer Print Thermal Error]: ${err.message}`);
+    return res.status(500).send('Gagal memuat struk thermal: ' + err.message);
+  }
+});
+
 router.post('/public/payment/create/:invoiceId', async (req, res) => {
   const settings = getSettingsWithCache();
   const secret = settings.session_secret || 'rahasia-portal-pelanggan-default-ganti-ini';
@@ -2534,9 +2666,13 @@ router.post('/tickets/create', uploadCustomer.array('photos', 5), async (req, re
   const loginId = req.session && req.session.phone;
   if (!loginId) return res.redirect('/customer/login');
   
-  const { subject, message, customerId } = req.body;
+  const profile = findCustomerProfileByLoginId(loginId) ||
+    (req.session.pppoe_username ? findCustomerProfileByLoginId(req.session.pppoe_username) : null);
+
+  const customerId = req.body.customerId || (profile ? profile.id : null);
+  const { subject, message } = req.body;
   if (!subject || !message || !customerId) {
-    req.session._msg = { type: 'danger', text: 'Semua field harus diisi.' };
+    req.session._msg = { type: 'danger', text: 'Semua field wajib diisi.' };
     return res.redirect('/customer/dashboard');
   }
 
@@ -3728,6 +3864,51 @@ router.post('/agent-topup/create', express.urlencoded({ extended: true }), async
     logger.error('[AgentTopup] Error: ' + e.message);
     req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
     return res.redirect('/agent');
+  }
+});
+
+// ─── RECONNECT / REFRESH INTERNET INSTAN ───────────────────────────────────
+router.post('/customer/reconnect', async (req, res) => {
+  try {
+    const sessionPhone = req.session.phone;
+    if (!sessionPhone) {
+      if (req.xhr || req.headers.accept?.includes('json')) {
+        return res.status(401).json({ success: false, message: 'Silakan login terlebih dahulu' });
+      }
+      return res.redirect('/customer/login');
+    }
+
+    const customer = customerSvc.findCustomerByAny(sessionPhone);
+    if (!customer) throw new Error('Data pelanggan tidak ditemukan');
+
+    const username = customer.pppoe_username || customer.hotspot_username || customer.name;
+    const radiusSvc = require('../services/radiusServerService');
+    const mikrotikSvc = require('../services/mikrotikService');
+
+    let reconnected = false;
+    if (username) {
+      await radiusSvc.disconnectSession(username);
+      await mikrotikSvc.kickPppoeUser(username, customer.router_id);
+      await mikrotikSvc.kickHotspotUser(username, customer.router_id);
+      reconnected = true;
+    }
+
+    if (req.xhr || req.headers.accept?.includes('json')) {
+      return res.json({
+        success: true,
+        message: 'Koneksi internet Anda berhasil direfresh! Silakan tunggu 2-3 detik agar IP & kecepatan kembali normal.'
+      });
+    }
+
+    req.session._msg = { type: 'success', text: 'Koneksi internet Anda berhasil direfresh! Silakan tunggu 2-3 detik agar IP & kecepatan kembali normal.' };
+    return res.redirect('/customer/dashboard');
+  } catch (e) {
+    logger.error('[Customer Reconnect] Error: ' + e.message);
+    if (req.xhr || req.headers.accept?.includes('json')) {
+      return res.status(500).json({ success: false, message: 'Gagal refresh koneksi: ' + e.message });
+    }
+    req.session._msg = { type: 'error', text: 'Gagal refresh koneksi: ' + e.message };
+    return res.redirect('/customer/dashboard');
   }
 });
 

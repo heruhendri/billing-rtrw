@@ -56,7 +56,7 @@
       <div class="realtime-bar"><span class="live-dot"></span> <%= t('admin.dashboard.live_update', 'Live Update') %></div>
       <span class="adm-badge">
         <i class="bi bi-person-fill"></i> 
-        <%= (typeof session !== 'undefined' && session.isCashier) ? t('admin.role.cashier', 'Kasir') : t('admin.role.admin', 'Admin') %>
+        <%= (typeof session !== 'undefined' && session && session.isCashier) ? t('admin.role.cashier', 'Kasir') : t('admin.role.admin', 'Admin') %>
       </span>
       <a href="/admin/logout" class="btn btn-g btn-sm"><i class="bi bi-box-arrow-left"></i> <%= t('common.logout', 'Logout') %></a>
     </div>
@@ -580,6 +580,38 @@ async function loadDevices() {
     const data = await res.json();
     if (data && data.error) throw new Error(data.error);
     devicesData = data.devices || [];
+
+    if (!search && status === 'all') {
+      const tot = data.total || devicesData.length;
+      let on = 0, off = 0;
+      devicesData.forEach(d => {
+        if (d.status === 'online') on++;
+        else off++;
+      });
+      const totalEl = document.getElementById('stat-total');
+      const onlineEl = document.getElementById('stat-online');
+      const offlineEl = document.getElementById('stat-offline');
+      if (totalEl) totalEl.textContent = tot;
+      if (onlineEl) onlineEl.textContent = on;
+      if (offlineEl) offlineEl.textContent = off;
+
+      const mTot = document.getElementById('m-total');
+      const mOn = document.getElementById('m-online');
+      const mOff = document.getElementById('m-offline');
+      const mPct = document.getElementById('m-pct');
+      if (mTot) mTot.textContent = tot;
+      if (mOn) mOn.textContent = on;
+      if (mOff) mOff.textContent = off;
+      if (mPct) mPct.textContent = (tot > 0 ? Math.round(on / tot * 100) : 0) + '%';
+
+      const legOn = document.getElementById('leg-online');
+      const legOff = document.getElementById('leg-offline');
+      const donutPct = document.getElementById('donut-pct');
+      if (legOn) legOn.textContent = on;
+      if (legOff) legOff.textContent = off;
+      if (donutPct) donutPct.textContent = (tot > 0 ? Math.round(on / tot * 100) : 0) + '%';
+      updateDonut(on, off);
+    }
 
     document.getElementById('device-count').textContent = devicesData.length + I18N.devicesSuffix;
 

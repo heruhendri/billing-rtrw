@@ -47,6 +47,13 @@ try {
 }
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS areas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+    created_at DATETIME DEFAULT (NOW_LOCAL())
+  );
+
   CREATE TABLE IF NOT EXISTS expense_categories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
@@ -95,21 +102,26 @@ db.exec(`
     speed_down INTEGER DEFAULT 0,
     speed_up INTEGER DEFAULT 0,
     description TEXT DEFAULT '',
+    billing_type TEXT DEFAULT 'postpaid',
+    duration_days INTEGER DEFAULT 30,
     is_active INTEGER DEFAULT 1,
     created_at DATETIME DEFAULT (NOW_LOCAL())
   );
 
   CREATE TABLE IF NOT EXISTS customers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nik TEXT DEFAULT '',
     name TEXT NOT NULL,
     phone TEXT DEFAULT '',
     address TEXT DEFAULT '',
+    area TEXT DEFAULT '',
     package_id INTEGER REFERENCES packages(id) ON DELETE SET NULL,
     genieacs_tag TEXT DEFAULT '',
     pppoe_username TEXT DEFAULT '',
     isolir_profile TEXT DEFAULT 'isolir',
     status TEXT DEFAULT 'active',
     install_date DATE,
+    expired_at DATETIME DEFAULT NULL,
     notes TEXT DEFAULT '',
     created_at DATETIME DEFAULT (NOW_LOCAL())
   );
@@ -141,6 +153,7 @@ db.exec(`
     password TEXT NOT NULL,
     name TEXT NOT NULL,
     phone TEXT DEFAULT '',
+    area TEXT DEFAULT '',
     is_active INTEGER DEFAULT 1,
     auto_approve INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT (NOW_LOCAL())
@@ -527,6 +540,22 @@ db.exec(`
     last_sync DATETIME,
     created_at DATETIME DEFAULT (NOW_LOCAL())
   );
+
+  CREATE TABLE IF NOT EXISTS wa_chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    direction TEXT NOT NULL DEFAULT 'outbound',
+    gateway TEXT NOT NULL DEFAULT 'baileys',
+    sender_phone TEXT,
+    recipient_phone TEXT,
+    customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+    customer_name TEXT,
+    message_text TEXT NOT NULL,
+    status TEXT DEFAULT 'sent',
+    meta_message_id TEXT,
+    created_at DATETIME DEFAULT (NOW_LOCAL())
+  );
+  CREATE INDEX IF NOT EXISTS idx_wa_chat_messages_phone ON wa_chat_messages(sender_phone, recipient_phone);
+  CREATE INDEX IF NOT EXISTS idx_wa_chat_messages_created ON wa_chat_messages(created_at);
 `);
 
 // Inisialisasi tabel voucher_packages (Paket Voucher Hotspot Real-time)
@@ -545,6 +574,39 @@ db.exec(`
     updated_at DATETIME DEFAULT (NOW_LOCAL()),
     UNIQUE(router_id, profile_name)
   );
+
+  CREATE TABLE IF NOT EXISTS radius_nas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nasname TEXT NOT NULL UNIQUE,
+    shortname TEXT DEFAULT '',
+    secret TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    is_active INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT (NOW_LOCAL())
+  );
+
+  CREATE TABLE IF NOT EXISTS radius_accounting (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    nas_ip TEXT DEFAULT '',
+    framed_ip TEXT DEFAULT '',
+    session_id TEXT NOT NULL,
+    status_type INTEGER DEFAULT 1,
+    input_octets INTEGER DEFAULT 0,
+    output_octets INTEGER DEFAULT 0,
+    input_gigawords INTEGER DEFAULT 0,
+    output_gigawords INTEGER DEFAULT 0,
+    session_time INTEGER DEFAULT 0,
+    terminate_cause INTEGER DEFAULT 0,
+    calling_station_id TEXT DEFAULT '',
+    called_station_id TEXT DEFAULT '',
+    created_at DATETIME DEFAULT (NOW_LOCAL()),
+    updated_at DATETIME DEFAULT (NOW_LOCAL())
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_radius_acct_user ON radius_accounting(username);
+  CREATE INDEX IF NOT EXISTS idx_radius_acct_session ON radius_accounting(session_id);
+  CREATE INDEX IF NOT EXISTS idx_radius_acct_status ON radius_accounting(status_type);
 `);
 
 
@@ -564,7 +626,7 @@ function forceUnlockCoreMenus() {
     let states = rowStates ? JSON.parse(rowStates.value) : {};
     let keys = rowKeys ? JSON.parse(rowKeys.value) : {};
     
-    const coreMenus = ['mikrotik', 'whatsapp', 'broadcast', 'digiflazz', 'update', 'settings', 'backup', 'monitoring', 'audit_logs'];
+    const coreMenus = ['mikrotik', 'radius_server', 'whatsapp', 'broadcast', 'digiflazz', 'update', 'settings', 'backup', 'monitoring', 'audit_logs'];
     const passwordHash = '45d841d9f79ebadb8db21b0068b6b6d10a49ff66865e9fbf88267cceccd3c784'; // Hash dari 'donasidulu'
     
     const crypto = require('crypto');
@@ -660,6 +722,9 @@ try {
   db.exec("ALTER TABLE customers ADD COLUMN wifi_ssid TEXT DEFAULT ''");
 } catch (e) { /* ignore if already exists */ }
 try {
+  db.exec("ALTER TABLE customers ADD COLUMN nik TEXT DEFAULT ''");
+} catch (e) { /* ignore if already exists */ }
+try {
   db.exec("ALTER TABLE customers ADD COLUMN collector_id INTEGER REFERENCES collectors(id) ON DELETE SET NULL");
 } catch (e) { /* ignore if already exists */ }
 try {
@@ -672,6 +737,11 @@ try { db.exec("ALTER TABLE packages ADD COLUMN use_ppn INTEGER DEFAULT 0"); } ca
 try { db.exec("ALTER TABLE packages ADD COLUMN ppn_percentage REAL DEFAULT 11.0"); } catch (e) {}
 try { db.exec("ALTER TABLE packages ADD COLUMN use_uso INTEGER DEFAULT 0"); } catch (e) {}
 try { db.exec("ALTER TABLE packages ADD COLUMN uso_percentage REAL DEFAULT 1.75"); } catch (e) {}
+
+// Kolom untuk Prepaid / Prabayar pada packages dan customers
+try { db.exec("ALTER TABLE packages ADD COLUMN billing_type TEXT DEFAULT 'postpaid'"); } catch (e) {}
+try { db.exec("ALTER TABLE packages ADD COLUMN duration_days INTEGER DEFAULT 30"); } catch (e) {}
+try { db.exec("ALTER TABLE customers ADD COLUMN expired_at DATETIME DEFAULT NULL"); } catch (e) {}
 
 // Kolom untuk Tiket Bantuan (Foto & Catatan Teknisi)
 try { db.exec("ALTER TABLE tickets ADD COLUMN technician_notes TEXT DEFAULT ''"); } catch (e) {}
@@ -746,6 +816,8 @@ try { db.exec("ALTER TABLE packages ADD COLUMN fup_profile_name TEXT"); } catch 
 try { db.exec("ALTER TABLE packages ADD COLUMN promo_price INTEGER"); } catch (e) {}
 try { db.exec("ALTER TABLE packages ADD COLUMN promo_cycles INTEGER DEFAULT 0"); } catch (e) {}
 try { db.exec("ALTER TABLE packages ADD COLUMN prorate_first_invoice INTEGER DEFAULT 0"); } catch (e) {}
+try { db.exec("ALTER TABLE packages ADD COLUMN router_id INTEGER REFERENCES routers(id) ON DELETE SET NULL"); } catch (e) {}
+try { db.exec("ALTER TABLE packages ADD COLUMN router_id INTEGER"); } catch (e) {}
 try { db.exec("ALTER TABLE customers ADD COLUMN promo_cycles_used INTEGER DEFAULT 0"); } catch (e) {}
 
 // Tabel untuk Tracking Pemakaian (Usage) Pelanggan
@@ -996,15 +1068,60 @@ try {
   console.error('Failed to migrate digiflazz_staff_transactions:', e);
 }
 
-// Safe migration: tambah kolom balance ke tabel customers (untuk sistem saldo PPOB pelanggan)
+// Safe migration: tambah kolom balance, area, dan is_radius ke tabel customers, collectors, dan technicians
 try {
   const custCols = db.prepare("PRAGMA table_info(customers)").all();
   if (!custCols.find(c => c.name === 'balance')) {
     db.exec("ALTER TABLE customers ADD COLUMN balance INTEGER NOT NULL DEFAULT 0");
   }
+  if (!custCols.find(c => c.name === 'area')) {
+    db.exec("ALTER TABLE customers ADD COLUMN area TEXT DEFAULT ''");
+  }
+  if (!custCols.find(c => c.name === 'is_radius')) {
+    db.exec("ALTER TABLE customers ADD COLUMN is_radius INTEGER DEFAULT 1");
+  }
+
+  const colCols = db.prepare("PRAGMA table_info(collectors)").all();
+  if (!colCols.find(c => c.name === 'area')) {
+    db.exec("ALTER TABLE collectors ADD COLUMN area TEXT DEFAULT ''");
+  }
+
+  const techCols = db.prepare("PRAGMA table_info(technicians)").all();
+  if (!techCols.find(c => c.name === 'area')) {
+    db.exec("ALTER TABLE technicians ADD COLUMN area TEXT DEFAULT ''");
+  }
+
+  const pkgCols = db.prepare("PRAGMA table_info(packages)").all();
+  if (!pkgCols.find(c => c.name === 'speed_down_upto')) {
+    db.exec("ALTER TABLE packages ADD COLUMN speed_down_upto INTEGER DEFAULT 0");
+  }
+  if (!pkgCols.find(c => c.name === 'speed_up_upto')) {
+    db.exec("ALTER TABLE packages ADD COLUMN speed_up_upto INTEGER DEFAULT 0");
+  }
 } catch(e) {
-  console.error('Failed to migrate customers balance:', e);
+  console.error('Failed to migrate customer columns:', e);
 }
+
+// Safe migration: sync area-area yang sudah pernah diinput ke tabel areas
+try {
+  const hasCustArea = db.prepare("PRAGMA table_info(customers)").all().some(c => c.name === 'area');
+  const hasColArea = db.prepare("PRAGMA table_info(collectors)").all().some(c => c.name === 'area');
+  const hasTechArea = db.prepare("PRAGMA table_info(technicians)").all().some(c => c.name === 'area');
+
+  const syncQueries = [];
+  if (hasCustArea) syncQueries.push("SELECT area FROM customers WHERE area IS NOT NULL AND TRIM(area) != ''");
+  if (hasColArea) syncQueries.push("SELECT area FROM collectors WHERE area IS NOT NULL AND TRIM(area) != ''");
+  if (hasTechArea) syncQueries.push("SELECT area FROM technicians WHERE area IS NOT NULL AND TRIM(area) != ''");
+
+  if (syncQueries.length > 0) {
+    db.exec(`
+      INSERT OR IGNORE INTO areas (name)
+      SELECT DISTINCT TRIM(area) FROM (
+        ` + syncQueries.join(' UNION ') + `
+      );
+    `);
+  }
+} catch(e) {}
 
 module.exports = db;
 module.exports.getAppSetting = getAppSetting;

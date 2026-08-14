@@ -106,12 +106,20 @@ router.use((req, res, next) => {
   next();
 });
 
+let loginRateLimiter = (req, res, next) => next();
+try {
+  const rlMod = require('../middleware/rateLimiter');
+  if (rlMod && typeof rlMod.loginRateLimiter === 'function') {
+    loginRateLimiter = rlMod.loginRateLimiter;
+  }
+} catch (e) {}
+
 router.get('/login', (req, res) => {
   if (req.session && req.session.isAgent) return res.redirect('/agent');
   res.render('agent/login', { title: 'Login Agent', company: company(), error: null });
 });
 
-router.post('/login', express.urlencoded({ extended: true }), (req, res) => {
+router.post('/login', loginRateLimiter, express.urlencoded({ extended: true }), (req, res) => {
   const username = String(req.body.username || '').trim();
   const password = String(req.body.password || '');
   const agent = agentSvc.authenticate(username, password);

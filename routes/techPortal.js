@@ -3,7 +3,7 @@ const router = express.Router();
 const techSvc = require('../services/techService');
 const customerSvc = require('../services/customerService');
 const odpSvc = require('../services/odpService');
-const { getSetting, getNowLocal, getCurrentDateInTimezone, getNowLocalISO, formatDateLocal, getSettings } = require('../config/settingsManager');
+const { getSetting, getNowLocal, getCurrentDateInTimezone, getNowLocalISO, formatDateLocal, getSettings, formatTimeLocal, parseDateInTimezone } = require('../config/settingsManager');
 const mikrotikService = require('../services/mikrotikService');
 const db = require('../config/database');
 const oltSvc = require('../services/oltService');
@@ -120,9 +120,19 @@ router.use((req, res, next) => {
   res.locals.session = req.session;
   res.locals.settings = getSettings();
   res.locals.formatDateLocal = formatDateLocal;
+  res.locals.formatTimeLocal = formatTimeLocal;
+  res.locals.parseDateInTimezone = parseDateInTimezone;
   res.locals.getNowLocal = getNowLocal;
   next();
 });
+
+let loginRateLimiter = (req, res, next) => next();
+try {
+  const rlMod = require('../middleware/rateLimiter');
+  if (rlMod && typeof rlMod.loginRateLimiter === 'function') {
+    loginRateLimiter = rlMod.loginRateLimiter;
+  }
+} catch (e) {}
 
 // --- AUTH ---
 router.get('/login', (req, res) => {
@@ -130,7 +140,7 @@ router.get('/login', (req, res) => {
   res.render('tech/login', { title: 'Teknisi Login', company: company(), error: null });
 });
 
-router.post('/login', express.urlencoded({ extended: true }), (req, res) => {
+router.post('/login', loginRateLimiter, express.urlencoded({ extended: true }), (req, res) => {
   const { username, password } = req.body;
   const tech = techSvc.authenticate(username, password);
   if (tech) {

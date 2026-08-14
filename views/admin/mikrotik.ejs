@@ -24,12 +24,12 @@
   <div class="topbar">
     <div class="tb-title"><button class="hb-menu" onclick="toggleSidebar()"><i class="bi bi-list"></i></button><i class="bi bi-router"></i> <%= t('admin.nav.mikrotik_monitoring', 'Monitoring MikroTik') %></div>
     <div class="tb-right" style="display:flex;align-items:center;gap:15px">
-      <div class="router-selector" style="display:flex;align-items:center;gap:8px;background:rgba(255,255,255,0.1);padding:4px 12px;border-radius:20px">
-        <i class="bi bi-hdd-network small"></i>
-        <select id="global-router-id" class="fs" style="background:transparent;border:none;color:white;padding:0;font-size:13px;width:auto;cursor:pointer" onchange="changeRouter()">
-          <option value="" style="color:black"><%= t('admin.mikrotik.default_router', '-- Default Router --') %></option>
+      <div class="router-selector" style="display:flex;align-items:center;gap:8px;padding:4px 10px;border-radius:10px;">
+        <i class="bi bi-hdd-network small" style="color:#60a5fa;"></i>
+        <select id="global-router-id" class="fs" style="padding:4px 8px;font-size:13px;border-radius:6px;cursor:pointer;" onchange="changeRouter()">
+          <option value="" <%= (!selectedRouterId) ? 'selected' : '' %>><%= t('admin.mikrotik.default_router', '-- Default / Semua Router --') %></option>
           <% routers.forEach(r => { %>
-            <option value="<%= r.id %>" style="color:black"><%= r.name %></option>
+            <option value="<%= r.id %>" <%= (String(selectedRouterId || activeRouterId || '') === String(r.id)) ? 'selected' : '' %>><%= r.name %></option>
           <% }) %>
         </select>
       </div>
@@ -38,7 +38,7 @@
         <span id="refresh-status">Auto</span>
       </button>
       <a href="#" onclick="downloadBackup(event)" class="btn btn-p btn-sm"><i class="bi bi-download"></i> <%= t('admin.mikrotik.backup_rsc', 'Backup RSC') %></a>
-      <span class="adm-badge"><i class="bi bi-person-fill"></i> <%= (typeof session !== 'undefined' && session.isCashier) ? t('admin.role.cashier', 'Kasir') : t('admin.role.admin', 'Admin') %></span>
+      <span class="adm-badge"><i class="bi bi-person-fill"></i> <%= (typeof session !== 'undefined' && session && session.isCashier) ? t('admin.role.cashier', 'Kasir') : t('admin.role.admin', 'Admin') %></span>
       <a href="/admin/logout" class="btn btn-g btn-sm"><i class="bi bi-box-arrow-left"></i></a>
     </div>
   </div>
@@ -762,13 +762,8 @@
   }
 
   function changeRouter() {
-    const active = document.querySelector('.tab.active');
-    const tabText = String(active?.textContent || '').toLowerCase();
-    if (tabText.includes('pppoe secret')) return loadSecrets();
-    if (tabText.includes('hotspot user')) return loadHotspotUsers();
-    if (tabText.includes('pppoe profile')) return loadPppoeProfiles();
-    if (tabText.includes('hotspot profile')) return loadHotspotUserProfiles();
-    return loadSecrets();
+    const rId = getRouterId();
+    window.location.href = '/admin/set-active-router?router_id=' + (rId || 'all');
   }
 
   function downloadBackup(e) {

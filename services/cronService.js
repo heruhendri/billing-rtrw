@@ -10,6 +10,7 @@ const mikrotikService = require('./mikrotikService');
 const usageSvc = require('./usageService');
 const { getSetting } = require('../config/settingsManager');
 const db = require('../config/database');
+const qrisUtil = require('../utils/qrisUtil');
 
 // Helper: Random delay generator untuk smart rate limiting
 function getRandomDelay(baseDelayMs, varianceMs = 3000) {
@@ -72,30 +73,43 @@ function startCronJobs() {
 
   // 2. Isolir Otomatis setiap hari jam 02:00
   cron.schedule('0 2 * * *', async () => {
-    const today = new Date().getDate();
-    // Kita cek semua pelanggan setiap hari untuk isolir otomatis
+    const now = new Date();
+    const today = now.getDate();
     logger.info(`[CRON] Menjalankan pengecekan isolir otomatis harian (Tanggal ${today})`);
     
     const customers = customerSvc.getAllCustomers();
     let isolatedCount = 0;
 
     for (const c of customers) {
-      // Cek apakah isolir otomatis aktif untuk user ini dan hari ini adalah tanggal isolirnya
-      const customerIsolirDay = c.isolate_day || 10;
       const isAutoIsolateEnabled = c.auto_isolate !== 0; // default aktif jika null/1
+      if (!isAutoIsolateEnabled || c.status !== 'active') continue;
 
-      if (isAutoIsolateEnabled && today >= customerIsolirDay) {
-        // Jika pelanggan aktif tapi punya tagihan belum bayar
-        if (c.status === 'active' && c.unpaid_count > 0) {
+      const isPrepaid = c.package_billing_type === 'prepaid';
+
+      if (isPrepaid) {
+        // Logika Prabayar: Isolir jika waktu sekarang >= expired_at
+        if (c.expired_at) {
+          const expDate = new Date(c.expired_at);
+          if (!isNaN(expDate.getTime()) && now >= expDate) {
+            try {
+              logger.info(`[CRON] Isolir otomatis pelanggan PRABAYAR: ${c.name} (${c.pppoe_username || c.hotspot_username || '-'}) - Masa Aktif Berakhir: ${c.expired_at}`);
+              await customerSvc.suspendCustomer(c.id);
+              isolatedCount++;
+            } catch (err) {
+              logger.error(`[CRON] Gagal isolir prabayar ${c.name}: ${err.message}`);
+            }
+          }
+        }
+      } else {
+        // Logika Pascabayar: Isolir jika hari ini >= isolate_day dan ada tagihan belum bayar
+        const customerIsolirDay = c.isolate_day || 10;
+        if (today >= customerIsolirDay && c.unpaid_count > 0) {
           try {
-            logger.info(`[CRON] Isolir otomatis pelanggan: ${c.name} (${c.pppoe_username}) - Tanggal Tagihan: ${customerIsolirDay}`);
-            
-            // Gunakan fungsi terpusat untuk isolir
+            logger.info(`[CRON] Isolir otomatis pelanggan PASCABAYAR: ${c.name} (${c.pppoe_username || c.hotspot_username || '-'}) - Tanggal Tagihan: ${customerIsolirDay}`);
             await customerSvc.suspendCustomer(c.id);
-            
             isolatedCount++;
           } catch (err) {
-            logger.error(`[CRON] Gagal isolir ${c.name}: ${err.message}`);
+            logger.error(`[CRON] Gagal isolir pascabayar ${c.name}: ${err.message}`);
           }
         }
       }
@@ -109,19 +123,30 @@ function startCronJobs() {
     const billingEnabled = getSetting('whatsapp_billing_to_customer_enabled', true);
     if (!enabled || !waEnabled || !billingEnabled) return;
 
-    let sendWA, whatsappStatus;
-    try {
-      const mod = await import('./whatsappBot.mjs');
-      sendWA = mod.sendWA;
-      whatsappStatus = mod.whatsappStatus;
-    } catch (e) {
-      logger.error(`[CRON] Gagal load WhatsApp bot: ${e.message || e}`);
-      return;
-    }
+    const gatewayType = getSetting('wa_gateway_type', 'baileys');
+    const waSvc = require('./whatsappService');
+    
+    if (gatewayType === 'meta') {
+      const phoneId = getSetting('meta_phone_number_id', '');
+      const token = getSetting('meta_access_token', '');
+      if (!phoneId || !token) {
+        logger.warn('[CRON] Kredensial Meta API belum diisi, pengingat tagihan otomatis dilewati.');
+        return;
+      }
+    } else {
+      let whatsappStatus;
+      try {
+        const mod = await import('./whatsappBot.mjs');
+        whatsappStatus = mod.whatsappStatus;
+      } catch (e) {
+        logger.error(`[CRON] Gagal load WhatsApp bot: ${e.message || e}`);
+        return;
+      }
 
-    if (!whatsappStatus || whatsappStatus.connection !== 'open') {
-      logger.warn('[CRON] WhatsApp bot belum terhubung, pengingat tagihan otomatis dilewati.');
-      return;
+      if (!whatsappStatus || whatsappStatus.connection !== 'open') {
+        logger.warn('[CRON] WhatsApp bot belum terhubung, pengingat tagihan otomatis dilewati.');
+        return;
+      }
     }
 
     const resolveBaseUrl = () => {
@@ -172,12 +197,30 @@ function startCronJobs() {
       if (!digits) continue;
       if (digits.startsWith('0')) digits = '62' + digits.slice(1);
       if (seenPhones.has(digits)) continue;
-      const unpaidCount = Number(c.unpaid_count || 0) || 0;
-      if (unpaidCount <= 0) continue;
 
-      const dueDay = Number(c.isolate_day || 0) || Number(getSetting('isolir_day', 10) || 10) || 10;
-      const remind1 = dueDay - 1;
-      const shouldSend = remind1 >= 1 && day === remind1;
+      const isPrepaid = c.package_billing_type === 'prepaid';
+      let shouldSend = false;
+
+      if (isPrepaid) {
+        if (c.expired_at) {
+          const expDate = new Date(c.expired_at);
+          if (!isNaN(expDate.getTime())) {
+            const diffMs = expDate.getTime() - today.getTime();
+            const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+            if (diffDays === 1 || diffDays === 2) {
+              shouldSend = true;
+            }
+          }
+        }
+      } else {
+        const unpaidCount = Number(c.unpaid_count || 0) || 0;
+        if (unpaidCount > 0) {
+          const dueDay = Number(c.isolate_day || 0) || Number(getSetting('isolir_day', 10) || 10) || 10;
+          const remind1 = dueDay - 1;
+          shouldSend = (remind1 >= 1 && day === remind1);
+        }
+      }
+
       if (!shouldSend) continue;
 
       seenPhones.add(digits);
@@ -207,18 +250,91 @@ function startCronJobs() {
           const totalTagihan = unpaidInvoices.reduce((sum, inv) => sum + (Number(inv.amount) || 0), 0);
           const rincianBulan = unpaidInvoices.map(inv => `${inv.period_month}/${inv.period_year}`).join(', ');
 
-          // Format pesan dengan variation untuk anti-spam
+          // Process Dynamic QRIS if enabled & available
+          let qrisImageBuffer = null;
+          let finalTagihanStr = totalTagihan.toLocaleString('id-ID');
+
+          if (unpaidInvoices.length > 0) {
+            try {
+              const inv = unpaidInvoices[0];
+              let code = Number(inv.qris_unique_code || 0) || 0;
+              let amt = Number(inv.qris_amount_unique || 0) || 0;
+              const invId = Number(inv.id);
+              const baseAmount = totalTagihan > 0 ? totalTagihan : Number(inv.amount || 0);
+
+              // Jika amt tidak ada atau amt tidak cocok dengan akumulasi total tagihan + kode, buat/perbarui nominal unik
+              if ((!code || !amt || (amt - code !== baseAmount)) && invId > 0 && baseAmount > 0) {
+                const exists = db.prepare('SELECT id FROM invoices WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1');
+                const custId = Number(c?.id || inv?.customer_id || 0);
+                let tryCode = 0;
+                let tryAmt = 0;
+
+                if (code > 0) {
+                  const pAmt = baseAmount + code;
+                  if (!exists.get('unpaid', pAmt, invId)) {
+                    tryCode = code;
+                    tryAmt = pAmt;
+                  }
+                }
+
+                if (!tryAmt && custId > 0) {
+                  const prefCode = (custId % 499 === 0) ? 499 : (custId % 499);
+                  const pAmt = baseAmount + prefCode;
+                  if (!exists.get('unpaid', pAmt, invId)) {
+                    tryCode = prefCode;
+                    tryAmt = pAmt;
+                  }
+                }
+
+                if (!tryAmt) {
+                  for (let randCode = 1; randCode <= 499; randCode++) {
+                    const pAmt = baseAmount + randCode;
+                    if (!exists.get('unpaid', pAmt, invId)) {
+                      tryCode = randCode;
+                      tryAmt = pAmt;
+                      break;
+                    }
+                  }
+                }
+
+                if (tryAmt > 0) {
+                  code = tryCode;
+                  amt = tryAmt;
+                  db.prepare('UPDATE invoices SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=CURRENT_TIMESTAMP WHERE id=?').run(code, amt, invId);
+                }
+              }
+
+              if (amt > 0) {
+                finalTagihanStr = amt.toLocaleString('id-ID');
+                const qrisPayload = String(getSetting('qris_static_payload', '') || '').trim();
+                const qrisEnabledRaw = getSetting('qris_static_enabled', true);
+                const qrisEnabled = !(qrisEnabledRaw === false || qrisEnabledRaw === 'false' || qrisEnabledRaw === 0 || qrisEnabledRaw === '0');
+
+                if (qrisEnabled && qrisPayload && typeof qrisUtil.buildDynamicQrisJpgBuffer === 'function') {
+                  qrisImageBuffer = await qrisUtil.buildDynamicQrisJpgBuffer(qrisPayload, amt);
+                }
+              }
+            } catch (qrisErr) {
+              logger.warn(`[CRON] Gagal generate QRIS dinamis untuk ${c.name}: ${qrisErr.message}`);
+            }
+          }
+
+          // Format pesan dengan Spintax & variation untuk anti-spam
           let formattedMsg = template
             .replace(/{{nama}}/gi, c.name || 'Pelanggan')
-            .replace(/{{tagihan}}/gi, totalTagihan.toLocaleString('id-ID'))
+            .replace(/{{tagihan}}/gi, finalTagihanStr)
             .replace(/{{rincian}}/gi, rincianBulan || '-')
             .replace(/{{paket}}/gi, c.package_name || '-')
             .replace(/{{link}}/gi, loginLink);
 
+          const { parseSpintax } = await import('./whatsappBot.mjs');
+          formattedMsg = parseSpintax(formattedMsg);
+
           // Add subtle variation untuk menghindari spam detection
           formattedMsg = addMessageVariation(formattedMsg, i);
 
-          const ok = await sendWA(c.phone, formattedMsg);
+          await waSvc.sendWhatsAppMessage(c.phone, formattedMsg);
+          const ok = true;
           if (ok) {
             sent++;
             targetCount++;

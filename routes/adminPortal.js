@@ -3,12 +3,13 @@
  */
 const express = require('express');
 const router = express.Router();
-const { getSetting, getSettings, saveSettings, getNowLocal, getCurrentDateInTimezone, getCurrentTimeInfo, getNowLocalISO, formatDateLocal } = require('../config/settingsManager');
+const { getSetting, getSettings, saveSettings, getNowLocal, getCurrentDateInTimezone, getCurrentTimeInfo, getNowLocalISO, formatDateLocal, formatTimeLocal, parseDateInTimezone } = require('../config/settingsManager');
 const { logger } = require('../config/logger');
 const db = require('../config/database');
 const customerDevice = require('../services/customerDeviceService');
 const customerSvc = require('../services/customerService');
 const billingSvc = require('../services/billingService');
+const pdfSvc = require('../services/pdfInvoiceService');
 const mikrotikService = require('../services/mikrotikService');
 const adminSvc = require('../services/adminService');
 const agentSvc = require('../services/agentService');
@@ -61,10 +62,13 @@ const diagnosticsSvc = require('../services/diagnosticsService');
 const attendanceSvc = require('../services/attendanceService');
 const payrollSvc = require('../services/payrollService');
 const sidebarMenuSvc = require('../services/sidebarMenuService');
+const areaSvc = require('../services/areaService');
 const axios = require('axios');
 const crypto = require('crypto');
-const Jimp = require('jimp');
+const _jimpMod = require('jimp');
+const Jimp = _jimpMod.Jimp || _jimpMod;
 const jsQR = require('jsqr');
+const qrisUtil = require('../utils/qrisUtil');
 const { MultiFormatReader, BarcodeFormat, DecodeHintType, BinaryBitmap, HybridBinarizer, RGBLuminanceSource } = require('@zxing/library');
 const QRCode = require('qrcode');
 const acsPortal = require('./acsPortal');
@@ -97,90 +101,7 @@ function digiflazzSign(refId) {
 async function extractQrTextFromImageBuffer(buffer) {
   const buf = buffer && Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
   if (!buf.length) return '';
-  const baseImg = await Jimp.read(buf);
-
-  const decodeFrom = (img) => {
-    const width = Number(img.bitmap?.width || 0);
-    const height = Number(img.bitmap?.height || 0);
-    const data = img.bitmap?.data;
-    if (!width || !height || !data) return '';
-    try {
-      const hints = new Map();
-      hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.QR_CODE]);
-      hints.set(DecodeHintType.TRY_HARDER, true);
-      const reader = new MultiFormatReader();
-      const luminanceSource = new RGBLuminanceSource(new Uint8ClampedArray(data), width, height);
-      const binaryBitmap = new BinaryBitmap(new HybridBinarizer(luminanceSource));
-      const res = reader.decode(binaryBitmap, hints);
-      const txt = res && typeof res.getText === 'function' ? res.getText() : '';
-      if (txt) return String(txt);
-    } catch {}
-    const decoded = jsQR(new Uint8ClampedArray(data), width, height, { inversionAttempts: 'attemptBoth' });
-    return decoded && decoded.data ? String(decoded.data) : '';
-  };
-
-  const makeCrops = (img) => {
-    const w = Number(img.bitmap?.width || 0);
-    const h = Number(img.bitmap?.height || 0);
-    const side = Math.floor(Math.min(w, h) * 0.78);
-    if (!w || !h || side < 120) return [];
-    const xMid = Math.max(0, Math.floor((w - side) / 2));
-    const yTop = Math.max(0, Math.floor((h - side) * 0.20));
-    const yMid = Math.max(0, Math.floor((h - side) * 0.40));
-    const yBot = Math.max(0, Math.floor((h - side) * 0.55));
-    const xs = [xMid];
-    const ys = [yMid, yBot, yTop];
-    const out = [];
-    for (const x of xs) {
-      for (const y of ys) {
-        try {
-          out.push(img.clone().crop(x, y, side, side));
-        } catch {}
-      }
-    }
-    return out;
-  };
-
-  const candidates = [];
-  candidates.push(baseImg);
-  candidates.push(baseImg.clone().greyscale());
-  candidates.push(baseImg.clone().greyscale().contrast(0.25));
-  candidates.push(baseImg.clone().greyscale().contrast(0.45));
-  candidates.push(baseImg.clone().greyscale().invert());
-  for (const img of [...candidates]) {
-    candidates.push(...makeCrops(img));
-  }
-
-  try {
-    const w = Number(baseImg.bitmap?.width || 0);
-    const h = Number(baseImg.bitmap?.height || 0);
-    const maxSide = Math.max(w, h);
-    if (maxSide > 0 && maxSide < 720) {
-      candidates.push(baseImg.clone().resize(w * 2, h * 2));
-      candidates.push(baseImg.clone().resize(w * 3, h * 3).greyscale().contrast(0.25));
-      try {
-        candidates.push(...makeCrops(baseImg.clone().resize(w * 2, h * 2)));
-        candidates.push(...makeCrops(baseImg.clone().resize(w * 3, h * 3).greyscale().contrast(0.25)));
-      } catch {}
-    }
-  } catch {}
-
-  let text = '';
-  for (const img of candidates) {
-    try {
-      text = decodeFrom(img);
-      if (text) break;
-    } catch {}
-  }
-
-  let s = String(text || '').replace(/[\r\n\t]+/g, '').trim();
-  const idx = s.indexOf('000201');
-  if (idx > 0) s = s.slice(idx);
-  const lastCrc = s.lastIndexOf('6304');
-  if (lastCrc >= 0 && s.length >= lastCrc + 8) {
-    s = s.slice(0, lastCrc + 8);
-  }
-  return s;
+  return await qrisUtil.decodeQrisPayloadFromBuffer(buf);
 }
 
 async function digiflazzCekSaldo() {
@@ -269,6 +190,53 @@ function resolvePaidByName(req, fallback) {
   if (req.session?.isAdmin) return fb || 'Admin';
   return fb || 'Admin';
 }
+
+function routerContextMiddleware(req, res, next) {
+  try {
+    const multiRouterMode = getSetting('multi_router_mode', 'disabled') === 'active';
+    const activeRouters = mikrotikService.getAllRouters() || [];
+
+    if (req.query.router_id !== undefined) {
+      if (req.query.router_id === 'all' || req.query.router_id === '0' || req.query.router_id === '') {
+        req.session.selected_router_id = null;
+      } else {
+        const rid = parseInt(req.query.router_id, 10);
+        req.session.selected_router_id = isNaN(rid) ? null : rid;
+      }
+    }
+
+    let selectedRouterId = req.session.selected_router_id ?? null;
+    if (selectedRouterId && !activeRouters.some(r => r.id === selectedRouterId)) {
+      selectedRouterId = null;
+      req.session.selected_router_id = null;
+    }
+
+    res.locals.multiRouterMode = multiRouterMode;
+    res.locals.allActiveRouters = activeRouters;
+    res.locals.selectedRouterId = selectedRouterId;
+    req.selectedRouterId = selectedRouterId;
+  } catch (e) {
+    res.locals.multiRouterMode = false;
+    res.locals.allActiveRouters = [];
+    res.locals.selectedRouterId = null;
+    req.selectedRouterId = null;
+  }
+  next();
+}
+
+router.use(routerContextMiddleware);
+
+router.get('/set-active-router', requireAdminSession, (req, res) => {
+  const routerId = req.query.router_id;
+  if (routerId === 'all' || routerId === '0' || !routerId) {
+    req.session.selected_router_id = null;
+  } else {
+    const parsed = parseInt(routerId, 10);
+    req.session.selected_router_id = isNaN(parsed) ? null : parsed;
+  }
+  const referer = req.headers.referer || '/admin';
+  return res.redirect(referer);
+});
 
 async function trySendWhatsappPayment(customerPhone, message) {
   try {
@@ -378,12 +346,22 @@ function copyDirSync(srcDir, destDir) {
 }
 
 function getGitDefaultBranch(repoRoot) {
-  const r = runCmd('git', ['symbolic-ref', 'refs/remotes/origin/HEAD'], repoRoot);
+  let r = runCmd('git', ['symbolic-ref', 'refs/remotes/origin/HEAD'], repoRoot);
   if (r.ok) {
     const ref = String(r.stdout || '').trim();
     const m = ref.match(/refs\/remotes\/origin\/(.+)$/);
     if (m && m[1]) return m[1].trim();
   }
+  r = runCmd('git', ['rev-parse', '--abbrev-ref', 'HEAD'], repoRoot);
+  if (r.ok) {
+    const b = String(r.stdout || '').trim();
+    if (b && b !== 'HEAD') return b;
+  }
+  r = runCmd('git', ['rev-parse', '--verify', 'origin/main'], repoRoot);
+  if (r.ok) return 'main';
+  r = runCmd('git', ['rev-parse', '--verify', 'origin/master'], repoRoot);
+  if (r.ok) return 'master';
+
   return 'main';
 }
 
@@ -575,10 +553,20 @@ router.use((req, res, next) => {
   res.locals.settings = getSettings();
   res.locals.company = company();
   res.locals.formatDateLocal = formatDateLocal;
+  res.locals.formatTimeLocal = formatTimeLocal;
+  res.locals.parseDateInTimezone = parseDateInTimezone;
   res.locals.getNowLocal = getNowLocal;
   res.locals.getCurrentTimeInfo = getCurrentTimeInfo;
   next();
 });
+
+let loginRateLimiter = (req, res, next) => next();
+try {
+  const rlMod = require('../middleware/rateLimiter');
+  if (rlMod && typeof rlMod.loginRateLimiter === 'function') {
+    loginRateLimiter = rlMod.loginRateLimiter;
+  }
+} catch (e) {}
 
 // ─── AUTH ROUTES ───────────────────────────────────────────────────────────
 router.get('/login', (req, res) => {
@@ -586,7 +574,7 @@ router.get('/login', (req, res) => {
   res.render('admin/login', { title: 'Admin Login', company: company(), error: null });
 });
 
-router.post('/login', express.urlencoded({ extended: true }), (req, res) => {
+router.post('/login', loginRateLimiter, express.urlencoded({ extended: true }), (req, res) => {
   const { username, password } = req.body;
   if (username === getSetting('admin_username', 'admin') && password === getSetting('admin_password', 'admin123')) {
     req.session.isAdmin = true;
@@ -620,6 +608,15 @@ router.get('/olts', requireAdminSession, async (req, res) => {
     olts, 
     msg: flashMsg(req) 
   });
+});
+
+router.get('/olts/all/stats', requireAdminSession, async (req, res) => {
+  try {
+    const stats = await oltSvc.getAllOltsStats(req.query.full === 'true');
+    res.json(stats);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 router.get('/olts/:id/stats', requireAdminSession, async (req, res) => {
@@ -719,6 +716,20 @@ router.get('/map', requireAdminSession, requireSidebarMenuAccess('map'), (req, r
     msg: flashMsg(req),
     settings: getSettings()
   });
+});
+
+router.get('/api/customers/live-sessions', requireAdminSession, async (req, res) => {
+  try {
+    const force = req.query.force === '1' || req.query.force === 'true';
+    const activeMap = await mikrotikService.getAllActiveSessionsMap(force);
+    const sessionsObj = {};
+    for (const [uname, session] of activeMap.entries()) {
+      sessionsObj[uname] = session;
+    }
+    return res.json({ ok: true, sessions: sessionsObj });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 router.get('/api/customers/:id/pppoe-traffic', requireAdminSession, async (req, res) => {
@@ -983,7 +994,8 @@ router.post('/cashiers/:id/delete', requireAdminSession, restrictToAdmin, (req, 
 // --- COLLECTOR MANAGEMENT ---
 router.get('/collectors', requireAdminSession, requireSidebarMenuAccess('collectors'), restrictToAdmin, (req, res) => {
   const collectors = adminSvc.getAllCollectors();
-  res.render('admin/collectors', { title: 'Manajemen Kolektor', company: company(), activePage: 'collectors', collectors, msg: flashMsg(req) });
+  const masterAreas = areaSvc.getAllAreas();
+  res.render('admin/collectors', { title: 'Manajemen Kolektor', company: company(), activePage: 'collectors', collectors, masterAreas, msg: flashMsg(req) });
 });
 
 router.post('/collectors', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), (req, res) => {
@@ -1010,6 +1022,42 @@ router.post('/collectors/:id/delete', requireAdminSession, restrictToAdmin, (req
   adminSvc.deleteCollector(req.params.id);
   req.session._msg = { type: 'success', text: 'Kolektor berhasil dihapus.' };
   res.redirect('/admin/collectors');
+});
+
+// --- AREA MANAGEMENT ---
+router.get('/areas', requireAdminSession, requireSidebarMenuAccess('areas'), (req, res) => {
+  const areas = areaSvc.getAllAreas();
+  res.render('admin/areas', { title: 'Manajemen Area', company: company(), activePage: 'areas', areas, msg: flashMsg(req) });
+});
+
+router.post('/areas', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    areaSvc.createArea(req.body);
+    req.session._msg = { type: 'success', text: 'Area berhasil ditambahkan.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+  }
+  res.redirect('/admin/areas');
+});
+
+router.post('/areas/:id/update', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    areaSvc.updateArea(req.params.id, req.body);
+    req.session._msg = { type: 'success', text: 'Data area berhasil diperbarui.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+  }
+  res.redirect('/admin/areas');
+});
+
+router.post('/areas/:id/delete', requireAdminSession, (req, res) => {
+  try {
+    areaSvc.deleteArea(req.params.id);
+    req.session._msg = { type: 'success', text: 'Area berhasil dihapus.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+  }
+  res.redirect('/admin/areas');
 });
 
 router.get('/collector-payments', requireAdminSession, requireSidebarMenuAccess('collector_payments'), (req, res) => {
@@ -1519,24 +1567,29 @@ router.get('/bulk', requireAdminSession, (req, res) => {
 });
 
 // ─── CUSTOMERS ─────────────────────────────────────────────────────────────
-router.get('/customers', requireAdminSession, requireSidebarMenuAccess('customers'), (req, res) => {
-  const { search = '', status: filterStatus = '' } = req.query;
-  const customers = customerSvc.getAllCustomers(search);
+router.get('/customers', requireAdminSession, requireSidebarMenuAccess('customers'), async (req, res) => {
+  const { search = '', status: filterStatus = '', area: filterArea = '' } = req.query;
+  const selectedRouterId = req.selectedRouterId || (req.query.router_id ? Number(req.query.router_id) : null);
+  const customers = customerSvc.getAllCustomers(search, selectedRouterId, filterStatus, filterArea);
   const stats = customerSvc.getCustomerStats();
-  const packages = customerSvc.getAllPackages();
+  const packages = customerSvc.getAllPackages(selectedRouterId);
   const routers = mikrotikService.getAllRouters();
   const olts = oltSvc.getAllOlts();
   const odps = odpSvc.getAllOdps();
   const collectors = adminSvc.getAllCollectors();
+  const areas = customerSvc.getAllCustomerAreas();
+  const masterAreas = areaSvc.getAllAreas();
 
-  // Apply status filter in JS if provided
-  const filteredCustomers = filterStatus
-    ? customers.filter(c => c.status === filterStatus)
-    : customers;
+  let activeSessionsMap = new Map();
+  try {
+    activeSessionsMap = await mikrotikService.getAllActiveSessionsMap();
+  } catch (e) {
+    logger.warn('[Customers] Failed to fetch active sessions map:', e.message);
+  }
 
   res.render('admin/customers', {
     title: 'Data Pelanggan', company: company(), activePage: 'customers',
-    customers: filteredCustomers, stats, packages, routers, olts, odps, collectors, search, filterStatus, msg: flashMsg(req),
+    customers, stats, packages, routers, olts, odps, collectors, areas, masterAreas, activeSessionsMap, search, filterStatus, filterArea, selectedRouterId, msg: flashMsg(req),
     settings: getSettings()
   });
 });
@@ -1662,10 +1715,14 @@ router.post('/customers', requireAdminSession, express.urlencoded({ extended: tr
       req.body.router_id = effectiveRouterId;
     }
 
+    const radiusEnabled = getSetting('radius_enabled', '0') === '1';
+    const isRadius = radiusEnabled ? (req.body.is_radius !== undefined ? (Number(req.body.is_radius) === 1 ? 1 : 0) : 0) : 0;
+    req.body.is_radius = isRadius;
+
     customerSvc.createCustomer(req.body);
     
-    // Sync to MikroTik if username provided
-    if (connectionType === 'pppoe' && req.body.pppoe_username) {
+    // Sync to MikroTik if username provided AND not RADIUS
+    if (connectionType === 'pppoe' && req.body.pppoe_username && !isRadius) {
       const password = String(req.body.pppoe_password || '').trim();
       const remoteAddress = String(req.body.pppoe_remote_address || '').trim();
       
@@ -1845,78 +1902,61 @@ router.post('/customers/:id/update', requireAdminSession, express.urlencoded({ e
       req.body.router_id = effectiveRouterId;
     }
 
+    const radiusEnabled = getSetting('radius_enabled', '0') === '1';
+    const isRadius = radiusEnabled ? (req.body.is_radius !== undefined ? (Number(req.body.is_radius) === 1 ? 1 : 0) : 0) : 0;
+    req.body.is_radius = isRadius;
+
     // Get old customer data to detect username changes
     const oldCustomer = customerSvc.getCustomerById(customerId);
     
     customerSvc.updateCustomer(req.params.id, req.body);
     
-    // Sync to MikroTik if username provided
+    // Sync to MikroTik if username provided (update profile only, NEVER delete PPP secret)
     if (connectionType === 'pppoe' && req.body.pppoe_username) {
-      const oldUsername = oldCustomer ? String(oldCustomer.pppoe_username || '').trim() : '';
-      const newUsername = String(req.body.pppoe_username || '').trim();
-      const oldRouterIdForOldUser = oldCustomer ? oldCustomer.router_id : null;
-      const oldEffectiveRouterId = oldCustomer ? customerSvc.getEffectiveRouterId(oldRouterIdForOldUser) : null;
-      
-      // If username changed, handle old one first
-      if (oldUsername && oldUsername !== newUsername && oldEffectiveRouterId) {
-        try {
-          logger.info(`[Update] PPPoE username changed: "${oldUsername}" → "${newUsername}" for customer ${customerId}`);
-          // Delete old PPPoE user from MikroTik
-          const oldSecrets = await mikrotikService.getPppoeSecrets(oldEffectiveRouterId);
-          const oldSecret = oldSecrets.find(s => String(s.name || '').toLowerCase() === String(oldUsername || '').toLowerCase());
-          if (oldSecret) {
-            const secretId = oldSecret['.id'] || oldSecret.id;
-            if (secretId) {
-              await mikrotikService.deletePppoeSecret(secretId, oldEffectiveRouterId);
-              logger.info(`[Update] Deleted old PPPoE secret: ${oldUsername} from router ${oldEffectiveRouterId}`);
-            }
+      try {
+        const newUsername = String(req.body.pppoe_username || '').trim();
+        let targetProfile = '';
+        if (req.body.status === 'suspended') {
+          targetProfile = req.body.isolir_profile || 'isolir';
+        } else if (req.body.package_id) {
+          const pkg = customerSvc.getPackageById(req.body.package_id);
+          if (pkg) targetProfile = pkg.name;
+        }
+        if (targetProfile) {
+          try {
+            await mikrotikService.setPppoeProfile(newUsername, targetProfile, req.body.router_id);
+          } catch (mErr) {
+            logger.error('Mikrotik sync error (update PPPoE):', mErr.message);
           }
-        } catch (err) {
-          logger.warn(`[Update] Failed to delete old PPPoE user ${oldUsername}: ${err.message}`);
         }
-      }
-      
-      // Now handle new username
-      let targetProfile = '';
-      if (req.body.status === 'suspended') {
-        targetProfile = req.body.isolir_profile || 'isolir';
-      } else if (req.body.package_id) {
-        const pkg = customerSvc.getPackageById(req.body.package_id);
-        if (pkg) targetProfile = pkg.name;
-      }
-      if (targetProfile) {
-        try {
-          await mikrotikService.setPppoeProfile(newUsername, targetProfile, req.body.router_id);
-        } catch (mErr) {
-          logger.error('Mikrotik sync error (update PPPoE):', mErr.message);
-        }
+      } catch (syncErr) {
+        logger.warn(`[Update] MikroTik API sync skipped/failed for customer ${customerId}: ${syncErr.message}`);
       }
     }
     if (connectionType === 'hotspot' && req.body.hotspot_username) {
-      const oldUsername = oldCustomer ? String(oldCustomer.hotspot_username || '').trim() : '';
-      const newUsername = String(req.body.hotspot_username || '').trim();
-      const oldRouterIdForOldUser = oldCustomer ? oldCustomer.router_id : null;
-      const oldEffectiveRouterId = oldCustomer ? customerSvc.getEffectiveRouterId(oldRouterIdForOldUser) : null;
-      
-      // If username changed, handle old one first
-      if (oldUsername && oldUsername !== newUsername && oldEffectiveRouterId) {
-        try {
-          logger.info(`[Update] Hotspot username changed: "${oldUsername}" → "${newUsername}" for customer ${customerId}`);
-          // Delete old Hotspot user from MikroTik
-          const oldUser = await mikrotikService.getHotspotUserByName(oldUsername, oldEffectiveRouterId);
-          if (oldUser && (oldUser.id || oldUser['.id'])) {
-            const userId = oldUser['.id'] || oldUser.id;
-            await mikrotikService.deleteHotspotUser(userId, oldEffectiveRouterId);
-            logger.info(`[Update] Deleted old Hotspot user: ${oldUsername} from router ${oldEffectiveRouterId}`);
-          }
-        } catch (err) {
-          logger.warn(`[Update] Failed to delete old Hotspot user ${oldUsername}: ${err.message}`);
-        }
-      }
-      
-      // Now handle new username
-      const disabled = String(req.body.status || 'active').toLowerCase() !== 'active';
       try {
+        const oldUsername = oldCustomer ? String(oldCustomer.hotspot_username || '').trim() : '';
+        const newUsername = String(req.body.hotspot_username || '').trim();
+        const oldRouterIdForOldUser = oldCustomer ? oldCustomer.router_id : null;
+        const oldEffectiveRouterId = oldCustomer ? customerSvc.getEffectiveRouterId(oldRouterIdForOldUser) : null;
+        
+        // If username changed, handle old one first
+        if (oldUsername && oldUsername !== newUsername && oldEffectiveRouterId) {
+          try {
+            logger.info(`[Update] Hotspot username changed: "${oldUsername}" → "${newUsername}" for customer ${customerId}`);
+            const oldUser = await mikrotikService.getHotspotUserByName(oldUsername, oldEffectiveRouterId);
+            if (oldUser && (oldUser.id || oldUser['.id'])) {
+              const userId = oldUser['.id'] || oldUser.id;
+              await mikrotikService.deleteHotspotUser(userId, oldEffectiveRouterId);
+              logger.info(`[Update] Deleted old Hotspot user: ${oldUsername} from router ${oldEffectiveRouterId}`);
+            }
+          } catch (err) {
+            logger.warn(`[Update] Failed to delete old Hotspot user ${oldUsername}: ${err.message}`);
+          }
+        }
+        
+        // Now handle new username
+        const disabled = String(req.body.status || 'active').toLowerCase() !== 'active';
         await mikrotikService.upsertHotspotUser({
           username: newUsername,
           password: String(req.body.hotspot_password || '').trim(),
@@ -1925,7 +1965,7 @@ router.post('/customers/:id/update', requireAdminSession, express.urlencoded({ e
           disabled
         }, req.body.router_id ? Number(req.body.router_id) : null);
       } catch (mErr) {
-        logger.error('Mikrotik sync error (update hotspot):', mErr.message);
+        logger.warn(`[Update] Mikrotik sync error (update hotspot): ${mErr.message}`);
       }
     }
 
@@ -1946,16 +1986,48 @@ router.post('/customers/:id/delete', requireAdminSession, async (req, res) => {
   res.redirect('/admin/customers');
 });
 
+router.post('/customers/:id/disconnect', requireAdminSession, async (req, res) => {
+  try {
+    const custId = Number(req.params.id);
+    const customer = customerSvc.getCustomerById(custId);
+    if (!customer) throw new Error('Pelanggan tidak ditemukan');
+
+    const pppoeUser = String(customer.pppoe_username || '').trim();
+    const hotspotUser = String(customer.hotspot_username || '').trim();
+    const username = pppoeUser || hotspotUser || String(customer.name || '').trim();
+
+    let kicked = false;
+    if (pppoeUser) {
+      kicked = await mikrotikService.kickPppoeUser(pppoeUser, customer.router_id);
+    } else if (hotspotUser) {
+      kicked = await mikrotikService.kickHotspotUser(hotspotUser, customer.router_id);
+    } else if (username) {
+      kicked = await mikrotikService.kickPppoeUser(username, customer.router_id) || await mikrotikService.kickHotspotUser(username, customer.router_id);
+    }
+
+    if (kicked) {
+      req.session._msg = { type: 'success', text: `Sesi koneksi aktif untuk "${customer.name}" berhasil diputus dari MikroTik.` };
+    } else {
+      req.session._msg = { type: 'error', text: `Sesi aktif untuk "${customer.name}" tidak ditemukan di MikroTik atau gagal diputus.` };
+    }
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal memutus koneksi: ' + (e.message || String(e)) };
+  }
+  res.redirect('/admin/customers');
+});
+
 // ─── EXPORT/IMPORT CUSTOMERS ──────────────────────────────────────
 router.get('/customers/export', requireAdminSession, (req, res) => {
   try {
     const customers = customerSvc.getAllCustomers();
     const data = customers.map(c => ({
       'ID': c.id,
+      'NIK': c.nik || '',
       'Nama': c.name,
       'Telepon': c.phone,
       'Email': c.email || '',
       'Alamat': c.address,
+      'Area': c.area || '',
       'Paket': c.package_name || '-',
       'Router': c.router_name || '-',
       'Tipe Koneksi': c.connection_type || 'pppoe',
@@ -2028,10 +2100,12 @@ router.post('/customers/import', requireAdminSession, upload.single('file'), asy
       const connType = String(cleanRow['Tipe Koneksi'] || cleanRow['connection_type'] || cleanRow['Connection Type'] || 'pppoe').trim().toLowerCase() || 'pppoe';
       
       const data = {
+        nik: cleanRow['NIK'] || cleanRow['nik'] || cleanRow['No KTP'] || cleanRow['No. KTP'] || '',
         name: name,
         phone: cleanRow['Telepon'] || cleanRow['phone'] || cleanRow['Phone'],
         email: cleanRow['Email'] || cleanRow['email'] || cleanRow['email_address'],
         address: cleanRow['Alamat'] || cleanRow['address'] || cleanRow['Address'],
+        area: cleanRow['Area'] || cleanRow['area'] || cleanRow['Wilayah'] || '',
         package_id: pkg ? pkg.id : null,
         router_id: router ? router.id : null,
         odp_id: odp ? odp.id : null,
@@ -2196,9 +2270,12 @@ router.post('/customers/:id/billing/pay', requireAdminSession, express.urlencode
 
 // ─── PACKAGES ──────────────────────────────────────────────────────────────
 router.get('/packages', requireAdminSession, requireSidebarMenuAccess('packages'), (req, res) => {
+  const selectedRouterId = req.selectedRouterId || (req.query.router_id ? Number(req.query.router_id) : null);
+  const routers = mikrotikService.getAllRouters();
+  const packages = customerSvc.getAllPackages(selectedRouterId);
   res.render('admin/packages', {
     title: 'Paket Internet', company: company(), activePage: 'packages',
-    packages: customerSvc.getAllPackages(), msg: flashMsg(req)
+    packages, routers, selectedRouterId, msg: flashMsg(req)
   });
 });
 
@@ -2234,21 +2311,34 @@ router.post('/packages/:id/delete', requireAdminSession, (req, res) => {
 
 // ─── VOUCHER PACKAGES (ON-DEMAND REAL-TIME CONFIGURATION) ────────────────────
 router.get('/vouchers/packages', requireAdminSession, requireSidebarMenuAccess('voucher_packages'), (req, res) => {
+  const selectedRouterId = req.selectedRouterId || (req.query.router_id ? Number(req.query.router_id) : null);
   const routers = db.prepare('SELECT id, name FROM routers WHERE is_active = 1').all();
   res.render('admin/vouchers_packages', {
     title: 'Paket Voucher Hotspot', company: company(), activePage: 'voucher_packages',
-    routers, msg: flashMsg(req)
+    routers, selectedRouterId, msg: flashMsg(req)
   });
 });
 
 router.get('/api/vouchers/packages', requireAdminSession, (req, res) => {
   try {
-    const rows = db.prepare(`
-      SELECT vp.*, r.name AS router_name
-      FROM voucher_packages vp
-      LEFT JOIN routers r ON r.id = vp.router_id
-      ORDER BY vp.price ASC
-    `).all();
+    const selectedRouterId = req.selectedRouterId || (req.query.router_id ? Number(req.query.router_id) : null);
+    let rows;
+    if (selectedRouterId && selectedRouterId > 0) {
+      rows = db.prepare(`
+        SELECT vp.*, r.name AS router_name
+        FROM voucher_packages vp
+        LEFT JOIN routers r ON r.id = vp.router_id
+        WHERE vp.router_id = ?
+        ORDER BY vp.price ASC
+      `).all(selectedRouterId);
+    } else {
+      rows = db.prepare(`
+        SELECT vp.*, r.name AS router_name
+        FROM voucher_packages vp
+        LEFT JOIN routers r ON r.id = vp.router_id
+        ORDER BY vp.price ASC
+      `).all();
+    }
     res.json({ ok: true, rows });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -2330,6 +2420,88 @@ router.get('/billing/:id/print', requireAdminSession, (req, res) => {
     company: settings.company_header || 'DIGITAL NETWORK',
     settings
   });
+});
+
+router.get('/billing/:id/print-thermal', requireAdminSession, (req, res) => {
+  const inv = billingSvc.getInvoiceById(req.params.id);
+  if (!inv) return res.status(404).send('Invoice tidak ditemukan');
+  
+  const customer = customerSvc.getCustomerById(inv.customer_id);
+  if (!customer) return res.status(404).send('Data pelanggan tidak ditemukan');
+
+  const settings = getSettings();
+  res.render('collector/print_thermal', {
+    invoice: inv,
+    customer,
+    company: settings.company_header || 'ALIJAYA DIGITAL NETWORK',
+    settings,
+    collectorName: req.session.adminUsername || 'Admin',
+    formatDateLocal,
+    formatTimeLocal,
+    getNowLocal
+  });
+});
+
+router.get('/billing/:id/pdf', requireAdminSession, async (req, res) => {
+  try {
+    const inv = billingSvc.getInvoiceById(req.params.id);
+    if (!inv) return res.status(404).send('Invoice tidak ditemukan');
+    
+    const customer = customerSvc.getCustomerById(inv.customer_id);
+    if (!customer) return res.status(404).send('Data pelanggan tidak ditemukan');
+
+    const settings = getSettings();
+    const pdfBuffer = await pdfSvc.generateInvoicePdfBuffer(inv, customer, settings);
+    
+    const safeName = (customer.name || 'Pelanggan').replace(/[^a-zA-Z0-9]/g, '_');
+    const filename = `Invoice_INV-${String(inv.id).padStart(4, '0')}_${safeName}.pdf`;
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `inline; filename="${filename}"`,
+      'Content-Length': pdfBuffer.length
+    });
+    return res.send(pdfBuffer);
+  } catch (err) {
+    logger.error(`[PDF Download] Error: ${err.message}`);
+    return res.status(500).send('Gagal generate PDF invoice: ' + err.message);
+  }
+});
+
+router.post('/billing/:id/send-pdf-wa', requireAdminSession, async (req, res) => {
+  try {
+    const inv = billingSvc.getInvoiceById(req.params.id);
+    if (!inv) return res.json({ success: false, message: 'Invoice tidak ditemukan' });
+    
+    const customer = customerSvc.getCustomerById(inv.customer_id);
+    if (!customer) return res.json({ success: false, message: 'Data pelanggan tidak ditemukan' });
+    if (!customer.phone) return res.json({ success: false, message: 'Nomor WhatsApp pelanggan belum terisi' });
+
+    const settings = getSettings();
+    const pdfBuffer = await pdfSvc.generateInvoicePdfBuffer(inv, customer, settings);
+
+    const mns = ['Jan','Feb','Mar','Apr','Mei','Jun','Jul','Agt','Sep','Okt','Nov','Des'];
+    const periodStr = `${mns[(inv.period_month || 1) - 1]} ${inv.period_year}`;
+    const safeName = (customer.name || 'Pelanggan').replace(/[^a-zA-Z0-9]/g, '_');
+    const filename = `Invoice_${inv.id}_${safeName}.pdf`;
+    const statusText = inv.status === 'paid' ? 'LUNAS' : 'BELUM BAYAR';
+    
+    const caption = `📄 *INVOICE PEMBAYARAN INTERNET*\n\nYth. *${customer.name}*,\nBerikut kami lampirkan dokumen resmi Invoice Pembayaran Internet untuk periode *${periodStr}*.\n\n💰 *Total Tagihan:* Rp ${Number(inv.amount || 0).toLocaleString('id-ID')}\n📌 *Status:* *${statusText}*\n\nTerima kasih telah menggunakan layanan *${settings.company_header || 'ALIJAYA NET'}*!`;
+
+    const { sendWADocument, whatsappStatus } = await import('../services/whatsappBot.mjs');
+    if (whatsappStatus.connection !== 'open') {
+      return res.json({ success: false, message: 'Bot WhatsApp belum terhubung' });
+    }
+
+    const sent = await sendWADocument(customer.phone, pdfBuffer, filename, caption);
+    if (sent) {
+      return res.json({ success: true, message: `Invoice PDF berhasil dikirim ke WhatsApp ${customer.name} (${customer.phone})` });
+    } else {
+      return res.json({ success: false, message: 'Gagal mengirim dokumen PDF ke WhatsApp' });
+    }
+  } catch (err) {
+    logger.error(`[Send PDF WA] Error: ${err.message}`);
+    return res.json({ success: false, message: 'Gagal kirim PDF: ' + err.message });
+  }
 });
 
 router.post('/billing/generate', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
@@ -2599,6 +2771,14 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
       throw new Error('Bot WhatsApp belum terhubung. Silakan cek status WhatsApp di menu Admin.');
     }
 
+    const unpaidInvoices = billingSvc.getUnpaidInvoicesByCustomerId(customer.id);
+    const totalTagihan = (unpaidInvoices && unpaidInvoices.length > 0)
+      ? unpaidInvoices.reduce((sum, i) => sum + (Number(i.amount) || 0), 0)
+      : Number(inv.amount || 0);
+    const rincianBulan = (unpaidInvoices && unpaidInvoices.length > 0)
+      ? unpaidInvoices.map(i => `${i.period_month}/${i.period_year}`).join(', ')
+      : `${inv.period_month}/${inv.period_year}`;
+
     let qrisAmountUnique = Number(inv.qris_amount_unique || 0) || 0;
     let qrisCode = Number(inv.qris_unique_code || 0) || 0;
     const qrisQrUrl = String(getSetting('qris_static_qr_url', '') || '').trim();
@@ -2607,9 +2787,10 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
     const qrisEnabled = !(qrisEnabledRaw === false || qrisEnabledRaw === 'false' || qrisEnabledRaw === 0 || qrisEnabledRaw === '0');
     const hasStaticQris = qrisEnabled && (!!qrisQrUrl || !!String(qrisPayloadSetting || '').trim());
 
-    if (hasStaticQris && String(inv.status) === 'unpaid' && (!qrisAmountUnique || !qrisCode)) {
+    const baseAmount = totalTagihan > 0 ? totalTagihan : Number(inv.amount || 0);
+
+    if (hasStaticQris && String(inv.status) === 'unpaid' && (!qrisAmountUnique || !qrisCode || (qrisAmountUnique - qrisCode !== baseAmount))) {
       const invId = Number(inv.id);
-      const baseAmount = Number(inv.amount || 0);
       if (Number.isFinite(invId) && invId > 0 && Number.isFinite(baseAmount) && baseAmount > 0) {
         const exists = db.prepare('SELECT id FROM invoices WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1');
         const update = db.prepare(`
@@ -2618,15 +2799,25 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
           WHERE id=?
         `);
 
-        let chosenCode = 0;
+        let chosenCode = qrisCode > 0 ? qrisCode : 0;
         let chosenAmount = 0;
-        for (let i = 0; i < 50; i++) {
-          const code = 1 + Math.floor(Math.random() * 999);
-          const amount = baseAmount + code;
-          if (!exists.get('unpaid', amount, invId)) {
-            chosenCode = code;
-            chosenAmount = amount;
-            break;
+
+        if (chosenCode > 0) {
+          const pAmt = baseAmount + chosenCode;
+          if (!exists.get('unpaid', pAmt, invId)) {
+            chosenAmount = pAmt;
+          }
+        }
+
+        if (!chosenAmount) {
+          for (let i = 0; i < 50; i++) {
+            const code = 1 + Math.floor(Math.random() * 999);
+            const amount = baseAmount + code;
+            if (!exists.get('unpaid', amount, invId)) {
+              chosenCode = code;
+              chosenAmount = amount;
+              break;
+            }
           }
         }
         if (!chosenAmount) {
@@ -2774,11 +2965,6 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
       return await decodeQrisPayloadFromUploadedQr();
     };
 
-    // Hitung Tagihan
-    const unpaidInvoices = billingSvc.getUnpaidInvoicesByCustomerId(customer.id);
-    const totalTagihan = unpaidInvoices.reduce((sum, i) => sum + i.amount, 0);
-    const rincianBulan = unpaidInvoices.map(i => `${i.period_month}/${i.period_year}`).join(', ');
-    
     // Generate Link Login
     const protocol = req.headers['x-forwarded-proto'] || req.protocol;
     const host = req.get('host');
@@ -2790,39 +2976,47 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
     const loginLink = `${baseUrl}/customer/login`;
 
     const comp = company();
-    const defaultAutoBilling = `Yth. Pelanggan {{nama}},\n\nIni adalah pengingat sebelum tanggal jatuh tempo/isolir.\n\n📦 *Paket:* {{paket}}\n💰 *Total Tagihan:* Rp {{tagihan}}\n📅 *Periode:* {{rincian}}\n\nMohon segera melakukan pembayaran melalui portal pelanggan: {{link}}\n\nTerima kasih atas kerja samanya.\nSalam,\nAdmin ${comp}`;
+    const defaultAutoBilling = `{Halo|Selamat Pagi|Yth.} Pelanggan {{nama}},\n\n{Ini adalah|Berikut} pengingat {sebelum tanggal jatuh tempo|pembayaran tagihan internet} Anda.\n\n📦 *Paket:* {{paket}}\n💰 *Total Tagihan:* Rp {{tagihan}}\n📅 *Periode:* {{rincian}}\n\n{Mohon|Silakan} {segera lakukan|lakukan} pembayaran melalui portal pelanggan: {{link}}\n\n{Terima kasih atas perhatian dan kerja samanya.|Terima kasih.}\nSalam,\nAdmin ${comp}`;
     
-    const defaultQris = `Yth. Pelanggan {{nama}},\n\nBerikut rincian tagihan manual + Kode Bayar QRIS Anda:\n\n📦 *Paket:* {{paket}}\n📅 *Periode:* {{periode}}\n💰 *Nominal:* Rp {{qris_nominal}}\n\nSilakan scan QRIS berikut untuk melakukan pembayaran otomatis:\n{{qris_qr}}\n\nTerima kasih.`;
+    const defaultQris = `{Halo|Selamat Pagi|Yth.} Pelanggan {{nama}},\n\n{Berikut|Ini adalah} rincian tagihan manual + Kode Bayar QRIS Anda:\n\n📦 *Paket:* {{paket}}\n📅 *Periode:* {{periode}}\n💰 *Nominal:* Rp {{qris_nominal}}\n\n{Silakan scan|Mohon scan} QRIS terlampir untuk melakukan pembayaran otomatis:\n{{qris_qr}}\n\nTerima kasih.`;
 
     const templateQris = db.getAppSetting('whatsapp_billing_qris_message', defaultQris);
     const template = db.getAppSetting('whatsapp_auto_billing_message', defaultAutoBilling);
 
     const isQrisCase = (qrisAmountUnique > 0 && qrisCode > 0);
-    const qrisJpgLink = `${baseUrl}/customer/qris/static.jpg?amount=${encodeURIComponent(String(qrisAmountUnique))}`;
-    const qrisPortalLink = `${baseUrl}/customer/payment/create/${encodeURIComponent(String(inv.id))}?method=QRIS_STATIC`;
+    const finalNominal = qrisAmountUnique > 0 ? qrisAmountUnique : totalTagihan;
+    const finalNominalStr = Number(finalNominal).toLocaleString('id-ID');
+
+    const qrisJpgLink = `${baseUrl}/customer/qris/static.jpg?amount=${encodeURIComponent(String(finalNominal))}`;
     const qrisJpgCaption = isQrisCase
       ? templateQris
           .replace(/{{nama}}/gi, customer.name || 'Pelanggan')
-          .replace(/{{periode}}/gi, `${inv.period_month}/${inv.period_year}`)
-          .replace(/{{paket}}/gi, inv.package_name || '-')
-          .replace(/{{qris_nominal}}/gi, Number(qrisAmountUnique).toLocaleString('id-ID'))
+          .replace(/{{periode}}/gi, rincianBulan)
+          .replace(/{{rincian}}/gi, rincianBulan)
+          .replace(/{{paket}}/gi, inv.package_name || customer.package_name || '-')
+          .replace(/{{qris_nominal}}/gi, finalNominalStr)
+          .replace(/{{tagihan}}/gi, finalNominalStr)
           .replace(/{{qris_kode}}/gi, String(qrisCode).padStart(3, '0'))
-          .replace(/{{qris_qr}}/gi, `QRIS terlampir (gambar).\n🔗 QRIS JPG: ${qrisJpgLink}\n🔐 Portal (Download): ${qrisPortalLink}`)
+          .replace(/{{qris_qr}}/gi, `QRIS terlampir (gambar).\n🌐 Portal Pelanggan: ${loginLink}`)
       : '';
 
     const formattedMsg = isQrisCase
       ? templateQris
           .replace(/{{nama}}/gi, customer.name || 'Pelanggan')
-          .replace(/{{periode}}/gi, `${inv.period_month}/${inv.period_year}`)
-          .replace(/{{paket}}/gi, inv.package_name || '-')
-          .replace(/{{qris_nominal}}/gi, Number(qrisAmountUnique).toLocaleString('id-ID'))
+          .replace(/{{periode}}/gi, rincianBulan)
+          .replace(/{{rincian}}/gi, rincianBulan)
+          .replace(/{{paket}}/gi, inv.package_name || customer.package_name || '-')
+          .replace(/{{qris_nominal}}/gi, finalNominalStr)
+          .replace(/{{tagihan}}/gi, finalNominalStr)
           .replace(/{{qris_kode}}/gi, String(qrisCode).padStart(3, '0'))
-          .replace(/{{qris_qr}}/gi, `🔗 QRIS JPG: ${qrisJpgLink}\n🔐 Portal (Download): ${qrisPortalLink}`)
+          .replace(/{{qris_qr}}/gi, `🔗 Link QRIS JPG: ${qrisJpgLink}\n🌐 Portal Pelanggan: ${loginLink}`)
       : template
           .replace(/{{nama}}/gi, customer.name || 'Pelanggan')
-          .replace(/{{tagihan}}/gi, totalTagihan.toLocaleString('id-ID'))
-          .replace(/{{rincian}}/gi, rincianBulan || '-')
-          .replace(/{{paket}}/gi, inv.package_name || '-')
+          .replace(/{{tagihan}}/gi, finalNominalStr)
+          .replace(/{{qris_nominal}}/gi, finalNominalStr)
+          .replace(/{{periode}}/gi, rincianBulan)
+          .replace(/{{rincian}}/gi, rincianBulan)
+          .replace(/{{paket}}/gi, inv.package_name || customer.package_name || '-')
           .replace(/{{link}}/gi, loginLink);
 
     let sent = false;
@@ -2830,9 +3024,7 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
       try {
         const payloadNorm = await resolveQrisStaticPayload();
         if (payloadNorm) {
-          const dynamic = convertStaticQrisToDynamic(payloadNorm, qrisAmountUnique);
-          const png = await QRCode.toBuffer(dynamic, { errorCorrectionLevel: 'M', margin: 1, width: 420, type: 'png' });
-          const jpg = await Jimp.read(png).then(img => img.quality(90).background(0xffffffff).getBufferAsync(Jimp.MIME_JPEG));
+          const jpg = await qrisUtil.buildDynamicQrisJpgBuffer(payloadNorm, qrisAmountUnique);
           sent = await sendWAImage(customer.phone, jpg, qrisJpgCaption);
         }
       } catch (e) {
@@ -2868,19 +3060,121 @@ router.get('/tickets', requireAdminSession, requireSidebarMenuAccess('tickets'),
   const { status = 'all' } = req.query;
   const tickets = ticketSvc.getAllTickets(status);
   const stats = ticketSvc.getTicketStats();
+  const customers = customerSvc.getAllCustomers();
+  const techSvc = require('../services/techService');
+  const technicians = techSvc.getAllTechnicians().filter(t => t.is_active === 1);
+  
   res.render('admin/tickets', {
-    title: 'Keluhan Pelanggan', company: company(), activePage: 'tickets',
-    tickets, stats, filterStatus: status, msg: flashMsg(req)
+    title: 'Keluhan & Tugas Teknisi', company: company(), activePage: 'tickets',
+    tickets, stats, customers, technicians, filterStatus: status, msg: flashMsg(req)
   });
+});
+
+router.post('/tickets/create', requireAdminSession, express.urlencoded({ extended: true }), async (req, res) => {
+  try {
+    const { customer_id, subject, message, technician_id, status } = req.body;
+    if (!subject || !message) {
+      req.session._msg = { type: 'error', text: 'Subjek dan Detail Pesan wajib diisi.' };
+      return res.redirect('/admin/tickets');
+    }
+
+    const custId = customer_id ? parseInt(customer_id, 10) : 0;
+    const techId = technician_id ? parseInt(technician_id, 10) : null;
+    const ticketStatus = status || (techId ? 'in_progress' : 'open');
+
+    const result = ticketSvc.createTicket(custId, subject, message, {
+      technicianId: techId,
+      status: ticketStatus
+    });
+
+    const ticketId = result.lastInsertRowid;
+    req.session._msg = { type: 'success', text: 'Tiket/tugas baru berhasil dibuat!' };
+
+    // --- WHATSAPP NOTIFICATION FOR NEW ADMIN CREATED TICKET ---
+    try {
+      const settings = getSettings();
+      if (settings.whatsapp_enabled) {
+        const { sendWA } = await import('../services/whatsappBot.mjs');
+        const cust = custId ? customerSvc.getCustomerById(custId) : null;
+        const techSvc = require('../services/techService');
+        const tech = techId ? techSvc.getTechnicianById(techId) : null;
+
+        const custName = cust ? cust.name : 'Tugas Umum / Maintenance Admin';
+        const custPhone = cust ? cust.phone : '-';
+        const custAddr = cust ? cust.address : '-';
+
+        const waMsg = `📌 *TUGAS TEKNISI BARU DARI ADMIN*\n\n` +
+                     `🎫 *ID Tiket:* #${ticketId}\n` +
+                     `👤 *Pelanggan/Objek:* ${custName}\n` +
+                     `📞 *Kontak:* ${custPhone}\n` +
+                     `📍 *Alamat:* ${custAddr}\n` +
+                     `📝 *Kendala/Tugas:* ${subject}\n` +
+                     `💬 *Detail Pesan:* ${message}\n\n` +
+                     `Silakan cek di portal teknisi/admin untuk menindaklanjuti.`;
+
+        // Send to assigned technician or broadcast to all active technicians if not assigned
+        if (tech && tech.phone) {
+          let digits = String(tech.phone).replace(/\D/g, '');
+          if (digits.startsWith('0')) digits = '62' + digits.slice(1);
+          await sendWA(digits, waMsg);
+        } else if (!techId) {
+          const technicians = techSvc.getAllTechnicians().filter(t => t.is_active === 1 && t.phone);
+          for (const t of technicians) {
+            let digits = String(t.phone).replace(/\D/g, '');
+            if (digits.startsWith('0')) digits = '62' + digits.slice(1);
+            await sendWA(digits, waMsg);
+          }
+        }
+      }
+    } catch (waErr) {
+      console.error(`[AdminPortal] WA Ticket Create Notification Error: ${waErr.message}`);
+    }
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal membuat tiket: ' + e.message };
+  }
+  res.redirect('/admin/tickets');
 });
 
 router.post('/tickets/:id/update', requireAdminSession, express.urlencoded({ extended: true }), async (req, res) => {
   try {
-    const { status } = req.body;
+    const { status, technician_id } = req.body;
     const ticketId = req.params.id;
+    const oldTicket = ticketSvc.getTicketById(ticketId);
     
-    ticketSvc.updateTicketStatus(ticketId, status);
-    req.session._msg = { type: 'success', text: 'Status keluhan berhasil diperbarui.' };
+    const techId = (technician_id && parseInt(technician_id, 10) > 0) ? parseInt(technician_id, 10) : null;
+    ticketSvc.updateTicketStatus(ticketId, status, techId);
+    req.session._msg = { type: 'success', text: 'Status & penugasan keluhan berhasil diperbarui.' };
+
+    // --- WHATSAPP NOTIFICATION IF TECHNICIAN IS ASSIGNED / CHANGED ---
+    if (techId && (!oldTicket || Number(oldTicket.technician_id) !== techId)) {
+      try {
+        const settings = getSettings();
+        if (settings.whatsapp_enabled) {
+          const { sendWA } = await import('../services/whatsappBot.mjs');
+          const techSvc = require('../services/techService');
+          const newTech = techSvc.getTechnicianById(techId);
+          const updatedTicket = ticketSvc.getTicketById(ticketId);
+
+          if (newTech && newTech.phone && updatedTicket) {
+            let digits = String(newTech.phone).replace(/\D/g, '');
+            if (digits.startsWith('0')) digits = '62' + digits.slice(1);
+            
+            const waMsg = `📌 *PENUGASAN TIKET OLEH ADMIN*\n\n` +
+                         `🎫 *ID Tiket:* #${updatedTicket.id}\n` +
+                         `👤 *Pelanggan/Objek:* ${updatedTicket.customer_name}\n` +
+                         `📞 *Kontak:* ${updatedTicket.customer_phone || '-'}\n` +
+                         `📍 *Alamat:* ${updatedTicket.customer_address || '-'}\n` +
+                         `📝 *Kendala/Tugas:* ${updatedTicket.subject}\n` +
+                         `💬 *Detail Pesan:* ${updatedTicket.message}\n` +
+                         `📊 *Status:* ${status}\n\n` +
+                         `Silakan cek portal teknisi untuk memproses tugas ini.`;
+            await sendWA(digits, waMsg);
+          }
+        }
+      } catch (waErr) {
+        console.error(`[AdminPortal] WA Assign Notification Error: ${waErr.message}`);
+      }
+    }
 
     // --- WHATSAPP NOTIFICATION FOR RESOLVED TICKET (BY ADMIN) ---
     if (status === 'resolved') {
@@ -3224,6 +3518,31 @@ router.post('/settings/qris-upload', requireAdminSession, qrisUpload.single('qri
   res.redirect('/admin/settings');
 });
 
+router.post('/settings/logo-upload', requireAdminSession, qrisUpload.single('logo_file'), async (req, res) => {
+  try {
+    const f = req.file;
+    if (!f || !f.buffer || !f.originalname) throw new Error('File logo tidak ditemukan');
+
+    const ext = String(path.extname(f.originalname || '') || '').toLowerCase();
+    const allowedExt = new Set(['.png', '.jpg', '.jpeg', '.webp']);
+    const allowedMime = new Set(['image/png', 'image/jpeg', 'image/webp']);
+    if (!allowedExt.has(ext) || !allowedMime.has(String(f.mimetype || '').toLowerCase())) {
+      throw new Error('Format file tidak didukung. Gunakan PNG/JPG/WebP');
+    }
+
+    const dir = path.join(__dirname, '../public/img');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    const fullPath = path.join(dir, 'logo.png');
+    fs.writeFileSync(fullPath, f.buffer);
+
+    req.session._msg = { type: 'success', text: 'Logo aplikasi berhasil diperbarui!' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal upload logo: ' + (e?.message || e) };
+  }
+  res.redirect('/admin/settings');
+});
+
 router.get('/digiflazz', requireAdminSession, requireSidebarMenuAccess('digiflazz'), restrictToAdmin, async (req, res) => {
   const settings = getSettings();
   const protocol = req.headers['x-forwarded-proto'] || req.protocol;
@@ -3433,7 +3752,8 @@ router.post('/update/run', requireAdminSession, restrictToAdmin, (req, res) => {
     { label: 'settings.json', relativePath: 'settings.json', cleanExclude: 'settings.json' },
     { label: '.env', relativePath: '.env', cleanExclude: '.env' },
     { label: 'database', relativePath: 'database', cleanExclude: 'database' },
-    { label: 'public', relativePath: 'public', cleanExclude: 'public' },
+    { label: 'public/uploads', relativePath: 'public/uploads', cleanExclude: 'public/uploads' },
+    { label: 'public/img', relativePath: 'public/img', cleanExclude: 'public/img' },
     { label: authFolder, relativePath: authFolder, cleanExclude: authFolder.replace(/\\/g, '/') },
     { label: 'data', relativePath: 'data', cleanExclude: 'data' }
   ];
@@ -3538,9 +3858,18 @@ router.post('/update/run', requireAdminSession, restrictToAdmin, (req, res) => {
 
     restorePreservedFiles('post-update');
 
-    const npm = runCmd('npm', ['install'], repoRoot);
-    pushCmd('npm install', npm);
-    if (!npm.ok) throw new Error('Update berhasil, tetapi npm install gagal.');
+    // Cek apakah package.json berubah sebelum install
+    const pkgDiff = runCmd('git', ['diff', 'HEAD@{1}', 'HEAD', '--', 'package.json'], repoRoot);
+    const pkgChanged = pkgDiff.ok && String(pkgDiff.stdout || '').trim().length > 0;
+
+    if (pkgChanged) {
+      log.push('$ package.json berubah, menjalankan npm install (Low-CPU Mode)...');
+      const npm = runCmd('npm', ['install', '--omit=dev', '--no-audit', '--no-fund', '--prefer-offline'], repoRoot);
+      pushCmd('npm install --omit=dev --no-audit --no-fund --prefer-offline', npm);
+      if (!npm.ok) throw new Error('Update berhasil, tetapi npm install gagal.');
+    } else {
+      log.push('$ package.json tidak berubah, npm install dilewati (Hemat CPU & Waktu!).');
+    }
 
     const localAfter = readTextFileSafe(versionPath) || '-';
     req.session._msg = { type: 'success', text: `Update selesai. Versi: ${localBefore} → ${localAfter}. Silakan restart aplikasi.` };
@@ -3669,6 +3998,32 @@ router.get('/backup', requireAdminSession, requireSidebarMenuAccess('backup'), (
   });
 });
 
+router.get('/backup/download/:fileName', requireAdminSession, (req, res) => {
+  try {
+    const rawFileName = req.params.fileName;
+    const fileName = path.basename(rawFileName);
+    const backupDir = path.join(__dirname, '../backups');
+    const filePath = path.join(backupDir, fileName);
+
+    if (!fs.existsSync(filePath)) {
+      req.session._msg = { type: 'error', text: 'File backup tidak ditemukan.' };
+      return res.redirect('/admin/backup');
+    }
+
+    res.download(filePath, fileName, (err) => {
+      if (err && !res.headersSent) {
+        logger.error(`[Backup] Error downloading file ${fileName}:`, err);
+        req.session._msg = { type: 'error', text: 'Gagal mendownload file backup.' };
+        res.redirect('/admin/backup');
+      }
+    });
+  } catch (e) {
+    logger.error('[Backup] Download error:', e);
+    req.session._msg = { type: 'error', text: 'Gagal mendownload backup: ' + e.message };
+    res.redirect('/admin/backup');
+  }
+});
+
 router.post('/backup/create', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
   try {
     const { type } = req.body;
@@ -3717,6 +4072,63 @@ router.post('/backup/restore', requireAdminSession, express.urlencoded({ extende
     }
   } catch (e) {
     req.session._msg = { type: 'error', text: `Gagal: ${e.message}` };
+  }
+  res.redirect('/admin/backup');
+});
+
+router.post('/backup/upload-restore', requireAdminSession, upload.single('backupFile'), (req, res) => {
+  try {
+    const file = req.file;
+    if (!file || !file.buffer || !file.originalname) {
+      throw new Error('File backup tidak ditemukan.');
+    }
+
+    const originalName = path.basename(file.originalname);
+    const ext = path.extname(originalName).toLowerCase();
+    const timestamp = Date.now();
+    const backupDir = path.join(__dirname, '../backups');
+
+    if (!fs.existsSync(backupDir)) {
+      fs.mkdirSync(backupDir, { recursive: true });
+    }
+
+    let result;
+    let savedFileName = '';
+
+    if (ext === '.db' || ext === '.sqlite' || originalName.includes('billing_db')) {
+      savedFileName = `uploaded_db_${timestamp}_${originalName}`;
+      const savePath = path.join(backupDir, savedFileName);
+      fs.writeFileSync(savePath, file.buffer);
+      result = backupSvc.restoreDatabase(savedFileName);
+    } else if (ext === '.json' || originalName.includes('settings')) {
+      savedFileName = `uploaded_settings_${timestamp}_${originalName}`;
+      const savePath = path.join(backupDir, savedFileName);
+      fs.writeFileSync(savePath, file.buffer);
+
+      // Verify JSON validity before restoring settings
+      try {
+        JSON.parse(file.buffer.toString('utf8'));
+      } catch (jsonErr) {
+        fs.unlinkSync(savePath);
+        throw new Error('Format JSON file settings tidak valid: ' + jsonErr.message);
+      }
+
+      result = backupSvc.restoreSettings(savedFileName);
+    } else {
+      throw new Error('Format file tidak didukung. Harap upload file .db (database) atau .json (settings).');
+    }
+
+    if (result && result.success) {
+      req.session._msg = { 
+        type: 'success', 
+        text: `File backup "${originalName}" berhasil di-upload dan di-restore! Backup otomatis sebelum restore telah dibuat (${result.preRestoreBackup || '-'}).` 
+      };
+    } else {
+      req.session._msg = { type: 'error', text: `Gagal restore: ${result ? result.error : 'Error tidak diketahui'}` };
+    }
+  } catch (e) {
+    logger.error('[Backup] Upload & restore error:', e);
+    req.session._msg = { type: 'error', text: 'Gagal upload & restore: ' + e.message };
   }
   res.redirect('/admin/backup');
 });
@@ -3970,14 +4382,22 @@ router.get('/api/stats', requireAdmin, async (req, res) => {
   try {
     const result = await customerDevice.listAllDevices(999999);
     if (!result.ok) return res.json({ error: result.message });
+    const mikrotikService = require('../services/mikrotikService');
+    const activeSessionsMap = await mikrotikService.getActivePppoeSessionsMap().catch(() => new Map());
+
     const devices = result.devices;
     const total = devices.length;
     let online = 0, offline = 0;
-    const now = Date.now();
+
     devices.forEach(d => {
-      if (d._lastInform && (now - new Date(d._lastInform).getTime()) < 15 * 60 * 1000) online++;
+      const pppoeUser = customerDevice.extractPppoeUser(d);
+      const isPppoeActive = pppoeUser && pppoeUser !== 'N/A' && pppoeUser !== '-' && activeSessionsMap.has(pppoeUser.toLowerCase());
+      const mapped = customerDevice.mapDeviceData(d, d._tags?.[0] || d._id, isPppoeActive) || {};
+      const status = String(mapped.status || 'offline').toLowerCase();
+      if (status === 'online') online++;
       else offline++;
     });
+
     res.json({ total, online, offline, warning: 0, lastUpdate: getNowLocalISO() });
   } catch (e) {
     res.status(500).json({ error: 'Failed to get stats', detail: e.message });
@@ -4173,10 +4593,31 @@ router.get('/api/mikrotik/users', requireAdmin, async (req, res) => {
 
 // ─── MIKROTIK MONITORING ───────────────────────────────────────────────────
 router.get('/mikrotik', requireAdminSession, requireSidebarMenuAccess('mikrotik'), (req, res) => {
-  // Hanya gunakan router dari settings.json (tidak dari database)
+  const dbRouters = mikrotikService.getAllRouters();
   const settings = getSettings();
-  const router = {
-    id: null, // null = router dari settings.json
+  const settingsRouter = {
+    id: '',
+    name: settings.mikrotik_host ? `MikroTik (settings.json - ${settings.mikrotik_host})` : 'MikroTik (settings.json)',
+    host: settings.mikrotik_host || '',
+    user: settings.mikrotik_user || '',
+    port: settings.mikrotik_port || 8728,
+    is_active: true
+  };
+  
+  const routers = dbRouters.length > 0 ? dbRouters : [settingsRouter];
+  const activeRouterId = req.selectedRouterId || (routers[0] ? routers[0].id : '');
+
+  res.render('admin/mikrotik', {
+    title: 'Monitoring MikroTik', company: company(), activePage: 'mikrotik',
+    routers, activeRouterId, selectedRouterId: req.selectedRouterId, msg: flashMsg(req)
+  });
+});
+
+router.get('/mikrotik/display', requireAdminSession, (req, res) => {
+  const routers = mikrotikService.getAllRouters();
+  const settings = getSettings();
+  const defaultRouter = {
+    id: 'settings_json',
     name: 'MikroTik (settings.json)',
     host: settings.mikrotik_host || '',
     user: settings.mikrotik_user || '',
@@ -4184,19 +4625,23 @@ router.get('/mikrotik', requireAdminSession, requireSidebarMenuAccess('mikrotik'
     is_active: true
   };
   
-  const routers = [router]; // Hanya 1 router
-  
-  res.render('admin/mikrotik', {
-    title: 'Monitoring MikroTik', company: company(), activePage: 'mikrotik',
-    routers, msg: flashMsg(req)
+  const allRouters = [defaultRouter, ...routers];
+
+  res.render('admin/mikrotik_display', {
+    title: 'MikroTik NOC Display',
+    company: company(),
+    routers: allRouters,
+    msg: flashMsg(req),
+    settings
   });
 });
 
 router.get('/vouchers', requireAdminSession, (req, res) => {
   const routers = mikrotikService.getAllRouters();
+  const selectedRouterId = req.selectedRouterId || (req.query.router_id ? Number(req.query.router_id) : null);
   res.render('admin/vouchers', {
     title: 'Manajemen Voucher', company: company(), activePage: 'mikrotik',
-    routers, msg: flashMsg(req), settings: getSettings()
+    routers, selectedRouterId, msg: flashMsg(req), settings: getSettings()
   });
 });
 
@@ -4798,6 +5243,106 @@ router.post('/api/mikrotik/hotspot-users/:id/delete', requireAdmin, async (req, 
   try { await mikrotikService.deleteHotspotUser(req.params.id, req.query.routerId); res.json({ success: true }); } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+router.get('/api/mikrotik/monitoring-display-data', requireAdmin, async (req, res) => {
+  const routerId = req.query.routerId ? (req.query.routerId === 'null' || req.query.routerId === 'settings' || req.query.routerId === 'settings_json' ? 'settings_json' : Number(req.query.routerId)) : 'settings_json';
+  try {
+    const conn = await mikrotikService.getConnection(routerId);
+    if (!conn) {
+      return res.status(500).json({ error: 'Gagal terhubung ke router MikroTik.' });
+    }
+
+    // Parallel execution for performance
+    const [
+      resource,
+      interfaces,
+      activePppoe,
+      secrets,
+      activeHotspot,
+      hotspotUsers
+    ] = await Promise.all([
+      // 1. Resources
+      mikrotikService.getSystemResource(routerId).catch(err => {
+        logger.error('[NOC Display] Error resource:', err.message);
+        return null;
+      }),
+      // 2. Interfaces
+      conn.client.menu('/interface').get().catch(err => {
+        logger.error('[NOC Display] Error interfaces:', err.message);
+        return [];
+      }),
+      // 3. Active PPPoE
+      mikrotikService.getPppoeActive(routerId).catch(err => {
+        logger.error('[NOC Display] Error active PPPoE:', err.message);
+        return [];
+      }),
+      // 4. PPPoE Secrets
+      mikrotikService.getPppoeSecrets(routerId).catch(err => {
+        logger.error('[NOC Display] Error secrets:', err.message);
+        return [];
+      }),
+      // 5. Active Hotspot
+      mikrotikService.getHotspotActive(routerId).catch(err => {
+        logger.error('[NOC Display] Error active Hotspot:', err.message);
+        return [];
+      }),
+      // 6. Hotspot Users
+      mikrotikService.getHotspotUsers(routerId).catch(err => {
+        logger.error('[NOC Display] Error hotspot users:', err.message);
+        return [];
+      })
+    ]);
+
+    // Calculate PPPoE Offline
+    const activePppoeNames = new Set((activePppoe || []).map(s => String(s.name).trim()));
+    const offlinePppoe = (secrets || []).filter(s => {
+      const isOnline = activePppoeNames.has(String(s.name).trim());
+      const isDisabled = s.disabled === true || s.disabled === 'true';
+      return !isOnline && !isDisabled;
+    });
+
+    // Format resources
+    const resData = {
+      cpu: resource ? String(resource['cpu-load'] || resource.cpuLoad || resource['cpu'] || '0') : '0',
+      freeMemory: resource ? Number(resource['free-memory'] || resource.freeMemory) || 0 : 0,
+      totalMemory: resource ? Number(resource['total-memory'] || resource.totalMemory) || 0 : 0,
+      uptime: resource ? String(resource['uptime'] || '00:00:00') : '00:00:00',
+      boardName: resource ? String(resource['board-name'] || resource.boardName || 'MikroTik') : 'MikroTik',
+      version: resource ? String(resource['version'] || 'N/A') : 'N/A'
+    };
+
+    // Format interfaces (only return fields needed)
+    const formattedInterfaces = (interfaces || []).map(i => {
+      return {
+        name: i.name,
+        type: i.type,
+        running: i.running === true || i.running === 'true' || i.running === 'yes',
+        disabled: i.disabled === true || i.disabled === 'true' || i.disabled === 'yes',
+        bytesIn: Number(i['rx-byte'] || i['rx-bytes'] || i['bytes-in']) || 0,
+        bytesOut: Number(i['tx-byte'] || i['tx-bytes'] || i['bytes-out']) || 0
+      };
+    });
+
+    res.json({
+      ok: true,
+      resources: resData,
+      interfaces: formattedInterfaces,
+      pppoe: {
+        active: activePppoe ? activePppoe.length : 0,
+        offline: offlinePppoe ? offlinePppoe.length : 0,
+        total: secrets ? secrets.length : 0
+      },
+      hotspot: {
+        active: activeHotspot ? activeHotspot.length : 0,
+        total: hotspotUsers ? hotspotUsers.length : 0
+      },
+      timestamp: Date.now()
+    });
+  } catch (e) {
+    logger.error('[NOC Display API] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.get('/api/mikrotik/hotspot-profiles', requireAdmin, async (req, res) => {
   try { res.json(await mikrotikService.getHotspotProfiles(req.query.routerId)); } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -4981,10 +5526,91 @@ function isTemporaryError(errorMessage) {
 // Global message history untuk duplicate detection
 global.broadcastMessageHistory = new Map();
 
+const waSvc = require('../services/whatsappService');
+
 router.get('/whatsapp', requireAdminSession, requireSidebarMenuAccess('whatsapp'), async (req, res) => {
+  const waGatewayType = getSetting('wa_gateway_type', 'baileys');
+  const metaSettings = {
+    meta_phone_number_id: getSetting('meta_phone_number_id', ''),
+    meta_waba_id: getSetting('meta_waba_id', ''),
+    meta_access_token: getSetting('meta_access_token', ''),
+    meta_verify_token: getSetting('meta_verify_token', 'antigravity_meta_wa_secret'),
+    meta_business_phone: getSetting('meta_business_phone', '')
+  };
+
   res.render('admin/whatsapp', {
-    title: 'Status WhatsApp', company: company(), activePage: 'whatsapp', msg: flashMsg(req)
+    title: 'Status WhatsApp',
+    company: company(),
+    activePage: 'whatsapp',
+    msg: flashMsg(req),
+    waGatewayType,
+    metaSettings,
+    host: req.get('host') || 'localhost:3001'
   });
+});
+
+router.post('/whatsapp/gateway-settings', requireAdminSession, express.urlencoded({ extended: true }), async (req, res) => {
+  try {
+    const { wa_gateway_type, meta_phone_number_id, meta_waba_id, meta_access_token, meta_verify_token, meta_business_phone } = req.body;
+    saveSettings({
+      wa_gateway_type: wa_gateway_type || 'baileys',
+      meta_phone_number_id: String(meta_phone_number_id || '').trim(),
+      meta_waba_id: String(meta_waba_id || '').trim(),
+      meta_access_token: String(meta_access_token || '').trim(),
+      meta_verify_token: String(meta_verify_token || '').trim() || 'antigravity_meta_wa_secret',
+      meta_business_phone: String(meta_business_phone || '').trim()
+    });
+    req.session._msg = { type: 'success', text: 'Pengaturan WhatsApp Gateway & Meta Cloud API berhasil disimpan.' };
+  } catch (e) {
+    req.session._msg = { type: 'danger', text: 'Gagal menyimpan pengaturan: ' + e.message };
+  }
+  res.redirect('/admin/whatsapp');
+});
+
+// LIVE CHAT ROUTES
+router.get('/whatsapp/live-chat', requireAdminSession, requireSidebarMenuAccess('whatsapp'), async (req, res) => {
+  const waGatewayType = getSetting('wa_gateway_type', 'baileys');
+  const customers = customerSvc.getAllCustomers();
+  res.render('admin/whatsapp_live_chat', {
+    title: 'Live Chat WhatsApp',
+    company: company(),
+    activePage: 'whatsapp_live_chat',
+    msg: flashMsg(req),
+    gatewayType: waGatewayType,
+    customers: customers || []
+  });
+});
+
+router.get('/api/whatsapp/conversations', requireAdminSession, (req, res) => {
+  try {
+    const list = waSvc.getRecentConversations(50);
+    res.json({ ok: true, conversations: list });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/whatsapp/messages', requireAdminSession, (req, res) => {
+  try {
+    const phone = req.query.phone || '';
+    const list = waSvc.getChatHistory(phone, 100);
+    res.json({ ok: true, messages: list });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.post('/api/whatsapp/send-direct', requireAdminSession, express.json(), async (req, res) => {
+  try {
+    const { phone, message } = req.body;
+    if (!phone || !message) return res.status(400).json({ success: false, error: 'Nomor dan pesan tidak boleh kosong' });
+
+    await waSvc.sendWhatsAppMessage(phone, message);
+    res.json({ success: true, message: 'Pesan WhatsApp terkirim' });
+  } catch (e) {
+    const errorText = e?.message || (typeof e === 'string' ? e : JSON.stringify(e));
+    res.status(500).json({ success: false, error: errorText });
+  }
 });
 
 router.get('/whatsapp/templates', requireAdminSession, requireSidebarMenuAccess('whatsapp'), async (req, res) => {
@@ -5136,8 +5762,6 @@ router.post('/whatsapp/broadcast', requireAdminSession, express.urlencoded({ ext
     if (uniqueCustomers.length === 0) {
       throw new Error('Tidak ada nomor pelanggan yang valid untuk target tersebut.');
     }
-
-    const { sendWA } = await import('../services/whatsappBot.mjs');
     
     // Initialize Tracker dengan Smart Rate Limit
     global.broadcastStatus = {
@@ -5155,71 +5779,56 @@ router.post('/whatsapp/broadcast', requireAdminSession, express.urlencoded({ ext
 
     const sendMessageAsync = async () => {
       let batchCount = 0;
+      let windowStartTime = Date.now();
       let messagesInCurrentHour = 0;
-      let hourStartTime = Date.now();
-      
+
       for (let i = 0; i < uniqueCustomers.length; i++) {
-        // Cek jika broadcast dihentikan
         if (global.broadcastStatus.stopped) {
-          logger.info('[Broadcast] Broadcast dihentikan oleh admin.');
+          logger.info('[Broadcast] Dihentikan oleh admin.');
           break;
         }
-        
-        // Cek jika broadcast dipause
+
         while (global.broadcastStatus.paused) {
-          await new Promise(r => setTimeout(r, 2000));
+          await new Promise(r => setTimeout(r, 1000));
           if (global.broadcastStatus.stopped) break;
         }
-        
         if (global.broadcastStatus.stopped) break;
 
-        // Hourly Rate Limiting
-        const elapsedHour = Date.now() - hourStartTime;
-        if (elapsedHour >= 3600000) { // 1 jam
+        // Rate Limiting: Cek batas per jam
+        const now = Date.now();
+        if (now - windowStartTime >= 3600000) {
+          windowStartTime = now;
           messagesInCurrentHour = 0;
-          hourStartTime = Date.now();
+          global.broadcastStatus.messagesPerHour = 0;
         }
-        
+
         if (messagesInCurrentHour >= hourlyLimit) {
-          const waitTime = 3600000 - elapsedHour;
-          logger.info(`[Broadcast] Hourly limit tercapai (${hourlyLimit} pesan). Menunggu ${Math.floor(waitTime / 60000)} menit...`);
-          await new Promise(r => setTimeout(r, waitTime));
+          const waitTimeMs = 3600000 - (now - windowStartTime);
+          logger.info(`[Broadcast] Batas per jam tercapai (${hourlyLimit} pesan). Menunggu ${Math.ceil(waitTimeMs / 60000)} menit...`);
+          await new Promise(r => setTimeout(r, waitTimeMs));
+          windowStartTime = Date.now();
           messagesInCurrentHour = 0;
-          hourStartTime = Date.now();
+          global.broadcastStatus.messagesPerHour = 0;
         }
 
         const cust = uniqueCustomers[i];
         let attemptCount = 0;
         const maxAttempts = 3;
-        
+
         while (attemptCount < maxAttempts) {
           try {
             // Smart Random Delay
             const randomDelay = getRandomDelay(baseDelayMs, 2000);
             await new Promise(r => setTimeout(r, randomDelay));
-            
-            // Hitung Tagihan
-            const unpaidInvoices = billingSvc.getUnpaidInvoicesByCustomerId(cust.id);
-            const totalTagihan = unpaidInvoices.reduce((sum, inv) => sum + inv.amount, 0);
-            const rincianBulan = unpaidInvoices.map(inv => `${inv.period_month}/${inv.period_year}`).join(', ');
-            
-            // Generate Link Login
-            const protocol = req.protocol;
-            const host = req.get('host');
-            const loginLink = `${protocol}://${host}/customer/login`;
 
-            // Format Pesan dengan variation untuk menghindari spam detection
-            let formattedMsg = message
-              .replace(/{{nama}}/gi, cust.name || 'Pelanggan')
-              .replace(/{{tagihan}}/gi, totalTagihan.toLocaleString('id-ID'))
-              .replace(/{{rincian}}/gi, rincianBulan || '-')
-              .replace(/{{paket}}/gi, cust.package_name || '-')
-              .replace(/{{link}}/gi, loginLink);
-            
-            // Add subtle variation untuk menghindari spam detection
+            // Format Pesan dengan Spintax
+            let formattedMsg = message.replace(/{{nama}}/gi, cust.name || 'Pelanggan');
+
+            const { parseSpintax } = await import('../services/whatsappBot.mjs');
+            formattedMsg = parseSpintax(formattedMsg);
             formattedMsg = addMessageVariation(formattedMsg, i);
 
-            await sendWA(cust.phone, formattedMsg);
+            await waSvc.sendWhatsAppMessage(cust.phone, formattedMsg);
             global.broadcastStatus.sent++;
             messagesInCurrentHour++;
             global.broadcastStatus.messagesPerHour = messagesInCurrentHour;
@@ -5297,8 +5906,15 @@ router.post('/whatsapp/auto-billing', requireAdminSession, express.urlencoded({ 
 
 router.get('/api/whatsapp/status', requireAdmin, async (req, res) => {
     try {
-      const { whatsappStatus } = await import('../services/whatsappBot.mjs');
-      res.json(whatsappStatus);
+      const gatewayType = getSetting('wa_gateway_type', 'baileys');
+      if (gatewayType === 'meta') {
+        const phoneId = getSetting('meta_phone_number_id', '');
+        const token = getSetting('meta_access_token', '');
+        res.json({ connection: (phoneId && token) ? 'open' : 'connecting', gateway: 'meta' });
+      } else {
+        const { whatsappStatus } = await import('../services/whatsappBot.mjs');
+        res.json(whatsappStatus);
+      }
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
@@ -5310,15 +5926,26 @@ router.post('/whatsapp/test-notification', requireAdminSession, async (req, res)
     if (whatsappStatus.connection !== 'open') {
       throw new Error('Bot WhatsApp belum terhubung. Silakan scan QR hingga status Terhubung.');
     }
-    const adminPhone = '08977345640';
+    const adminNumbers = getSetting('whatsapp_admin_numbers', []);
+    const legacyNumbers = getSetting('admins', []);
+    let adminPhone = '08977345640'; // fallback
+    if (Array.isArray(adminNumbers) && adminNumbers.length > 0) {
+      adminPhone = adminNumbers[0];
+    } else if (Array.isArray(legacyNumbers) && legacyNumbers.length > 0) {
+      adminPhone = legacyNumbers[0];
+    }
+
+    logger.info(`[WA Test] Mengirim test notifikasi ke nomor admin: ${adminPhone}`);
     const msg =
       `🧪 *TEST NOTIFIKASI WHATSAPP*\n\n` +
       `✅ Jika pesan ini masuk, berarti notifikasi WhatsApp dari Billing System sudah berfungsi.\n` +
       `📅 Waktu: ${getNowLocal()}`;
     const ok = await sendWA(adminPhone, msg);
     if (!ok) throw new Error('Gagal mengirim pesan test (sendWA=false).');
-    req.session._msg = { type: 'success', text: 'Test notifikasi WhatsApp berhasil dikirim.' };
+    logger.info(`[WA Test] Test notifikasi sukses terkirim ke ${adminPhone}`);
+    req.session._msg = { type: 'success', text: 'Test notifikasi WhatsApp berhasil dikirim ke ' + adminPhone };
   } catch (e) {
+    logger.error(`[WA Test] Gagal mengirim test notifikasi: ${e.message}`);
     req.session._msg = { type: 'error', text: 'Gagal kirim test WhatsApp: ' + e.message };
   }
   res.redirect('/admin/whatsapp');
@@ -5549,6 +6176,105 @@ router.get('/api/routers/:id/test', requireAdmin, async (req, res) => {
   }
 });
 
+router.get('/api/routers/:id/details', requireAdmin, async (req, res) => {
+  try {
+    const routerId = req.params.id;
+    const routerConfig = mikrotikService.getRouterById(routerId);
+    if (!routerConfig) return res.status(404).json({ success: false, error: 'Router tidak ditemukan' });
+
+    let liveData = {
+      connected: false,
+      identity: routerConfig.name || 'MikroTik',
+      version: '-',
+      boardName: '-',
+      cpuLoad: 0,
+      freeMemory: 0,
+      totalMemory: 0,
+      freeHdd: 0,
+      totalHdd: 0,
+      uptime: '-',
+      architecture: '-',
+      cpuCount: 1,
+      cpuFrequency: 0,
+      activePppoe: 0,
+      activeHotspot: 0,
+      customersCount: 0,
+      error: null
+    };
+
+    try {
+      const allRouters = mikrotikService.getAllRouters();
+      const firstRouter = allRouters && allRouters.length > 0 ? allRouters[0] : null;
+      let countRes;
+      if (firstRouter && Number(firstRouter.id) === Number(routerId)) {
+        countRes = db.prepare('SELECT COUNT(*) as total FROM customers WHERE router_id = ? OR router_id IS NULL OR router_id = 0').get(routerId);
+      } else {
+        countRes = db.prepare('SELECT COUNT(*) as total FROM customers WHERE router_id = ?').get(routerId);
+      }
+      liveData.customersCount = countRes ? countRes.total : 0;
+    } catch (e) {
+      liveData.customersCount = 0;
+    }
+
+    try {
+      const resource = await mikrotikService.getSystemResource(routerId);
+      if (resource) {
+        liveData.connected = true;
+        liveData.cpuLoad = parseInt(resource['cpu-load'] || resource.cpuLoad || 0);
+        liveData.freeMemory = parseInt(resource['free-memory'] || resource.freeMemory || 0);
+        liveData.totalMemory = parseInt(resource['total-memory'] || resource.totalMemory || 0);
+        liveData.freeHdd = parseInt(resource['free-hdd-space'] || resource.freeHddSpace || 0);
+        liveData.totalHdd = parseInt(resource['total-hdd-space'] || resource.totalHddSpace || 0);
+        liveData.version = resource.version || '-';
+        liveData.boardName = resource['board-name'] || resource.boardName || '-';
+        liveData.uptime = resource.uptime || '-';
+        liveData.architecture = resource['architecture-name'] || resource.architectureName || '-';
+        liveData.cpuCount = resource['cpu-count'] || resource.cpuCount || 1;
+        liveData.cpuFrequency = resource['cpu-frequency'] || resource.cpuFrequency || 0;
+      }
+
+      try {
+        const identity = await mikrotikService.getSystemIdentity(routerId);
+        if (identity) liveData.identity = identity;
+      } catch (e) {}
+
+      try {
+        const activePpp = await mikrotikService.getPppoeActive(routerId);
+        liveData.activePppoe = activePpp ? activePpp.length : 0;
+        liveData.activePppoeList = Array.isArray(activePpp) ? activePpp.slice(0, 50).map(s => ({
+          name: s.name || s['name'] || '-',
+          address: s.address || s['address'] || '-',
+          uptime: s.uptime || s['uptime'] || '-',
+          callerId: s['caller-id'] || s.callerId || '-'
+        })) : [];
+      } catch (e) {
+        liveData.activePppoeList = [];
+      }
+
+      try {
+        const activeHs = await mikrotikService.getHotspotActive(routerId);
+        liveData.activeHotspot = activeHs ? activeHs.length : 0;
+        liveData.activeHotspotList = Array.isArray(activeHs) ? activeHs.slice(0, 50).map(h => ({
+          user: h.user || h['user'] || '-',
+          address: h.address || h['address'] || '-',
+          mac: h['mac-address'] || h.mac || '-',
+          uptime: h.uptime || h['uptime'] || '-'
+        })) : [];
+      } catch (e) {
+        liveData.activeHotspotList = [];
+      }
+
+    } catch (e) {
+      liveData.connected = false;
+      liveData.error = e.message;
+    }
+
+    res.json({ success: true, router: routerConfig, live: liveData });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 router.post('/api/routers/:id/setup-firewall', requireAdmin, async (req, res) => {
   try {
     const result = await mikrotikService.setupIsolirFirewall(req.params.id);
@@ -5565,6 +6291,32 @@ router.get('/api/isolir-portal-script', requireAdmin, async (req, res) => {
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
+});
+
+router.post('/api/system/update', requireAdmin, async (req, res) => {
+  const { exec } = require('child_process');
+  const path = require('path');
+  const projectDir = path.join(__dirname, '..');
+  const isWindows = process.platform === 'win32';
+
+  const cmd = isWindows 
+    ? 'git pull origin main || git pull' 
+    : 'nice -n 19 bash update.sh';
+
+  logger.info(`[System Update] Admin initiated 1-Click System Update.`);
+
+  exec(cmd, { cwd: projectDir, timeout: 120000 }, (error, stdout, stderr) => {
+    if (error) {
+      logger.error(`[System Update Error]: ${error.message}`);
+      return res.json({ success: false, message: 'Gagal update: ' + error.message, output: stderr || stdout });
+    }
+    logger.info(`[System Update Complete]: ${stdout}`);
+    return res.json({ 
+      success: true, 
+      message: 'Pembaruan aplikasi berhasil diterapkan (Low-CPU Mode)!', 
+      output: stdout || 'Git pull & reload berhasil.' 
+    });
+  });
 });
 
 router.get('/api/mikrotik/profiles/:routerId', requireAdmin, async (req, res) => {
@@ -5676,9 +6428,11 @@ router.post('/attendance/:id/update', requireAdminSession, express.json(), (req,
     // Calculate duration if both times provided
     let duration = 0;
     if (check_in_time && check_out_time) {
-      const checkIn = new Date(check_in_time);
-      const checkOut = new Date(check_out_time);
-      duration = Math.floor((checkOut - checkIn) / 1000 / 60);
+      const checkIn = parseDateInTimezone(check_in_time);
+      const checkOut = parseDateInTimezone(check_out_time);
+      if (checkIn && checkOut) {
+        duration = Math.floor((checkOut - checkIn) / 1000 / 60);
+      }
     }
     
     attendanceSvc.updateAttendance(parseInt(id), {
@@ -5765,10 +6519,9 @@ router.get('/payroll', requireAdmin, requireSidebarMenuAccess('payroll'), (req, 
   const slips = payrollSvc.getSlipsByPeriod(month, year);
   const summary = payrollSvc.getPayrollSummary(month, year);
 
-  const { getSettingsWithCache } = require('../config/settingsManager');
   res.render('admin/payroll', {
     title: 'Gaji Karyawan',
-    company: getSettingsWithCache().company_header || 'My ISP',
+    company: company(),
     employees,
     slips,
     summary,
@@ -5879,9 +6632,8 @@ router.get('/payroll/slip/:id/print', requireAdmin, (req, res) => {
   const slip = payrollSvc.getSlipById(req.params.id);
   if (!slip) return res.status(404).send('Slip tidak ditemukan');
   
-  const { getSettingsWithCache } = require('../config/settingsManager');
   res.render('admin/print_payslip', {
-    company: getSettingsWithCache().company_header || 'My ISP',
+    company: company(),
     slip
   });
 });
@@ -6210,5 +6962,214 @@ router.post('/onu-provision/delete', requireAdminSession, restrictToAdmin, expre
   }
 });
 
+// --- RADIUS SERVER MANAGEMENT ---
+const radiusSvc = require('../services/radiusServerService');
+
+router.get('/radius-settings', requireAdminSession, restrictToAdmin, async (req, res) => {
+  try {
+    const radiusStatus = radiusSvc.getStatus();
+    const onlineSessions = radiusSvc.getOnlineSessions();
+    const acctLogs = radiusSvc.getAccountingLogs(100);
+    const nasList = db.prepare(`SELECT * FROM radius_nas ORDER BY id DESC`).all() || [];
+
+    const todayStats = db.prepare(`
+      SELECT 
+        COUNT(1) as total_events,
+        COALESCE(SUM(input_octets + output_octets), 0) as total_bytes
+      FROM radius_accounting
+      WHERE DATE(created_at) = DATE('now')
+    `).get() || { total_events: 0, total_bytes: 0 };
+
+    const todayTrafficMB = (todayStats.total_bytes / (1024 * 1024)).toFixed(1);
+    const todayEvents = todayStats.total_events;
+
+    const msg = req.session._msg || null;
+    req.session._msg = null;
+
+    res.render('admin/radius-settings', {
+      title: 'Pengaturan RADIUS',
+      company: company(),
+      activePage: 'radius_settings',
+      session: req.session,
+      radiusStatus,
+      onlineSessions,
+      acctLogs,
+      nasList,
+      todayTrafficMB,
+      todayEvents,
+      msg
+    });
+  } catch (error) {
+    logger.error('Error rendering RADIUS settings page:', error);
+    res.status(500).send('Internal Server Error: ' + error.message);
+  }
+});
+
+router.post('/radius-settings', requireAdminSession, restrictToAdmin, async (req, res) => {
+  try {
+    const {
+      radius_enabled,
+      radius_secret,
+      radius_auth_port,
+      radius_acct_port,
+      radius_isolir_action,
+      radius_isolir_pool,
+      radius_isolir_rate_limit,
+      radius_isolir_ip_pool_enabled,
+      radius_isolir_ip_pool_start,
+      radius_isolir_ip_pool_end,
+      radius_limit_simultaneous,
+      radius_default_rate_limit,
+      radius_ip_pool_enabled,
+      radius_ip_pool_start,
+      radius_ip_pool_end,
+      radius_framed_pool
+    } = req.body;
+
+    saveSettings({
+      radius_enabled: radius_enabled === '1' ? '1' : '0',
+      radius_secret: String(radius_secret || 'secret123').trim(),
+      radius_auth_port: String(radius_auth_port || '1812').trim(),
+      radius_acct_port: String(radius_acct_port || '1813').trim(),
+      radius_isolir_action: String(radius_isolir_action || 'pool').trim(),
+      radius_isolir_pool: String(radius_isolir_pool || 'isolir').trim(),
+      radius_isolir_rate_limit: String(radius_isolir_rate_limit || '512k/512k').trim(),
+      radius_isolir_ip_pool_enabled: radius_isolir_ip_pool_enabled === '1' ? '1' : '0',
+      radius_isolir_ip_pool_start: String(radius_isolir_ip_pool_start || '10.10.99.2').trim(),
+      radius_isolir_ip_pool_end: String(radius_isolir_ip_pool_end || '10.10.99.254').trim(),
+      radius_limit_simultaneous: radius_limit_simultaneous === '1' ? '1' : '0',
+      radius_default_rate_limit: String(radius_default_rate_limit || '5M/10M').trim(),
+      radius_ip_pool_enabled: radius_ip_pool_enabled === '1' ? '1' : '0',
+      radius_ip_pool_start: String(radius_ip_pool_start || '10.10.10.2').trim(),
+      radius_ip_pool_end: String(radius_ip_pool_end || '10.10.10.254').trim(),
+      radius_framed_pool: String(radius_framed_pool || 'pool-pppoe').trim()
+    });
+
+    // Kontrol background service UDP RADIUS
+    radiusSvc.stop();
+    if (radius_enabled === '1') {
+      radiusSvc.start();
+    }
+
+    req.session._msg = { type: 'success', text: 'Pengaturan RADIUS Server berhasil diperbarui.' };
+  } catch (error) {
+    logger.error('Error saving RADIUS settings:', error);
+    req.session._msg = { type: 'danger', text: 'Gagal menyimpan pengaturan: ' + error.message };
+  }
+  res.redirect('/admin/radius-settings');
+});
+
+router.post('/radius/disconnect', requireAdminSession, restrictToAdmin, async (req, res) => {
+  try {
+    const { username, session_id, nas_ip } = req.body;
+    if (!username) throw new Error('Username tidak boleh kosong');
+
+    await radiusSvc.disconnectSession(username, session_id, nas_ip);
+    req.session._msg = { type: 'success', text: `Sesi aktif RADIUS untuk user "${username}" berhasil diputus.` };
+  } catch (e) {
+    logger.error('Error disconnecting RADIUS session:', e);
+    req.session._msg = { type: 'danger', text: 'Gagal memutus sesi RADIUS: ' + e.message };
+  }
+  res.redirect('/admin/radius-settings');
+});
+
+router.post('/radius/restart', requireAdminSession, restrictToAdmin, async (req, res) => {
+  try {
+    radiusSvc.stop();
+    await new Promise(r => setTimeout(r, 500));
+    radiusSvc.start();
+    req.session._msg = { type: 'success', text: 'Layanan RADIUS Server (UDP Port 1812/1813) berhasil direstart.' };
+  } catch (e) {
+    logger.error('Error restarting RADIUS service:', e);
+    req.session._msg = { type: 'danger', text: 'Gagal merestart layanan RADIUS: ' + e.message };
+  }
+  res.redirect('/admin/radius-settings');
+});
+
+router.post('/radius/nas/add', requireAdminSession, restrictToAdmin, async (req, res) => {
+  try {
+    const { nasname, shortname, secret, description } = req.body;
+    if (!nasname || !secret) {
+      throw new Error('IP NAS & Shared Secret wajib diisi.');
+    }
+
+    db.prepare(`
+      INSERT INTO radius_nas (nasname, shortname, secret, description, is_active)
+      VALUES (?, ?, ?, ?, 1)
+      ON CONFLICT(nasname) DO UPDATE SET
+        shortname = excluded.shortname,
+        secret = excluded.secret,
+        description = excluded.description,
+        is_active = 1
+    `).run(
+      String(nasname).trim(),
+      String(shortname || '').trim(),
+      String(secret).trim(),
+      String(description || '').trim()
+    );
+
+    req.session._msg = { type: 'success', text: `NAS ${nasname} berhasil ditambahkan.` };
+  } catch (error) {
+    logger.error('Error adding NAS:', error);
+    req.session._msg = { type: 'danger', text: 'Gagal menambah NAS: ' + error.message };
+  }
+  res.redirect('/admin/radius-settings');
+});
+
+router.post('/radius/nas/edit', requireAdminSession, restrictToAdmin, async (req, res) => {
+  try {
+    const { id, nasname, shortname, secret, description, is_active } = req.body;
+    if (!id || !nasname || !secret) {
+      throw new Error('ID, IP NAS & Shared Secret wajib diisi.');
+    }
+
+    db.prepare(`
+      UPDATE radius_nas
+      SET nasname = ?, shortname = ?, secret = ?, description = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(
+      String(nasname).trim(),
+      String(shortname || '').trim(),
+      String(secret).trim(),
+      String(description || '').trim(),
+      is_active === '1' || is_active === 1 ? 1 : 0,
+      id
+    );
+
+    req.session._msg = { type: 'success', text: `Data NAS ${nasname} berhasil diperbarui.` };
+  } catch (error) {
+    logger.error('Error updating NAS:', error);
+    req.session._msg = { type: 'danger', text: 'Gagal memperbarui NAS: ' + error.message };
+  }
+  res.redirect('/admin/radius-settings');
+});
+
+router.post('/radius/nas/toggle', requireAdminSession, restrictToAdmin, async (req, res) => {
+  try {
+    const { id } = req.body;
+    const nas = db.prepare(`SELECT id, nasname, is_active FROM radius_nas WHERE id = ?`).get(id);
+    if (nas) {
+      const newStatus = nas.is_active ? 0 : 1;
+      db.prepare(`UPDATE radius_nas SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(newStatus, id);
+      req.session._msg = { type: 'success', text: `Status NAS ${nas.nasname} diubah menjadi ${newStatus ? 'Aktif' : 'Non-Aktif'}.` };
+    }
+  } catch (error) {
+    logger.error('Error toggling NAS status:', error);
+    req.session._msg = { type: 'danger', text: 'Gagal mengubah status NAS: ' + error.message };
+  }
+  res.redirect('/admin/radius-settings');
+});
+
+router.post('/radius/nas/delete', requireAdminSession, restrictToAdmin, async (req, res) => {
+  try {
+    const { id } = req.body;
+    db.prepare(`DELETE FROM radius_nas WHERE id = ?`).run(id);
+    req.session._msg = { type: 'success', text: 'NAS Client berhasil dihapus.' };
+  } catch (error) {
+    logger.error('Error deleting NAS:', error);
+    req.session._msg = { type: 'danger', text: 'Gagal menghapus NAS: ' + error.message };
+  }
+  res.redirect('/admin/radius-settings');
+});
 
 module.exports = router;

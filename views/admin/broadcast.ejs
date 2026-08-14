@@ -6,10 +6,14 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
   <link rel="stylesheet" href="/css/admin.css">
   <style>
-    .wa-tabs { display: flex; gap: 10px; margin-bottom: 14px; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
-    .wa-tab { padding: 8px 14px; border-radius: 8px; cursor: pointer; color: var(--muted); transition: all 0.2s; font-weight: 700; text-decoration: none; }
+    .wa-tabs { display: flex; gap: 8px; margin-bottom: 14px; border-bottom: 1px solid var(--border); padding-bottom: 10px; overflow-x: auto; -webkit-overflow-scrolling: touch; white-space: nowrap; }
+    .wa-tab { padding: 8px 14px; border-radius: 8px; cursor: pointer; color: var(--muted); transition: all 0.2s; font-weight: 700; text-decoration: none; flex-shrink: 0; }
     .wa-tab:hover { background: rgba(255,255,255,0.06); color: var(--text); }
     .wa-tab.active { background: var(--primary); color: white; }
+    @media (max-width: 768px) {
+      .wa-tab { padding: 6px 10px; font-size: 12px; }
+      .form-row, .grid-2 { grid-template-columns: 1fr !important; }
+    }
   </style>
 </head>
 <body>
@@ -48,8 +52,15 @@
       </div>
       <form id="broadcastForm" method="POST" action="/admin/whatsapp/broadcast" data-confirm="<%= t('admin.broadcast.confirm_send', 'Kirim pesan broadcast sekarang? Pastikan target dan pesan sudah benar.') %>">
         <div class="card-bd">
-          <div class="alert alert-i" style="margin-bottom: 10px;">
-            <i class="bi bi-info-circle"></i> <%= t('admin.broadcast.info', 'Pesan akan dikirim menggunakan nomor WhatsApp Bot Anda secara otomatis dengan jeda aman per pesan agar tidak terdeteksi sebagai spam.') %>
+          <div class="alert alert-i" style="margin-bottom: 14px; background: rgba(99,102,241,0.12); border: 1px solid rgba(99,102,241,0.3);">
+            <div style="font-weight: 800; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; color: var(--primary);">
+              <i class="bi bi-shield-check" style="font-size: 16px;"></i> Protection Anti-Banned Active (Human Typing Simulation & Spintax)
+            </div>
+            <div style="font-size: 12px; line-height: 1.5; color: var(--text);">
+              • <strong>Simulasi Mengetik Manusia:</strong> Sistem mengirim sinyal <code>sedang mengetik...</code> di WhatsApp penerima sebelum pesan dikirim.<br>
+              • <strong>Variasi Kata Spintax:</strong> Gunakan <code>{Halo|Selamat Pagi|Yth.}</code> agar isi pesan otomatis diacak & tidak dianggap spam.<br>
+              • <strong>Jeda Acak & Batching:</strong> Dikirim dengan jeda acak dinamis dan jeda istirahat otomatis antar batch.
+            </div>
           </div>
 
 

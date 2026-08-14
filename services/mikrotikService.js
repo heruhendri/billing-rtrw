@@ -256,7 +256,14 @@ class ClientAdapter {
 async function getConnection(routerId = null) {
   let host, port, user, password;
 
-  if (routerId) {
+  if (routerId === 'settings_json' || routerId === 'settings') {
+    const settings = getSettingsWithCache();
+    host = settings.mikrotik_host;
+    port = settings.mikrotik_port || 8728;
+    user = settings.mikrotik_user;
+    password = settings.mikrotik_password;
+    logger.info('[MikroTik] Using router from settings.json (explicitly requested)');
+  } else if (routerId) {
     const router = db.prepare('SELECT * FROM routers WHERE id = ?').get(routerId);
     if (!router) throw new Error(`Router with ID ${routerId} not found`);
     host = router.host;
@@ -396,6 +403,19 @@ async function checkConnection(routerId = null) {
   }
 }
 
+async function getSystemIdentity(routerId = null) {
+  let conn = null;
+  try {
+    conn = await getConnection(routerId);
+    const identity = await conn.client.menu('/system/identity').getOnly();
+    return identity ? (identity.name || identity['name'] || 'MikroTik') : 'MikroTik';
+  } catch (e) {
+    return null;
+  } finally {
+    if (conn && conn.api) conn.api.close();
+  }
+}
+
 async function getPppoeProfiles(routerId = null) {
   const ck = cacheKey(routerId, 'pppoeProfiles');
   const cached = getCachedList(ck, 15000);
@@ -508,6 +528,7 @@ async function kickPppoeUser(username, routerId = null) {
         }
         await conn.client.menu('/ppp/active').remove(sessionId);
       }
+      activeSessionsMapCache = { ts: 0, data: new Map() };
       return true;
     }
     
@@ -681,26 +702,57 @@ async function getPppoeActive(routerId = null) {
   let conn = null;
   try {
     conn = await getConnection(routerId);
-    // Use proplist to only fetch needed fields for better performance
-    let rows;
-    try {
-      rows = await withTimeout(
-        conn.api.send([
-          '/ppp/active/print',
-          '=.proplist=.id,name,address,uptime,caller-id,service'
-        ]),
-        15000, // Increased timeout to 15s
-        'getPppoeActive'
-      );
-    } catch (timeoutErr) {
-      // Fallback: try without proplist if timeout occurs
-      logger.warn(`[MikroTik] Timeout with proplist for active PPPoE, trying full query: ${timeoutErr.message}`);
-      rows = await withTimeout(
-        conn.client.menu('/ppp/active').get(),
-        20000, // 20 second timeout for fallback
-        'getPppoeActive-fallback'
-      );
+    let rows = await withTimeout(
+      conn.client.menu('/ppp/active').get(),
+      10000,
+      'getPppoeActive'
+    ).catch(() => []);
+
+    if (Array.isArray(rows) && rows.length > 0) {
+      try {
+        const ifaces = await withTimeout(
+          conn.client.menu('/interface').get(),
+          5000,
+          'getPppoeActive-interface'
+        ).catch(() => []);
+
+        if (Array.isArray(ifaces) && ifaces.length > 0) {
+          const ifaceMap = new Map();
+          for (const f of ifaces) {
+            const rawName = String(f.name || f['name'] || '').trim();
+            const cleanName = rawName.replace(/^<|>$/g, '').trim().toLowerCase();
+            const rx = Number(f['rx-byte'] || f['rx-bytes'] || f['rxByte'] || f['rxBytes'] || f['bytes-in'] || f['bytesIn'] || 0);
+            const tx = Number(f['tx-byte'] || f['tx-bytes'] || f['txByte'] || f['txBytes'] || f['bytes-out'] || f['bytesOut'] || 0);
+            const ifData = { rx, tx, rawName, cleanName };
+
+            ifaceMap.set(cleanName, ifData);
+            ifaceMap.set(rawName.toLowerCase(), ifData);
+
+            if (cleanName.startsWith('pppoe-')) {
+              const uname = cleanName.substring(6);
+              if (uname) ifaceMap.set(uname, ifData);
+            }
+          }
+
+          for (const s of rows) {
+            const uname = String(s.name || s.user || '').trim().toLowerCase();
+            const ifaceField = String(s.interface || s['interface'] || '').trim().toLowerCase().replace(/^<|>$/g, '');
+            const match = ifaceMap.get(uname) || ifaceMap.get(`pppoe-${uname}`) || (ifaceField ? ifaceMap.get(ifaceField) : null);
+            if (match) {
+              s['bytes-in'] = match.rx;
+              s['bytes-out'] = match.tx;
+              s['bytesIn'] = match.rx;
+              s['bytesOut'] = match.tx;
+              s['rx-byte'] = match.rx;
+              s['tx-byte'] = match.tx;
+            }
+          }
+        }
+      } catch (ifErr) {
+        logger.warn(`[MikroTik] Error augmenting /interface bytes: ${ifErr.message}`);
+      }
     }
+
     const mapped = Array.isArray(rows) ? rows.map(augmentRow) : [];
     setCachedList(ck, mapped);
     return mapped;
@@ -746,6 +798,81 @@ async function getActivePppoeSessionsMap() {
     }
   }
   return sessionsMap;
+}
+
+let activeSessionsMapCache = { ts: 0, data: new Map() };
+
+async function getAllActiveSessionsMap(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && activeSessionsMapCache.data && (now - activeSessionsMapCache.ts) < 3000 && activeSessionsMapCache.data.size > 0) {
+    return activeSessionsMapCache.data;
+  }
+
+  const routers = getAllRouters().filter(r => r.is_active === 1 || r.is_active === '1' || r.is_active === true);
+  const sessionsMap = new Map();
+
+  const withTimeout = (promise, ms = 4000) => {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms))
+    ]).catch(() => []);
+  };
+
+  await Promise.all(routers.map(async (r) => {
+    try {
+      const pppoeActives = await withTimeout(getPppoeActive(r.id), 4000);
+      if (Array.isArray(pppoeActives)) {
+        for (const s of pppoeActives) {
+          if (s && (s.name || s.user)) {
+            const username = String(s.name || s.user).trim().toLowerCase();
+            const bIn = Number(s['bytes-in'] || s['bytesIn'] || s['bytes_in'] || s['rx-byte'] || s['rx_byte'] || s['bytes-in-count'] || 0);
+            const bOut = Number(s['bytes-out'] || s['bytesOut'] || s['bytes_out'] || s['tx-byte'] || s['tx_byte'] || s['bytes-out-count'] || 0);
+            sessionsMap.set(username, {
+              username: s.name || s.user,
+              ip: s.address || s['address'] || '-',
+              uptime: s.uptime || s['uptime'] || '-',
+              callerId: s['caller-id'] || s['callerId'] || s['mac-address'] || '',
+              bytesIn: bIn,
+              bytesOut: bOut,
+              type: 'pppoe',
+              routerId: r.id,
+              routerName: r.name
+            });
+          }
+        }
+      }
+    } catch (err) {}
+
+    try {
+      const hsActives = await withTimeout(getHotspotActive(r.id), 4000);
+      if (Array.isArray(hsActives)) {
+        for (const s of hsActives) {
+          if (s && (s.user || s.name)) {
+            const username = String(s.user || s.name).trim().toLowerCase();
+            const bIn = Number(s['bytes-in'] || s['bytesIn'] || s['bytes_in'] || s['rx-byte'] || s['rx_byte'] || s['bytes-in-count'] || 0);
+            const bOut = Number(s['bytes-out'] || s['bytesOut'] || s['bytes_out'] || s['tx-byte'] || s['tx_byte'] || s['bytes-out-count'] || 0);
+            sessionsMap.set(username, {
+              username: s.user || s.name,
+              ip: s.address || s['address'] || '-',
+              uptime: s.uptime || s['uptime'] || '-',
+              callerId: s['mac-address'] || s['macAddress'] || s['caller-id'] || '',
+              bytesIn: bIn,
+              bytesOut: bOut,
+              type: 'hotspot',
+              routerId: r.id,
+              routerName: r.name
+            });
+          }
+        }
+      }
+    } catch (err) {}
+  }));
+
+  if (sessionsMap.size > 0 || !activeSessionsMapCache.data || activeSessionsMapCache.data.size === 0) {
+    activeSessionsMapCache = { ts: now, data: sessionsMap };
+    return sessionsMap;
+  }
+  return activeSessionsMapCache.data;
 }
 
 
@@ -1680,6 +1807,7 @@ module.exports = {
   getHotspotProfiles,
   getPppoeActive,
   getActivePppoeSessionsMap,
+  getAllActiveSessionsMap,
   getHotspotActive,
   getIpPools,
   addPppoeProfile,
@@ -1693,6 +1821,7 @@ module.exports = {
   getBackup,
   kickPppoeUser,
   kickHotspotUser,
+  getSystemIdentity,
   getSystemResource,
   getSystemScripts,
   getAllRouters,

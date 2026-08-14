@@ -1,12 +1,13 @@
 const express = require('express');
 const router = express.Router();
-const { getSetting, getCurrentDateInTimezone, getSettings, formatDateLocal, getNowLocal } = require('../config/settingsManager');
+const { getSetting, getCurrentDateInTimezone, getSettings, formatDateLocal, getNowLocal, formatTimeLocal, parseDateInTimezone } = require('../config/settingsManager');
 const { logger } = require('../config/logger');
 const db = require('../config/database');
 const billingSvc = require('../services/billingService');
 const customerSvc = require('../services/customerService');
 const adminSvc = require('../services/adminService');
 const attendanceSvc = require('../services/attendanceService');
+const pdfSvc = require('../services/pdfInvoiceService');
 const { uploadAttendance, removeAttendanceFile } = require('../middleware/attendanceUpload');
 
 function requireCollectorSession(req, res, next) {
@@ -28,16 +29,26 @@ router.use((req, res, next) => {
   res.locals.session = req.session;
   res.locals.settings = getSettings();
   res.locals.formatDateLocal = formatDateLocal;
+  res.locals.formatTimeLocal = formatTimeLocal;
+  res.locals.parseDateInTimezone = parseDateInTimezone;
   res.locals.getNowLocal = getNowLocal;
   next();
 });
+
+let loginRateLimiter = (req, res, next) => next();
+try {
+  const rlMod = require('../middleware/rateLimiter');
+  if (rlMod && typeof rlMod.loginRateLimiter === 'function') {
+    loginRateLimiter = rlMod.loginRateLimiter;
+  }
+} catch (e) {}
 
 router.get('/login', (req, res) => {
   if (req.session && req.session.isCollector) return res.redirect('/collector');
   res.render('collector/login', { title: 'Login Kolektor', company: company(), error: null });
 });
 
-router.post('/login', express.urlencoded({ extended: true }), (req, res) => {
+router.post('/login', loginRateLimiter, express.urlencoded({ extended: true }), (req, res) => {
   const username = String(req.body.username || '').trim();
   const password = String(req.body.password || '');
   const collector = adminSvc.authenticateCollector(username, password);
@@ -46,6 +57,7 @@ router.post('/login', express.urlencoded({ extended: true }), (req, res) => {
     req.session.collectorId = collector.id;
     req.session.collectorName = collector.name;
     req.session.collectorUsername = collector.username;
+    req.session.collectorArea = collector.area || '';
     return res.redirect('/collector');
   }
   return res.render('collector/login', { title: 'Login Kolektor', company: company(), error: 'Username atau password salah!' });
@@ -158,18 +170,29 @@ router.get('/', requireCollectorSession, (req, res) => {
   const now = new Date();
   const month = Math.max(1, Math.min(12, parseInt(req.query.month || (now.getMonth() + 1), 10) || (now.getMonth() + 1)));
   const year = parseInt(req.query.year || now.getFullYear(), 10) || now.getFullYear();
-  const status = String(req.query.status || 'unpaid').trim() || 'unpaid'; // unpaid, paid, all
+  const status = String(req.query.status || 'all').trim(); // all, unpaid, paid
   const search = String(req.query.search || '').trim();
-  const scope = String(req.query.scope || '').trim(); // today, unpaid, isolir
+  const scope = String(req.query.scope || '').trim(); // today, unpaid, isolir, multi, all
   const todayDay = now.getDate();
 
   const collectorId = Number(req.session.collectorId || 0);
+  const collectorObj = db.prepare('SELECT area FROM collectors WHERE id = ?').get(collectorId);
+  const collectorArea = String(collectorObj?.area || req.session.collectorArea || '').trim();
+  req.session.collectorArea = collectorArea;
+
+  let collectorWhere = '(c.collector_id = ? OR c.collector_id IS NULL)';
+  let collectorParams = [collectorId];
+  if (collectorArea) {
+    collectorWhere = '(c.collector_id = ? OR ((c.collector_id IS NULL OR c.collector_id = 0) AND LOWER(TRIM(c.area)) = LOWER(TRIM(?))))';
+    collectorParams = [collectorId, collectorArea];
+  }
   
   let q = `
-    SELECT i.*,
+    SELECT c.id as customer_id,
            c.name as customer_name,
            c.phone as customer_phone,
            c.address as customer_address,
+           c.area as customer_area,
            c.pppoe_username,
            c.genieacs_tag,
            c.connection_type,
@@ -178,28 +201,35 @@ router.get('/', requireCollectorSession, (req, res) => {
            c.install_date,
            c.isolate_day,
            c.lat, c.lng,
+           c.collector_id,
            p.name as package_name,
-           r.name as router_name
-    FROM invoices i
-    JOIN customers c ON i.customer_id = c.id
+           p.price as package_price,
+           r.name as router_name,
+           i.id as invoice_id,
+           i.status as invoice_status,
+           i.amount as invoice_amount,
+           i.period_month,
+           i.period_year
+    FROM customers c
     LEFT JOIN packages p ON c.package_id = p.id
     LEFT JOIN routers r ON c.router_id = r.id
-    WHERE (c.collector_id = ? OR c.collector_id IS NULL)
+    LEFT JOIN invoices i ON i.customer_id = c.id AND i.period_month = ? AND i.period_year = ?
+    WHERE ${collectorWhere}
   `;
-  const params = [collectorId];
-  if (scope !== 'multi') {
-    q += ' AND i.period_month=? AND i.period_year=?';
-    params.push(month, year);
-  }
+  const params = [month, year, ...collectorParams];
+
   if (scope === 'today') {
     q += ' AND c.isolate_day = ?';
     params.push(todayDay);
   } else if (scope === 'isolir') {
     q += " AND c.status = 'suspended'";
+  } else if (scope === 'unpaid') {
+    q += " AND (i.status = 'unpaid' OR i.status IS NULL)";
+  } else if (scope === 'paid') {
+    q += " AND i.status = 'paid'";
   } else if (scope === 'multi') {
     q += `
-      AND i.status='unpaid'
-      AND i.customer_id IN (
+      AND c.id IN (
         SELECT customer_id FROM invoices
         WHERE status='unpaid'
         GROUP BY customer_id
@@ -207,31 +237,35 @@ router.get('/', requireCollectorSession, (req, res) => {
       )
     `;
   }
-  if (status !== 'all') {
-    q += ' AND i.status=?';
-    params.push(status);
+
+  if (status === 'unpaid') {
+    q += " AND (i.status = 'unpaid' OR i.status IS NULL)";
+  } else if (status === 'paid') {
+    q += " AND i.status = 'paid'";
   }
+
   if (search) {
-    q += ' AND (c.name LIKE ? OR c.phone LIKE ? OR c.genieacs_tag LIKE ? OR c.pppoe_username LIKE ?)';
+    q += ' AND (c.name LIKE ? OR c.phone LIKE ? OR c.area LIKE ? OR c.genieacs_tag LIKE ? OR c.pppoe_username LIKE ?)';
     const like = `%${search}%`;
-    params.push(like, like, like, like);
+    params.push(like, like, like, like, like);
   }
-  q += ' ORDER BY c.name ASC, i.id DESC LIMIT 500';
+  q += ' ORDER BY c.name ASC, c.id DESC LIMIT 500';
   const list = db.prepare(q).all(...params);
 
   const summaryPeriod = db.prepare(`
     SELECT
-      SUM(CASE WHEN i.status='unpaid' THEN 1 ELSE 0 END) as unpaid_count,
-      SUM(CASE WHEN i.status='unpaid' THEN i.amount ELSE 0 END) as unpaid_total,
-      SUM(CASE WHEN i.status='unpaid' AND c.isolate_day=? THEN 1 ELSE 0 END) as today_count,
-      SUM(CASE WHEN i.status='unpaid' AND c.isolate_day=? THEN i.amount ELSE 0 END) as today_total,
-      SUM(CASE WHEN i.status='unpaid' AND c.status='suspended' THEN 1 ELSE 0 END) as isolir_count,
-      SUM(CASE WHEN i.status='unpaid' AND c.status='suspended' THEN i.amount ELSE 0 END) as isolir_total
-    FROM invoices i
-    JOIN customers c ON i.customer_id = c.id
-    WHERE (c.collector_id = ? OR c.collector_id IS NULL)
-      AND i.period_month=? AND i.period_year=?
-  `).get(todayDay, todayDay, collectorId, month, year) || {};
+      COUNT(DISTINCT c.id) as total_customer_count,
+      SUM(CASE WHEN (i.status='unpaid' OR i.status IS NULL) THEN 1 ELSE 0 END) as unpaid_count,
+      SUM(CASE WHEN (i.status='unpaid' OR i.status IS NULL) THEN COALESCE(i.amount, p.price, 0) ELSE 0 END) as unpaid_total,
+      SUM(CASE WHEN (i.status='unpaid' OR i.status IS NULL) AND c.isolate_day=? THEN 1 ELSE 0 END) as today_count,
+      SUM(CASE WHEN (i.status='unpaid' OR i.status IS NULL) AND c.isolate_day=? THEN COALESCE(i.amount, p.price, 0) ELSE 0 END) as today_total,
+      SUM(CASE WHEN c.status='suspended' THEN 1 ELSE 0 END) as isolir_count,
+      SUM(CASE WHEN c.status='suspended' THEN COALESCE(i.amount, p.price, 0) ELSE 0 END) as isolir_total
+    FROM customers c
+    LEFT JOIN packages p ON c.package_id = p.id
+    LEFT JOIN invoices i ON i.customer_id = c.id AND i.period_month=? AND i.period_year=?
+    WHERE ${collectorWhere}
+  `).get(todayDay, todayDay, month, year, ...collectorParams) || {};
 
   const summaryMulti = db.prepare(`
     SELECT
@@ -243,27 +277,29 @@ router.get('/', requireCollectorSession, (req, res) => {
       FROM invoices i
       JOIN customers c ON i.customer_id = c.id
       WHERE i.status='unpaid'
-        AND (c.collector_id = ? OR c.collector_id IS NULL)
+        AND ${collectorWhere}
       GROUP BY i.customer_id
       HAVING COUNT(1) > 1
     ) x
-  `).get(collectorId) || {};
+  `).get(...collectorParams) || {};
 
   const summary = { ...summaryPeriod, ...summaryMulti };
 
-  const invoiceIds = list.map(i => Number(i?.id || 0)).filter(n => Number.isFinite(n) && n > 0);
+  const customerIds = list.map(c => Number(c?.customer_id || 0)).filter(n => Number.isFinite(n) && n > 0);
   const pendingMap = new Map();
-  if (invoiceIds.length > 0) {
-    const placeholders = invoiceIds.map(() => '?').join(',');
+  if (customerIds.length > 0) {
+    const placeholders = customerIds.map(() => '?').join(',');
     const rows = db.prepare(`
       SELECT r.*
       FROM collector_payment_requests r
-      WHERE r.invoice_id IN (${placeholders})
+      WHERE r.customer_id IN (${placeholders})
       ORDER BY r.id DESC
-    `).all(...invoiceIds);
+    `).all(...customerIds);
     for (const r of rows) {
+      const cid = Number(r.customer_id || 0);
       const invId = Number(r.invoice_id || 0);
-      if (!pendingMap.has(invId)) pendingMap.set(invId, r);
+      if (invId > 0 && !pendingMap.has('inv_' + invId)) pendingMap.set('inv_' + invId, r);
+      if (cid > 0 && !pendingMap.has('cust_' + cid)) pendingMap.set('cust_' + cid, r);
     }
   }
 
@@ -296,9 +332,19 @@ router.get('/', requireCollectorSession, (req, res) => {
 
 router.post('/payment-request', requireCollectorSession, express.urlencoded({ extended: true }), async (req, res) => {
   try {
-    const invoiceId = Number(req.body.invoice_id || 0);
-    if (!Number.isFinite(invoiceId) || invoiceId <= 0) throw new Error('Invoice ID tidak valid');
+    let invoiceId = Number(req.body.invoice_id || 0);
+    const customerId = Number(req.body.customer_id || 0);
+    const m = Number(req.body.month || (new Date().getMonth() + 1));
+    const y = Number(req.body.year || new Date().getFullYear());
     const note = String(req.body.note || '').trim();
+
+    // If invoice doesn't exist yet, auto generate invoice on-the-fly!
+    if ((!invoiceId || invoiceId <= 0) && customerId > 0) {
+      const genResult = billingSvc.generateInvoiceForCustomer(customerId, m, y);
+      invoiceId = Number(genResult.invoiceId || 0);
+    }
+
+    if (!Number.isFinite(invoiceId) || invoiceId <= 0) throw new Error('Tagihan / Invoice tidak valid');
 
     const inv = billingSvc.getInvoiceById(invoiceId);
     if (!inv) throw new Error('Tagihan tidak ditemukan');
@@ -342,8 +388,20 @@ router.post('/payment-request', requireCollectorSession, express.urlencoded({ ex
         VALUES (?, ?, ?, ?, ?, 'approved', 'system', 'Auto-Approve', 'Otomatis disetujui (kolektor setting aktif)', CURRENT_TIMESTAMP)
       `).run(collectorId, invoiceId, Number(inv.customer_id || 0), amount, note);
 
-      // Send WhatsApp notification to customer
+      // Auto-unisolate if customer status is currently suspended
       const customer = customerSvc.getCustomerById(inv.customer_id);
+      let unisolatedText = '';
+      if (customer && customer.status === 'suspended') {
+        try {
+          await customerSvc.activateCustomer(customer.id);
+          unisolatedText = ' dan layanan pelanggan di-unisolate';
+          logger.info(`[Collector Auto-Approve] Customer ${customer.id} (${customer.name}) auto-unisolated on payment.`);
+        } catch (actErr) {
+          logger.error(`[Collector Auto-Approve] Failed to auto-activate customer ${customer.id}:`, actErr);
+        }
+      }
+
+      // Send WhatsApp notification to customer
       if (customer && customer.phone) {
         const msg =
           `✅ *PEMBAYARAN BERHASIL*\n\n` +
@@ -361,7 +419,7 @@ router.post('/payment-request', requireCollectorSession, express.urlencoded({ ex
         }
       }
 
-      req.session._msg = { type: 'success', text: 'Pembayaran berhasil diproses dan tagihan sudah lunas (Auto-Approve kolektor aktif).' };
+      req.session._msg = { type: 'success', text: `Pembayaran berhasil diproses, tagihan lunas${unisolatedText}. <a href="/collector/invoice/${invoiceId}/print-thermal" target="_blank" class="btn btn-sm btn-dark ms-2 fw-bold"><i class="bi bi-printer"></i> Cetak Struk (Bluetooth Thermal)</a>` };
     } else {
       // Manual approval: insert as pending
       db.prepare(`
@@ -381,6 +439,59 @@ router.post('/payment-request', requireCollectorSession, express.urlencoded({ ex
   if (req.body.search) qs.set('search', String(req.body.search));
   const suffix = qs.toString() ? ('?' + qs.toString()) : '';
   res.redirect('/collector' + suffix);
+});
+
+// ─── THERMAL RECEIPT PRINT ROUTE (58mm/80mm Bluetooth Printer) ───────────────
+router.get('/invoice/:id/print-thermal', requireCollectorSession, (req, res) => {
+  try {
+    const invoiceId = Number(req.params.id || 0);
+    const invoice = billingSvc.getInvoiceById(invoiceId);
+    if (!invoice) return res.status(404).send('Invoice tidak ditemukan');
+
+    const customer = customerSvc.getCustomerById(invoice.customer_id);
+    if (!customer) return res.status(404).send('Data pelanggan tidak ditemukan');
+    const settings = getSettings();
+
+    res.render('collector/print_thermal', {
+      invoice,
+      customer,
+      settings,
+      company: company(),
+      collectorName: req.session.collectorName || 'Kolektor',
+      formatDateLocal,
+      formatTimeLocal,
+      getNowLocal
+    });
+  } catch (e) {
+    res.status(500).send('Error: ' + e.message);
+  }
+});
+
+// ─── SEND INVOICE PDF VIA WHATSAPP ROUTE ──────────────────────────────────────
+router.post('/invoice/:id/send-pdf-wa', requireCollectorSession, async (req, res) => {
+  try {
+    const invoiceId = Number(req.params.id || 0);
+    const inv = billingSvc.getInvoiceById(invoiceId);
+    if (!inv) return res.json({ success: false, message: 'Invoice tidak ditemukan' });
+
+    const customer = customerSvc.getCustomerById(inv.customer_id);
+    if (!customer || !customer.phone) return res.json({ success: false, message: 'Nomor HP pelanggan tidak valid' });
+
+    const settings = getSettings();
+    const pdfBuffer = await pdfSvc.generateInvoicePdfBuffer(inv, customer, settings);
+    const filename = `Invoice_INV-${String(inv.id).padStart(4, '0')}.pdf`;
+    const caption = `🧾 *FAKTUR / INVOICE LUNAS*\n\nYth. Bpk/Ibu *${customer.name}*,\nBerikut kami lampirkan dokumen Invoice LUNAS periode ${inv.period_month}/${inv.period_year}.\n\nTerima kasih atas pembayaran Anda.`;
+
+    const waBot = require('../services/whatsappBot.mjs');
+    const result = await waBot.sendWADocument(customer.phone, pdfBuffer, filename, caption);
+    if (result && result.success) {
+      return res.json({ success: true, message: 'Dokumen Invoice PDF berhasil dikirim via WhatsApp ke pelanggan!' });
+    } else {
+      return res.json({ success: false, message: result?.message || 'Gagal mengirim WA PDF' });
+    }
+  } catch (e) {
+    return res.json({ success: false, message: 'Error: ' + e.message });
+  }
 });
 
 module.exports = router;
