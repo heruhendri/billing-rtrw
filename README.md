@@ -271,7 +271,7 @@ Aplikasi Android resmi **Alijaya** adalah aplikasi native multifungsi untuk semu
    ```text
    https://app.alijaya.com/downloads/AlijayaCustomer.apk
    ```
-   *(Ganti `[IP-SERVER]` dan `3001` sesuai IP/Domain dan Port server billing Anda)*.
+   *(Ganti `[IP-SERVER]` dan `4000` sesuai IP/Domain dan Port server billing Anda)*.
 2. **File Lokal di Repository**:
    File APK siap install juga tersedia di root proyek: `AlijayaCustomer.apk` atau `public/downloads/AlijayaCustomer.apk`.
 
@@ -286,8 +286,8 @@ Agar aplikasi Android dapat terhubung ke server billing Anda (lokal IP, VPN, ata
 2. Pada layar login awal, tap tombol **⚙️ Icon Pengaturan / Server** di pojok kanan atas (atau tombol **Ganti Server**).
 3. Masukkan URL server billing Anda:
    - **Format**: `http://IP-SERVER:PORT` atau `https://DOMAIN-ANDA.COM`
-   - *Contoh IP Lokal*: `http://192.168.1.100:3001`
-   - *Contoh IP Publik / VPS*: `http://103.150.xxx.xxx:3001`
+   - *Contoh IP Lokal*: `http://192.168.1.100:4000`
+   - *Contoh IP Publik / VPS*: `http://103.150.xxx.xxx:4000`
    - *Contoh Domain*: `https://billing.myisp.net`
 4. Tap tombol **💾 Simpan & Tes Koneksi**.
 5. Jika server aktif dan terjangkau, aplikasi akan menampilkan pesan *Koneksi Server Berhasil* dan Anda siap login sesuai peran akun Anda.
