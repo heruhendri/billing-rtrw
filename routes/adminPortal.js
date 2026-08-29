@@ -58,6 +58,8 @@ const backupSvc = require('../services/backupService');
 const monitoringSvc = require('../services/monitoringService');
 const inventorySvc = require('../services/inventoryService');
 const auditSvc = require('../services/auditTrailService');
+const whatsappService = require('../services/whatsappService');
+const { parseMikhmonOnLogin } = require('../utils/mikhmonParser');
 const diagnosticsSvc = require('../services/diagnosticsService');
 const attendanceSvc = require('../services/attendanceService');
 const payrollSvc = require('../services/payrollService');
@@ -252,16 +254,37 @@ async function trySendWhatsappPayment(customerPhone, message) {
   }
 }
 
-async function sendPaymentSuccessWA(customerPhone, customerName, periodText, amountText, paidBy) {
+async function sendPaymentSuccessWA(customerPhone, customerName, periodText, amountText, paidBy, extraOpts = {}) {
   try {
-    const defaultSuccess = `Yth. Pelanggan {{nama}},\n\n*PEMBAYARAN BERHASIL (LUNAS)*\n\n📅 *Periode:* {{periode}}\n💰 *Total Bayar:* Rp {{total}}\n💳 *Metode:* {{metode}}\n\nLayanan internet Anda aktif. Terima kasih atas kerja samanya.`;
-    const template = db.getAppSetting('whatsapp_payment_success_message', defaultSuccess);
+    const defaultTemplate = whatsappService.DEFAULT_PAYMENT_SUCCESS_TEMPLATE;
+    const template = db.getAppSetting('whatsapp_payment_success_message', defaultTemplate);
+    const settings = getSettings();
+    const appUrl = (settings.public_base_url || '').replace(/\/$/, '');
+    const portalUrl = appUrl ? `${appUrl}/customer` : '';
 
-    const formattedMsg = template
-      .replace(/{{nama}}/gi, customerName || 'Pelanggan')
-      .replace(/{{periode}}/gi, periodText || '-')
-      .replace(/{{total}}/gi, amountText || '-')
-      .replace(/{{metode}}/gi, paidBy || '-');
+    let periodMonth = '';
+    let periodYear = '';
+    if (periodText && String(periodText).includes('/')) {
+      const p = String(periodText).split('/');
+      periodMonth = p[0];
+      periodYear = p[1];
+    }
+
+    const formattedMsg = whatsappService.formatPaymentSuccessMessage({
+      customerName: customerName || 'Pelanggan',
+      invoiceId: extraOpts.invoiceId || '',
+      customerUsername: extraOpts.username || extraOpts.customerId || '-',
+      packageName: extraOpts.packageName || '-',
+      periodMonth: periodMonth || periodText,
+      periodYear: periodYear || '',
+      amount: String(amountText || '0').replace(/[^\d]/g, ''),
+      paymentMethod: paidBy || 'Kasir / Admin',
+      paidAt: extraOpts.paidAt || new Date(),
+      companyName: company(),
+      companyPhone: settings.company_phone || '',
+      portalUrl,
+      customTemplate: template
+    });
 
     return await trySendWhatsappPayment(customerPhone, formattedMsg);
   } catch (e) {
@@ -396,47 +419,6 @@ function getUpdateInfo(repoRoot) {
   return info;
 }
 
-function parseMikhmonOnLogin(script) {
-  if (!script) return null;
-  const s = String(script).trim();
-  
-  // Cari pattern :put (",rem, ... , ... , ...
-  // Updated regex untuk support format: :put (",rem,4000,2d,5000,,Disable,");
-  const putMatch = s.match(/:\s*put\s*\(\s*[",]rem[",]?\s*,\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^,]+)/i);
-  if (putMatch) {
-    const cost = String(putMatch[1] || '').trim();
-    const validity = String(putMatch[2] || '').trim();
-    const priceStr = String(putMatch[3] || '').trim();
-    const price = Number(priceStr.replace(/[^\d]/g, '')) || 0;
-    
-    if (validity && price > 0) {
-      return { validity, price, cost: Number(cost.replace(/[^\d]/g, '')) || 0 };
-    }
-  }
-  
-  // Fallback: split by comma
-  const parts = s.split(',').map(p => String(p).trim());
-  let remIdx = -1;
-  for (let i = 0; i < parts.length; i++) {
-    if (parts[i].includes('rem')) {
-      remIdx = i;
-      break;
-    }
-  }
-  
-  if (remIdx >= 0 && remIdx + 3 < parts.length) {
-    const cost = String(parts[remIdx + 1] || '').trim();
-    const validity = String(parts[remIdx + 2] || '').trim();
-    const priceStr = String(parts[remIdx + 3] || '').trim();
-    const price = Number(priceStr.replace(/[^\d]/g, '')) || 0;
-    
-    if (validity && price > 0) {
-      return { validity, price, cost: Number(cost.replace(/[^\d]/g, '')) || 0 };
-    }
-  }
-  
-  return null;
-}
 
 function genCode(len, charset) {
   const n = Math.max(4, Math.min(16, Number(len) || 6));
@@ -1716,13 +1698,25 @@ router.post('/customers', requireAdminSession, express.urlencoded({ extended: tr
     }
 
     const radiusEnabled = getSetting('radius_enabled', '0') === '1';
+    // Ketika RADIUS offline, paksa is_radius = 0 (MikroTik mode) agar secret SELALU dibuat ke MikroTik
     const isRadius = radiusEnabled ? (req.body.is_radius !== undefined ? (Number(req.body.is_radius) === 1 ? 1 : 0) : 0) : 0;
     req.body.is_radius = isRadius;
 
     customerSvc.createCustomer(req.body);
     
-    // Sync to MikroTik if username provided AND not RADIUS
-    if (connectionType === 'pppoe' && req.body.pppoe_username && !isRadius) {
+    // ========================================================================
+    // SYNC KE MIKROTIK - PENTING: SECRET TIDAK PERNAH DIHAPUS!
+    // ========================================================================
+    // Logika:
+    // - Jika RADIUS OFFLINE: SELALU create/update secret ke MikroTik
+    // - Jika RADIUS AKTIF tapi is_radius=0: Hybrid mode, tetap ke MikroTik
+    // - Jika RADIUS AKTIF dan is_radius=1: Full RADIUS mode, skip MikroTik
+    // 
+    // CATATAN: Kode ini TIDAK PERNAH menghapus secret dari MikroTik!
+    //          Hanya CREATE (jika belum ada) atau UPDATE PROFILE (jika sudah ada)
+    // ========================================================================
+    const shouldSyncToMikrotik = !radiusEnabled || !isRadius;
+    if (connectionType === 'pppoe' && req.body.pppoe_username && shouldSyncToMikrotik) {
       const password = String(req.body.pppoe_password || '').trim();
       const remoteAddress = String(req.body.pppoe_remote_address || '').trim();
       
@@ -1745,12 +1739,13 @@ router.post('/customers', requireAdminSession, express.urlencoded({ extended: tr
               remoteAddress: remoteAddress,
               routerId: req.body.router_id
             });
+            logger.info(`[Add Customer] Created PPPoE secret "${req.body.pppoe_username}" in MikroTik (RADIUS ${radiusEnabled ? 'ON' : 'OFF'})`);
           } catch (mErr) {
-            console.error('Mikrotik create PPPoE secret error:', mErr);
+            logger.error('Mikrotik create PPPoE secret error:', mErr);
           }
         }
       } else {
-        // If from MikroTik list, just update profile
+        // If from MikroTik list (no password input), just update profile
         let targetProfile = '';
         if (req.body.status === 'suspended') {
           targetProfile = req.body.isolir_profile || 'isolir';
@@ -1761,8 +1756,9 @@ router.post('/customers', requireAdminSession, express.urlencoded({ extended: tr
         if (targetProfile) {
           try {
             await mikrotikService.setPppoeProfile(req.body.pppoe_username, targetProfile, req.body.router_id);
+            logger.info(`[Add Customer] Updated PPPoE profile for "${req.body.pppoe_username}" to "${targetProfile}"`);
           } catch (mErr) {
-            console.error('Mikrotik sync error (create):', mErr);
+            logger.error('Mikrotik sync error (create):', mErr);
           }
         }
       }
@@ -1903,6 +1899,7 @@ router.post('/customers/:id/update', requireAdminSession, express.urlencoded({ e
     }
 
     const radiusEnabled = getSetting('radius_enabled', '0') === '1';
+    // Ketika RADIUS offline, paksa is_radius = 0 (MikroTik mode) agar secret SELALU ada di MikroTik
     const isRadius = radiusEnabled ? (req.body.is_radius !== undefined ? (Number(req.body.is_radius) === 1 ? 1 : 0) : 0) : 0;
     req.body.is_radius = isRadius;
 
@@ -1911,10 +1908,28 @@ router.post('/customers/:id/update', requireAdminSession, express.urlencoded({ e
     
     customerSvc.updateCustomer(req.params.id, req.body);
     
-    // Sync to MikroTik if username provided (update profile only, NEVER delete PPP secret)
-    if (connectionType === 'pppoe' && req.body.pppoe_username) {
+    // ========================================================================
+    // SYNC KE MIKROTIK SAAT EDIT - PENTING: SECRET TIDAK PERNAH DIHAPUS!
+    // ========================================================================
+    // Logika:
+    // - Jika RADIUS OFFLINE: SELALU sync ke MikroTik
+    // - Jika RADIUS AKTIF tapi is_radius=0: Hybrid mode, tetap sync ke MikroTik  
+    // - Jika RADIUS AKTIF dan is_radius=1: Full RADIUS mode, skip MikroTik
+    //
+    // Proses:
+    // 1. Cek apakah secret sudah ada di MikroTik
+    // 2. Jika sudah ada: UPDATE PROFILE saja (TIDAK HAPUS!)
+    // 3. Jika belum ada: CREATE secret baru (jika ada password)
+    // 
+    // CATATAN: Kode ini TIDAK PERNAH menghapus secret dari MikroTik!
+    // ========================================================================
+    const shouldSyncToMikrotik = !radiusEnabled || !isRadius;
+    if (connectionType === 'pppoe' && req.body.pppoe_username && shouldSyncToMikrotik) {
       try {
         const newUsername = String(req.body.pppoe_username || '').trim();
+        const newPassword = String(req.body.pppoe_password || '').trim();
+        const remoteAddress = String(req.body.pppoe_remote_address || '').trim();
+        
         let targetProfile = '';
         if (req.body.status === 'suspended') {
           targetProfile = req.body.isolir_profile || 'isolir';
@@ -1922,9 +1937,30 @@ router.post('/customers/:id/update', requireAdminSession, express.urlencoded({ e
           const pkg = customerSvc.getPackageById(req.body.package_id);
           if (pkg) targetProfile = pkg.name;
         }
+        
         if (targetProfile) {
           try {
-            await mikrotikService.setPppoeProfile(newUsername, targetProfile, req.body.router_id);
+            // Cek apakah secret sudah ada di MikroTik
+            const secrets = await mikrotikService.getPppoeSecrets(req.body.router_id);
+            const existingSecret = secrets.find(s => String(s.name || '').trim() === newUsername);
+            
+            if (existingSecret) {
+              // Secret sudah ada, hanya update profile
+              await mikrotikService.setPppoeProfile(newUsername, targetProfile, req.body.router_id);
+              logger.info(`[Edit Customer] Updated PPPoE profile for "${newUsername}" to "${targetProfile}"`);
+            } else if (newPassword) {
+              // Secret belum ada DAN ada password, create secret baru ke MikroTik
+              await mikrotikService.createPppoeSecret({
+                username: newUsername,
+                password: newPassword,
+                profile: targetProfile,
+                remoteAddress: remoteAddress,
+                routerId: req.body.router_id
+              });
+              logger.info(`[Edit Customer] Created NEW PPPoE secret for "${newUsername}" in MikroTik`);
+            } else {
+              logger.warn(`[Edit Customer] Cannot create PPPoE secret for "${newUsername}" - password not provided`);
+            }
           } catch (mErr) {
             logger.error('Mikrotik sync error (update PPPoE):', mErr.message);
           }
@@ -3338,8 +3374,9 @@ router.get('/reports', requireAdminSession, requireSidebarMenuAccess('reports'),
 router.get('/reports/print', requireAdminSession, requireSidebarMenuAccess('reports'), (req, res) => {
   const filterYear = parseInt(req.query.year) || new Date().getFullYear();
   const yStr = String(filterYear);
-  const nowYearStr = String(new Date().getFullYear());
-  const nowMonthStr = String(new Date().getMonth() + 1).padStart(2, '0');
+  const monthlyData = billingSvc.getMonthlyRevenue(filterYear);
+  const settings = getSettingsWithCache();
+  const activeCustomers = customerSvc.getCustomerStats().active;
 
   // Kalkulasi sama seperti laporan utama
   const revenueYearDirect = Number(db.prepare("SELECT SUM(amount) as t FROM invoices WHERE status='paid' AND strftime('%Y', paid_at) = ? AND (paid_by_name IS NULL OR paid_by_name NOT LIKE 'Agent %')").get(yStr)?.t || 0);
@@ -3353,6 +3390,9 @@ router.get('/reports/print', requireAdminSession, requireSidebarMenuAccess('repo
   
   const netProfitYear = cashInYear - expensesYear;
 
+  const pendingAmountRow = db.prepare("SELECT SUM(amount) as t FROM invoices WHERE status='unpaid' AND period_year = ?").get(filterYear);
+  const pendingAmount = Number(pendingAmountRow?.t || 0);
+
   const expensesByCategory = db.prepare("SELECT category, SUM(amount) as total FROM expenses WHERE strftime('%Y', date) = ? GROUP BY category").all(yStr);
   if (digiflazzCostYear > 0) {
     expensesByCategory.push({ category: 'Modal PPOB (Digiflazz)', total: digiflazzCostYear });
@@ -3361,12 +3401,17 @@ router.get('/reports/print', requireAdminSession, requireSidebarMenuAccess('repo
 
   res.render('admin/reports_print', {
     company: company(),
+    settings,
     filterYear,
     cashInYear,
     expensesYear,
     netProfitYear,
+    pendingAmount,
+    activeCustomers,
+    monthlyData,
     expensesByCategory,
-    formatDateLocal
+    formatDateLocal,
+    getNowLocal
   });
 });
 
@@ -4694,7 +4739,7 @@ router.get('/api/webhook/payment-notif/logs', requireAdminSession, (req, res) =>
     }
 
     const sql = `
-      SELECT id, created_at, service, content, parsed_amount, parsed_ok, matched_invoice_id, matched_voucher_order_id, ip
+      SELECT id, created_at, service, content, parsed_amount, parsed_ok, matched_invoice_id, matched_voucher_order_id, matched_donation_order_id, ip
       FROM webhook_payment_notifs
       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
       ORDER BY id DESC
@@ -5619,7 +5664,7 @@ router.get('/whatsapp/templates', requireAdminSession, requireSidebarMenuAccess(
   
   const defaultQris = `Yth. Pelanggan {{nama}},\n\nBerikut rincian tagihan manual + Kode Bayar QRIS Anda:\n\n📦 *Paket:* {{paket}}\n📅 *Periode:* {{periode}}\n💰 *Nominal:* Rp {{qris_nominal}}\n\nSilakan scan QRIS berikut untuk melakukan pembayaran otomatis:\n{{qris_qr}}\n\nTerima kasih.`;
 
-  const defaultSuccess = `Yth. Pelanggan {{nama}},\n\n*PEMBAYARAN BERHASIL (LUNAS)*\n\n📅 *Periode:* {{periode}}\n💰 *Total Bayar:* Rp {{total}}\n💳 *Metode:* {{metode}}\n\nLayanan internet Anda aktif. Terima kasih atas kerja samanya.`;
+  const defaultSuccess = whatsappService.DEFAULT_PAYMENT_SUCCESS_TEMPLATE;
 
   const defaultIsolir = `Yth. Pelanggan {{nama}},\n\nLayanan internet Anda (Paket {{paket}}) saat ini ditangguhkan (Terisolir) karena belum melunasi tagihan sebesar *Rp {{tagihan}}*.\n\nSilakan lakukan pembayaran segera melalui portal pelanggan: {{link}}\n\nTerima kasih.`;
 

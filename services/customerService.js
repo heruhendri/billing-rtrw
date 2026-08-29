@@ -354,10 +354,11 @@ async function deleteCustomer(id) {
 
 function getCustomerStats() {
   return {
-    total:     db.prepare('SELECT COUNT(*) as c FROM customers').get().c,
-    active:    db.prepare("SELECT COUNT(*) as c FROM customers WHERE status='active'").get().c,
-    suspended: db.prepare("SELECT COUNT(*) as c FROM customers WHERE status='suspended'").get().c,
-    inactive:  db.prepare("SELECT COUNT(*) as c FROM customers WHERE status='inactive'").get().c,
+    total:        db.prepare('SELECT COUNT(*) as c FROM customers').get().c,
+    active:       db.prepare("SELECT COUNT(*) as c FROM customers WHERE status IN ('active', 'ditangguhkan')").get().c,
+    ditangguhkan: db.prepare("SELECT COUNT(*) as c FROM customers WHERE status='ditangguhkan'").get().c,
+    suspended:    db.prepare("SELECT COUNT(*) as c FROM customers WHERE status='suspended'").get().c,
+    inactive:     db.prepare("SELECT COUNT(*) as c FROM customers WHERE status='inactive'").get().c,
   };
 }
 
@@ -641,7 +642,7 @@ async function suspendCustomer(id) {
   return true;
 }
 
-async function activateCustomer(id) {
+async function activateCustomer(id, targetStatus = 'active') {
   const customer = getCustomerById(id);
   if (!customer) throw new Error('Pelanggan tidak ditemukan');
   
@@ -655,7 +656,7 @@ async function activateCustomer(id) {
   
   if (hasMikrotikConnection && !effectiveRouterId) {
     logger.warn(`[activateCustomer] Pelanggan "${customer.name}" (ID: ${id}) memiliki koneksi ${customer.connection_type} tapi router_id NULL dan tidak ada default router. Aktivasi lokal hanya, MikroTik tidak diupdate.`);
-    updateCustomer(id, { ...customer, status: 'active' });
+    updateCustomer(id, { ...customer, status: targetStatus });
     return;
   }
 
@@ -706,7 +707,7 @@ async function activateCustomer(id) {
   }
 
   // Update database status SETELAH MikroTik berhasil (atau gagal tapi continue)
-  updateCustomer(id, { ...customer, status: 'active' });
+  updateCustomer(id, { ...customer, status: targetStatus });
   return true;
 }
 
