@@ -44,13 +44,8 @@ function formatGatewayError(gatewayName, error) {
  * Generate fallback email based on phone number
  */
 function getFallbackEmail(phone) {
-<<<<<<< HEAD
-  const digits = phone.replace(/\D/g, '');
-  return `cust${digits}@hdri.web.id`;
-=======
   const digits = String(phone || '').replace(/\D/g, '');
-  return `cust${digits || '08123456789'}@alijaya.net`;
->>>>>>> origin/main
+  return `cust${digits || '08977345640'}@hendri.net`;
 }
 
 /**
