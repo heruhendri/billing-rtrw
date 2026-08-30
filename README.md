@@ -273,7 +273,7 @@ Aplikasi Android resmi **Alijaya** adalah aplikasi native multifungsi untuk semu
    ```
    *(Ganti `[IP-SERVER]` dan `4000` sesuai IP/Domain dan Port server billing Anda)*.
 2. **File Lokal di Repository**:
-   File APK siap install juga tersedia di root proyek: `AlijayaCustomer.apk` atau `public/downloads/AlijayaCustomer.apk`.
+   File APK siap install juga tersedia di root proyek: `Billing-System.apk` atau `public/downloads/Billing-System.apk`.
 
 ---
 
