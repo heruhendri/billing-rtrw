@@ -816,6 +816,324 @@ router.post('/app/collector/pay-bill', async (req, res) => {
   }
 });
 
+// Kolektor: Riwayat Setoran / Tagihan yang Diterima
+router.get('/app/collector/history', (req, res) => {
+  try {
+    const requests = db.prepare(`
+      SELECT r.id, r.collector_id, r.invoice_id, r.customer_id, r.amount, r.note, r.status,
+             r.decided_by_role, r.decided_by_name, r.decided_note, r.decided_at, r.created_at,
+             c.name as customer_name, c.phone as customer_phone, c.address as customer_address,
+             i.period_month, i.period_year, i.amount as invoice_amount
+      FROM collector_payment_requests r
+      LEFT JOIN customers c ON c.id = r.customer_id
+      LEFT JOIN invoices i ON i.id = r.invoice_id
+      ORDER BY r.id DESC LIMIT 100
+    `).all() || [];
+
+    // Summary counters
+    let approvedTotal = 0;
+    let pendingTotal = 0;
+    let approvedCount = 0;
+    let pendingCount = 0;
+
+    for (const r of requests) {
+      const amt = Number(r.amount || 0);
+      if (r.status === 'approved') {
+        approvedTotal += amt;
+        approvedCount++;
+      } else if (r.status === 'pending') {
+        pendingTotal += amt;
+        pendingCount++;
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        requests,
+        summary: {
+          approvedTotal,
+          approvedCount,
+          pendingTotal,
+          pendingCount,
+          totalTransactions: requests.length
+        }
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// Kolektor: Absensi Kerja
+router.get('/app/collector/attendance/today', (req, res) => {
+  try {
+    const attendanceSvc = require('../services/attendanceService');
+    const { getSetting } = require('../config/settingsManager');
+    const companyName = getSetting('company_header', 'ALIJAYA NET');
+    const firstCol = db.prepare('SELECT id, name FROM collectors ORDER BY id ASC LIMIT 1').get() || { id: 1, name: 'Kolektor' };
+    const today = attendanceSvc.getTodayAttendance('collector', firstCol.id);
+    const history = attendanceSvc.getAttendanceHistory('collector', firstCol.id, 10);
+    res.json({
+      success: true,
+      data: {
+        today: today || null,
+        history: history || [],
+        collectorName: firstCol.name,
+        companyName
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+function saveAttendancePhoto(photoData) {
+  if (!photoData || typeof photoData !== 'string') return '';
+  if (photoData.startsWith('data:image')) {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const uploadDir = path.join(__dirname, '../public/uploads/attendance');
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+      const matches = photoData.match(/^data:image\/([a-zA-Z0-9]+);base64,(.+)$/);
+      if (matches) {
+        const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+        const filename = `attendance-${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`;
+        const fullPath = path.join(uploadDir, filename);
+        fs.writeFileSync(fullPath, Buffer.from(matches[2], 'base64'));
+        return `/uploads/attendance/${filename}`;
+      }
+    } catch (err) {
+      logger.error('Failed to save attendance photo: ' + err.message);
+    }
+  } else if (photoData.startsWith('/uploads/')) {
+    return photoData;
+  }
+  return '';
+}
+
+router.post('/app/collector/attendance/checkin', (req, res) => {
+  try {
+    const attendanceSvc = require('../services/attendanceService');
+    const firstCol = db.prepare('SELECT id, name FROM collectors ORDER BY id ASC LIMIT 1').get() || { id: 1, name: 'Kolektor' };
+    const today = attendanceSvc.getTodayAttendance('collector', firstCol.id);
+    if (today) {
+      return res.status(400).json({ success: false, message: 'Anda sudah melakukan check-in hari ini!' });
+    }
+
+    let { lat, lng, note, photo } = req.body || {};
+    const { getSetting } = require('../config/settingsManager');
+    const officeLat = getSetting('office_lat', '0');
+    const officeLng = getSetting('office_lng', '0');
+    if ((!lat || !lng || String(lat).trim() === '' || String(lat).trim() === '0') && officeLat && officeLng) {
+      lat = officeLat;
+      lng = officeLng;
+    }
+
+    const photoPath = saveAttendancePhoto(photo);
+
+    const result = attendanceSvc.checkIn({
+      employee_type: 'collector',
+      employee_id: firstCol.id,
+      employee_name: firstCol.name,
+      lat: String(lat || officeLat || ''),
+      lng: String(lng || officeLng || ''),
+      note: String(note || 'Check-in Kolektor APK Native'),
+      photo: photoPath
+    });
+
+    res.json({ success: true, message: '✅ Check-in berhasil dicatat!', id: result.lastInsertRowid });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Gagal check-in: ' + e.message });
+  }
+});
+
+router.post('/app/collector/attendance/checkout', (req, res) => {
+  try {
+    const attendanceSvc = require('../services/attendanceService');
+    const firstCol = db.prepare('SELECT id FROM collectors ORDER BY id ASC LIMIT 1').get() || { id: 1 };
+    const today = attendanceSvc.getTodayAttendance('collector', firstCol.id);
+    if (!today) {
+      return res.status(400).json({ success: false, message: 'Anda belum melakukan check-in hari ini!' });
+    }
+    if (today.status === 'checked_out') {
+      return res.status(400).json({ success: false, message: 'Anda sudah check-out hari ini!' });
+    }
+
+    let { lat, lng, note, photo } = req.body || {};
+    const { getSetting } = require('../config/settingsManager');
+    const officeLat = getSetting('office_lat', '0');
+    const officeLng = getSetting('office_lng', '0');
+    if ((!lat || !lng || String(lat).trim() === '' || String(lat).trim() === '0') && officeLat && officeLng) {
+      lat = officeLat;
+      lng = officeLng;
+    }
+
+    const photoPath = saveAttendancePhoto(photo);
+
+    attendanceSvc.checkOut(today.id, {
+      lat: String(lat || officeLat || ''),
+      lng: String(lng || officeLng || ''),
+      note: String(note || 'Check-out Kolektor APK Native'),
+      photo: photoPath
+    });
+
+    res.json({ success: true, message: '🏁 Check-out berhasil dicatat. Selamat beristirahat!' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Gagal check-out: ' + e.message });
+  }
+});
+
+// ─── KASIR NATIVE: ABSENSI ──────────────────────────────────────────────────
+router.get('/app/cashier/attendance/today', (req, res) => {
+  try {
+    const attendanceSvc = require('../services/attendanceService');
+    const cashiersList = db.prepare('SELECT id, name, username FROM cashiers WHERE is_active = 1 ORDER BY name ASC').all() || [];
+    
+    let cashierId = parseInt(req.query.cashier_id) || (cashiersList.length > 0 ? cashiersList[0].id : 1);
+    let cashierName = 'Kasir Utama';
+    
+    const found = cashiersList.find(c => c.id === cashierId);
+    if (found) {
+      cashierName = found.name;
+    }
+
+    const today = attendanceSvc.getTodayAttendance('cashier', cashierId);
+    const history = attendanceSvc.getAttendanceHistory('cashier', cashierId, 10);
+
+    const { getSetting } = require('../config/settingsManager');
+    const companyName = getSetting('company_header', 'ALIJAYA NET');
+
+    res.json({
+      success: true,
+      data: {
+        today: today || null,
+        history: history || [],
+        cashierId,
+        cashierName,
+        cashiers: cashiersList,
+        companyName
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+router.post('/app/cashier/attendance/checkin', (req, res) => {
+  try {
+    const attendanceSvc = require('../services/attendanceService');
+    let { cashier_id, lat, lng, note, photo } = req.body || {};
+    let cashierId = parseInt(cashier_id) || 1;
+    let cashierName = 'Kasir';
+
+    const cRow = db.prepare('SELECT name FROM cashiers WHERE id = ?').get(cashierId);
+    if (cRow) {
+      cashierName = cRow.name;
+    } else {
+      const first = db.prepare('SELECT id, name FROM cashiers ORDER BY id ASC LIMIT 1').get();
+      if (first) {
+        cashierId = first.id;
+        cashierName = first.name;
+      }
+    }
+
+    const today = attendanceSvc.getTodayAttendance('cashier', cashierId);
+    if (today) {
+      return res.status(400).json({ success: false, message: 'Kasir ' + cashierName + ' sudah check-in hari ini!' });
+    }
+
+    const { getSetting } = require('../config/settingsManager');
+    const officeLat = getSetting('office_lat', '0');
+    const officeLng = getSetting('office_lng', '0');
+    if ((!lat || !lng || String(lat).trim() === '' || String(lat).trim() === '0') && officeLat && officeLng) {
+      lat = officeLat;
+      lng = officeLng;
+    }
+
+    const photoPath = saveAttendancePhoto(photo);
+
+    const result = attendanceSvc.checkIn({
+      employee_type: 'cashier',
+      employee_id: cashierId,
+      employee_name: cashierName,
+      lat: String(lat || officeLat || ''),
+      lng: String(lng || officeLng || ''),
+      note: String(note || 'Check-in Kasir APK Native'),
+      photo: photoPath
+    });
+
+    res.json({ success: true, message: '✅ Check-in kasir (' + cashierName + ') berhasil dicatat!', id: result.lastInsertRowid });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Gagal check-in kasir: ' + e.message });
+  }
+});
+
+router.post('/app/cashier/attendance/checkout', (req, res) => {
+  try {
+    const attendanceSvc = require('../services/attendanceService');
+    let { cashier_id, lat, lng, note, photo } = req.body || {};
+    let cashierId = parseInt(cashier_id) || 1;
+
+    const today = attendanceSvc.getTodayAttendance('cashier', cashierId);
+    if (!today) {
+      return res.status(400).json({ success: false, message: 'Kasir belum melakukan check-in hari ini!' });
+    }
+    if (today.status === 'checked_out') {
+      return res.status(400).json({ success: false, message: 'Kasir sudah check-out hari ini!' });
+    }
+
+    const { getSetting } = require('../config/settingsManager');
+    const officeLat = getSetting('office_lat', '0');
+    const officeLng = getSetting('office_lng', '0');
+    if ((!lat || !lng || String(lat).trim() === '' || String(lat).trim() === '0') && officeLat && officeLng) {
+      lat = officeLat;
+      lng = officeLng;
+    }
+
+    const photoPath = saveAttendancePhoto(photo);
+
+    attendanceSvc.checkOut(today.id, {
+      lat: String(lat || officeLat || ''),
+      lng: String(lng || officeLng || ''),
+      note: String(note || 'Check-out Kasir APK Native'),
+      photo: photoPath
+    });
+
+    res.json({ success: true, message: '🏁 Check-out kasir berhasil dicatat. Selesai bertugas!' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Gagal check-out kasir: ' + e.message });
+  }
+});
+
+// Kolektor: Peta Lokasi & Koordinat Pelanggan Tagihan
+router.get('/app/collector/customers/map', (req, res) => {
+  try {
+    const now = new Date();
+    const curMonth = now.getMonth() + 1;
+    const curYear = now.getFullYear();
+
+    const customers = db.prepare(`
+      SELECT c.id, c.name, c.phone, c.address, c.area, c.lat, c.lng, c.status, c.isolate_day,
+             p.name as package_name, p.price as package_price,
+             i.id as invoice_id, i.amount as invoice_amount, i.status as invoice_status
+      FROM customers c
+      LEFT JOIN packages p ON p.id = c.package_id
+      LEFT JOIN invoices i ON i.customer_id = c.id AND i.period_month = ? AND i.period_year = ?
+      WHERE (i.status = 'unpaid' OR i.status IS NULL OR c.status = 'suspended' OR c.status = 'isolated')
+      ORDER BY c.name ASC LIMIT 100
+    `).all(curMonth, curYear) || [];
+
+    res.json({
+      success: true,
+      data: customers
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.get('/app/admin/cash-report', (req, res) => {
   try {
     const now = new Date();
@@ -858,6 +1176,442 @@ router.get('/app/admin/cash-report', (req, res) => {
     });
   }
 });
+
+// ─── ADMIN NATIVE: MONITORING SISTEM ──────────────────────────────────────────
+router.get('/app/admin/monitoring', async (req, res) => {
+  try {
+    const os = require('os');
+    const cpus = os.cpus();
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const usedMem = totalMem - freeMem;
+    const uptime = os.uptime();
+
+    // CPU usage (average across cores)
+    let cpuPercent = 0;
+    if (cpus.length > 0) {
+      const total = cpus.reduce((acc, cpu) => {
+        const t = Object.values(cpu.times).reduce((a, b) => a + b, 0);
+        const idle = cpu.times.idle;
+        return { total: acc.total + t, idle: acc.idle + idle };
+      }, { total: 0, idle: 0 });
+      cpuPercent = Math.round((1 - total.idle / total.total) * 100);
+    }
+
+    // Disk usage (try Windows and Linux)
+    let diskTotal = 0, diskUsed = 0, diskFree = 0;
+    try {
+      const { execSync } = require('child_process');
+      if (process.platform === 'win32') {
+        const out = execSync('wmic logicaldisk get size,freespace,caption /format:csv', { encoding: 'utf8' });
+        const lines = out.trim().split('\n').filter(l => l.includes(','));
+        for (const line of lines) {
+          const parts = line.trim().split(',');
+          if (parts.length >= 4 && parts[2]) {
+            diskFree += Number(parts[2]) || 0;
+            diskTotal += Number(parts[3]) || 0;
+          }
+        }
+        diskUsed = diskTotal - diskFree;
+      } else {
+        const out = execSync("df -B1 / | tail -1", { encoding: 'utf8' });
+        const parts = out.trim().split(/\s+/);
+        diskTotal = Number(parts[1]) || 0;
+        diskUsed = Number(parts[2]) || 0;
+        diskFree = Number(parts[3]) || 0;
+      }
+    } catch (_) {}
+
+    // Service status checks
+    let mikrotikStatus = 'unknown', whatsappStatus = 'unknown', dbStatus = 'ok';
+    try {
+      const routers = db.prepare('SELECT id, name, host FROM routers WHERE is_active = 1 LIMIT 1').all();
+      mikrotikStatus = routers.length > 0 ? 'configured' : 'not_configured';
+    } catch (_) { mikrotikStatus = 'error'; }
+    try {
+      const { whatsappStatus: waStatus } = await import('../services/whatsappBot.mjs');
+      whatsappStatus = waStatus?.connection === 'open' ? 'connected' : 'disconnected';
+    } catch (_) { whatsappStatus = 'not_available'; }
+
+    res.json({
+      success: true,
+      data: {
+        cpu: { percent: cpuPercent, cores: cpus.length, model: cpus[0]?.model || 'Unknown' },
+        memory: { total: totalMem, used: usedMem, free: freeMem, percent: Math.round(usedMem / totalMem * 100) },
+        disk: { total: diskTotal, used: diskUsed, free: diskFree, percent: diskTotal > 0 ? Math.round(diskUsed / diskTotal * 100) : 0 },
+        uptime: uptime,
+        platform: process.platform,
+        nodeVersion: process.version,
+        services: { mikrotik: mikrotikStatus, whatsapp: whatsappStatus, database: dbStatus }
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─── ADMIN NATIVE: LAPORAN KEUANGAN ──────────────────────────────────────────
+router.get('/app/admin/reports', (req, res) => {
+  try {
+    const month = Number(req.query.month) || (new Date().getMonth() + 1);
+    const year = Number(req.query.year) || new Date().getFullYear();
+
+    const income = db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as total FROM invoices 
+      WHERE (LOWER(status) = 'paid' OR LOWER(status) = 'lunas') AND period_month = ? AND period_year = ?
+    `).get(month, year)?.total || 0;
+
+    const prevMonth = month === 1 ? 12 : month - 1;
+    const prevYear = month === 1 ? year - 1 : year;
+    const prevIncome = db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as total FROM invoices 
+      WHERE (LOWER(status) = 'paid' OR LOWER(status) = 'lunas') AND period_month = ? AND period_year = ?
+    `).get(prevMonth, prevYear)?.total || 0;
+
+    const totalExpense = db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as total FROM expenses 
+      WHERE strftime('%m', date) = ? AND strftime('%Y', date) = ?
+    `).get(String(month).padStart(2, '0'), String(year))?.total || 0;
+
+    const paidCount = db.prepare(`
+      SELECT COUNT(*) as c FROM invoices 
+      WHERE (LOWER(status) = 'paid' OR LOWER(status) = 'lunas') AND period_month = ? AND period_year = ?
+    `).get(month, year)?.c || 0;
+
+    const unpaidCount = db.prepare(`
+      SELECT COUNT(*) as c FROM invoices 
+      WHERE (LOWER(status) = 'unpaid' OR status IS NULL) AND period_month = ? AND period_year = ?
+    `).get(month, year)?.c || 0;
+
+    const recentPayments = db.prepare(`
+      SELECT i.id, i.amount, i.paid_at, c.name as customer_name, p.name as package_name
+      FROM invoices i JOIN customers c ON c.id = i.customer_id LEFT JOIN packages p ON p.id = c.package_id
+      WHERE (LOWER(i.status) = 'paid' OR LOWER(i.status) = 'lunas') AND i.period_month = ? AND i.period_year = ?
+      ORDER BY i.paid_at DESC LIMIT 30
+    `).all(month, year) || [];
+
+    res.json({
+      success: true,
+      data: { month, year, income: Number(income), prevIncome: Number(prevIncome), expense: Number(totalExpense),
+              netProfit: Number(income) - Number(totalExpense), paidCount, unpaidCount, recentPayments }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─── ADMIN NATIVE: PENGELUARAN ───────────────────────────────────────────────
+router.get('/app/admin/expenses', (req, res) => {
+  try {
+    const rows = db.prepare(`SELECT * FROM expenses ORDER BY date DESC, id DESC LIMIT 100`).all() || [];
+    const totalMonth = db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as total FROM expenses 
+      WHERE strftime('%m', date) = ? AND strftime('%Y', date) = ?
+    `).get(String(new Date().getMonth() + 1).padStart(2, '0'), String(new Date().getFullYear()))?.total || 0;
+    const categories = db.prepare(`SELECT DISTINCT category FROM expenses ORDER BY category`).all().map(r => r.category) || [];
+    res.json({ success: true, data: { expenses: rows, totalMonth: Number(totalMonth), categories } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+router.post('/app/admin/expenses/create', (req, res) => {
+  try {
+    const { date, category, amount, description, vendor, payment_method } = req.body;
+    if (!category || !amount) return res.status(400).json({ success: false, message: 'Kategori dan nominal wajib diisi' });
+    db.prepare(`INSERT INTO expenses (date, category, amount, description, vendor, payment_method, recorded_by_role) VALUES (?, ?, ?, ?, ?, ?, 'admin')`)
+      .run(date || new Date().toISOString().slice(0, 10), category, Number(amount), description || '', vendor || '', payment_method || 'cash');
+    res.json({ success: true, message: 'Pengeluaran berhasil dicatat' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─── ADMIN NATIVE: PEMASUKAN KAS ─────────────────────────────────────────────
+router.get('/app/admin/cash-in', (req, res) => {
+  try {
+    const rows = db.prepare(`SELECT * FROM cash_in ORDER BY date DESC, id DESC LIMIT 100`).all() || [];
+    const totalMonth = db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as total FROM cash_in 
+      WHERE strftime('%m', date) = ? AND strftime('%Y', date) = ?
+    `).get(String(new Date().getMonth() + 1).padStart(2, '0'), String(new Date().getFullYear()))?.total || 0;
+    res.json({ success: true, data: { cashIn: rows, totalMonth: Number(totalMonth) } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─── ADMIN NATIVE: VOUCHER HOTSPOT ───────────────────────────────────────────
+router.get('/app/admin/vouchers', (req, res) => {
+  try {
+    const batches = db.prepare(`
+      SELECT b.id as batch_id, b.profile_name, b.price, b.validity, b.qty_total as total_count,
+             (SELECT COUNT(*) FROM vouchers WHERE batch_id = b.id AND (status = 'used' OR status = 'active')) as sold_count,
+             b.created_at
+      FROM voucher_batches b ORDER BY b.id DESC LIMIT 50
+    `).all() || [];
+    const totalVouchers = db.prepare(`SELECT COUNT(*) as c FROM vouchers`).get()?.c || 0;
+    const unsold = db.prepare(`SELECT COUNT(*) as c FROM vouchers WHERE status = 'unused' OR status IS NULL OR status = 'new'`).get()?.c || 0;
+    res.json({ success: true, data: { batches, totalVouchers, unsold } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─── ADMIN NATIVE: ROUTER MIKROTIK ───────────────────────────────────────────
+router.get('/app/admin/routers', (req, res) => {
+  try {
+    const rows = db.prepare(`SELECT id, name, host, port, is_active, created_at FROM routers ORDER BY id ASC`).all() || [];
+    res.json({ success: true, data: rows });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─── ADMIN NATIVE: OLT ──────────────────────────────────────────────────────
+router.get('/app/admin/olts', (req, res) => {
+  try {
+    const rows = db.prepare(`SELECT id, name, host, port, brand, snmp_community, is_active FROM olts ORDER BY id ASC`).all() || [];
+    res.json({ success: true, data: rows });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─── ADMIN NATIVE: WHATSAPP STATUS ───────────────────────────────────────────
+router.get('/app/admin/whatsapp/status', async (req, res) => {
+  try {
+    const { whatsappStatus } = await import('../services/whatsappBot.mjs');
+    const isConnected = whatsappStatus?.connection === 'open';
+    res.json({
+      success: true,
+      data: {
+        connected: isConnected,
+        status: isConnected ? 'Terhubung' : 'Tidak Terhubung',
+        number: whatsappStatus?.phoneNumber || '-',
+        name: whatsappStatus?.pushName || '-'
+      }
+    });
+  } catch (e) {
+    res.json({ success: true, data: { connected: false, status: 'Bot Tidak Aktif', number: '-', name: '-' } });
+  }
+});
+
+// ─── ADMIN NATIVE: DIGIFLAZZ STATUS ─────────────────────────────────────────
+router.get('/app/admin/digiflazz/status', (req, res) => {
+  try {
+    const settings = getSettingsWithCache();
+    const username = settings.digiflazz_username || '';
+    const isActive = settings.digiflazz_enabled === '1' || settings.digiflazz_enabled === 'true';
+    const todayTrx = db.prepare(`
+      SELECT COUNT(*) as c, COALESCE(SUM(price), 0) as total FROM agent_transactions 
+      WHERE type = 'digi_purchase' AND date(created_at) = date('now','localtime')
+    `).get() || {};
+    res.json({
+      success: true,
+      data: { enabled: isActive, username, todayCount: todayTrx.c || 0, todayTotal: Number(todayTrx.total || 0) }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─── ADMIN NATIVE: PENGATURAN SISTEM ─────────────────────────────────────────
+router.get('/app/admin/settings', (req, res) => {
+  try {
+    const s = getSettingsWithCache();
+    res.json({
+      success: true,
+      data: {
+        company_header: s.company_header || '', company_subheader: s.company_subheader || '',
+        company_phone: s.company_phone || '', company_address: s.company_address || '',
+        server_port: s.server_port || '3001', timezone: s.timezone || 'Asia/Jakarta',
+        payment_gateway: s.payment_gateway || '', qris_enabled: s.qris_enabled || '0',
+        whatsapp_enabled: s.whatsapp_enabled || '0', telegram_enabled: s.telegram_enabled || '0',
+        digiflazz_enabled: s.digiflazz_enabled || '0', radius_enabled: s.radius_enabled || '0',
+        multi_router_mode: s.multi_router_mode || 'disabled',
+        auto_isolate_enabled: s.auto_isolate_enabled || '1'
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+router.post('/app/admin/settings/update', (req, res) => {
+  try {
+    const allowed = ['company_header', 'company_subheader', 'company_phone', 'company_address', 'timezone', 'qris_enabled', 'auto_isolate_enabled'];
+    const updates = req.body || {};
+    const settingsPath = require('path').join(__dirname, '../settings.json');
+    const current = JSON.parse(require('fs').readFileSync(settingsPath, 'utf8'));
+    let changed = 0;
+    for (const key of allowed) {
+      if (updates[key] !== undefined) { current[key] = updates[key]; changed++; }
+    }
+    if (changed > 0) require('fs').writeFileSync(settingsPath, JSON.stringify(current, null, 2));
+    res.json({ success: true, message: `${changed} pengaturan berhasil diperbarui` });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─── ADMIN NATIVE: TEKNISI ──────────────────────────────────────────────────
+router.get('/app/admin/technicians', (req, res) => {
+  try {
+    const rows = db.prepare(`SELECT id, name, username, phone, area, is_active, created_at FROM technicians ORDER BY id DESC`).all() || [];
+    res.json({ success: true, data: rows });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── ADMIN NATIVE: KASIR ────────────────────────────────────────────────────
+router.get('/app/admin/cashiers', (req, res) => {
+  try {
+    const rows = db.prepare(`SELECT id, name, username, phone, is_active, created_at FROM cashiers ORDER BY id DESC`).all() || [];
+    res.json({ success: true, data: rows });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── ADMIN NATIVE: KOLEKTOR ─────────────────────────────────────────────────
+router.get('/app/admin/collectors', (req, res) => {
+  try {
+    const rows = db.prepare(`SELECT id, name, username, phone, area, is_active, created_at FROM collectors ORDER BY id DESC`).all() || [];
+    res.json({ success: true, data: rows });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── ADMIN NATIVE: AGEN ─────────────────────────────────────────────────────
+router.get('/app/admin/agents', (req, res) => {
+  try {
+    const rows = db.prepare(`SELECT id, name, username, phone, balance, is_active, created_at FROM agents ORDER BY id DESC`).all() || [];
+    res.json({ success: true, data: rows });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+router.post('/app/admin/agents/topup', (req, res) => {
+  try {
+    const { agentId, amount, note } = req.body;
+    const aid = Number(agentId); const amt = Number(amount);
+    if (!aid || !amt || amt <= 0) return res.status(400).json({ success: false, message: 'ID Agen dan nominal wajib diisi' });
+    db.prepare('UPDATE agents SET balance = balance + ? WHERE id = ?').run(amt, aid);
+    const agent = db.prepare('SELECT name, balance FROM agents WHERE id = ?').get(aid);
+    res.json({ success: true, message: `Saldo agen "${agent?.name}" berhasil ditambah Rp ${amt.toLocaleString('id-ID')}. Saldo baru: Rp ${(agent?.balance || 0).toLocaleString('id-ID')}` });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── ADMIN NATIVE: APPROVAL PEMBAYARAN KOLEKTOR ─────────────────────────────
+router.get('/app/admin/collector-payments', (req, res) => {
+  try {
+    const rows = db.prepare(`
+      SELECT cp.*, c.name as customer_name, c.phone as customer_phone, col.name as collector_name
+      FROM collector_payment_requests cp
+      LEFT JOIN customers c ON c.id = cp.customer_id
+      LEFT JOIN collectors col ON col.id = cp.collector_id
+      ORDER BY cp.id DESC LIMIT 50
+    `).all() || [];
+    const pending = rows.filter(r => r.status === 'pending').length;
+    res.json({ success: true, data: { payments: rows, pendingCount: pending } });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+router.post('/app/admin/collector-payments/approve', async (req, res) => {
+  try {
+    const payId = Number(req.body.paymentId || req.body.id);
+    if (!payId) return res.status(400).json({ success: false, message: 'ID pembayaran tidak valid' });
+    const pay = db.prepare('SELECT * FROM collector_payment_requests WHERE id = ?').get(payId);
+    if (!pay) return res.status(404).json({ success: false, message: 'Pembayaran tidak ditemukan' });
+    if (pay.status !== 'pending') return res.status(400).json({ success: false, message: 'Pembayaran sudah diproses' });
+    // Mark as approved & pay invoice
+    db.prepare('UPDATE collector_payment_requests SET status = ?, decided_at = datetime("now","localtime"), decided_by_role = ?, decided_by_name = ? WHERE id = ?').run('approved', 'admin', 'Admin APK', payId);
+    if (pay.invoice_id) {
+      db.prepare(`UPDATE invoices SET status = 'paid', paid_at = datetime('now','localtime'), paid_by_name = ? WHERE id = ?`).run('Kolektor: ' + (pay.collector_name || 'Kolektor'), pay.invoice_id);
+      try { await customerSvc.activateCustomer(pay.customer_id); } catch (_) {}
+    }
+    res.json({ success: true, message: 'Pembayaran berhasil di-approve dan tagihan ditandai LUNAS' });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── ADMIN NATIVE: AREA WILAYAH ─────────────────────────────────────────────
+router.get('/app/admin/areas', (req, res) => {
+  try {
+    const rows = db.prepare(`
+      SELECT a.*, (SELECT COUNT(*) FROM customers WHERE area = a.name) as customer_count 
+      FROM areas a ORDER BY a.name ASC
+    `).all() || [];
+    res.json({ success: true, data: rows });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── ADMIN NATIVE: INVENTARIS / GUDANG ──────────────────────────────────────
+router.get('/app/admin/inventory', (req, res) => {
+  try {
+    const items = db.prepare(`SELECT * FROM inventory_items ORDER BY name ASC`).all() || [];
+    const lowStock = items.filter(i => i.quantity <= (i.min_stock || 5));
+    res.json({ success: true, data: { items, lowStockCount: lowStock.length } });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── ADMIN NATIVE: TIKET DUKUNGAN ───────────────────────────────────────────
+router.get('/app/admin/tickets', (req, res) => {
+  try {
+    const rows = db.prepare(`
+      SELECT t.*, c.name as customer_name, c.phone as customer_phone
+      FROM tickets t LEFT JOIN customers c ON c.id = t.customer_id
+      ORDER BY t.created_at DESC LIMIT 50
+    `).all() || [];
+    const openCount = rows.filter(r => r.status === 'open' || r.status === 'pending').length;
+    res.json({ success: true, data: { tickets: rows, openCount } });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+router.post('/app/admin/tickets/update-status', (req, res) => {
+  try {
+    const { ticketId, status, note } = req.body;
+    if (!ticketId) return res.status(400).json({ success: false, message: 'ID tiket tidak valid' });
+    db.prepare('UPDATE tickets SET status = ?, updated_at = datetime("now","localtime") WHERE id = ?').run(status || 'resolved', Number(ticketId));
+    res.json({ success: true, message: 'Status tiket berhasil diperbarui' });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── ADMIN NATIVE: BACKUP DATABASE ──────────────────────────────────────────
+router.get('/app/admin/backups', (req, res) => {
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const backupDir = path.join(__dirname, '../backups');
+    let files = [];
+    if (fs.existsSync(backupDir)) {
+      files = fs.readdirSync(backupDir).filter(f => f.endsWith('.db') || f.endsWith('.zip') || f.endsWith('.gz'))
+        .map(f => ({ name: f, size: fs.statSync(path.join(backupDir, f)).size, date: fs.statSync(path.join(backupDir, f)).mtime }))
+        .sort((a, b) => new Date(b.date) - new Date(a.date));
+    }
+    res.json({ success: true, data: files });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+router.post('/app/admin/backup/create', (req, res) => {
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const backupDir = path.join(__dirname, '../backups');
+    if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const dest = path.join(backupDir, `billing_backup_${ts}.db`);
+    const src = path.join(__dirname, '../database/billing.db');
+    fs.copyFileSync(src, dest);
+    const size = fs.statSync(dest).size;
+    res.json({ success: true, message: `Backup berhasil dibuat: billing_backup_${ts}.db (${(size / 1024).toFixed(1)} KB)` });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─── ADMIN NATIVE: AUDIT LOG ────────────────────────────────────────────────
+router.get('/app/admin/audit-logs', (req, res) => {
+  try {
+    const rows = db.prepare(`SELECT id, action, actor_name as performed_by, details, created_at FROM audit_trail ORDER BY id DESC LIMIT 100`).all() || [];
+    res.json({ success: true, data: rows });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+
 
 router.post('/app/agent/buy-voucher', (req, res) => {
   try {
@@ -1239,7 +1993,337 @@ router.post('/app/tech/tr069/device/reboot', async (req, res) => {
   }
 });
 
-// ─── 1. INFO SERVER & KONFIGURASI ISP (PUBLIC) ────────────────────────────────
+// ─── TEKNISI NATIVE: PASANG BARU PELANGGAN ──────────────────────────────────
+router.get('/app/tech/customers/options', (req, res) => {
+  try {
+    const pkgs = customerSvc.getAllPackages() || [];
+    const routers = db.prepare('SELECT id, name, host FROM routers WHERE is_active = 1').all() || [];
+    const odps = db.prepare('SELECT id, name, area, total_ports, used_ports FROM odps').all() || [];
+    const areas = db.prepare('SELECT id, name FROM areas ORDER BY name ASC').all() || [];
+    res.json({ success: true, data: { packages: pkgs, routers, odps, areas } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+router.post('/app/tech/customers/create', async (req, res) => {
+  try {
+    const name = String(req.body.name || '').trim();
+    if (!name) return res.status(400).json({ success: false, message: 'Nama pelanggan wajib diisi' });
+
+    const customerData = {
+      name,
+      phone: String(req.body.phone || '').trim(),
+      address: String(req.body.address || '').trim(),
+      area: String(req.body.area || '').trim(),
+      package_id: req.body.package_id ? Number(req.body.package_id) : null,
+      pppoe_username: String(req.body.pppoe_username || '').trim(),
+      pppoe_password: String(req.body.pppoe_password || '123456').trim(),
+      router_id: req.body.router_id ? Number(req.body.router_id) : null,
+      odp_id: req.body.odp_id ? Number(req.body.odp_id) : null,
+      lat: String(req.body.lat || '').trim(),
+      lng: String(req.body.lng || '').trim(),
+      status: 'active',
+      install_date: new Date().toISOString().slice(0, 10),
+      notes: String(req.body.notes || 'Pasang Baru via Teknisi APK').trim(),
+      isolate_day: req.body.isolate_day ? Number(req.body.isolate_day) : 10
+    };
+
+    if (customerData.pppoe_username) {
+      const existing = db.prepare('SELECT id, name FROM customers WHERE pppoe_username = ? LIMIT 1').get(customerData.pppoe_username);
+      if (existing) return res.status(400).json({ success: false, message: `PPPoE Username sudah dipakai oleh ${existing.name}` });
+    }
+
+    const inserted = customerSvc.createCustomer(customerData);
+    const newId = Number(inserted.lastInsertRowid);
+
+    // If PPPoE and router, create secret in MikroTik
+    if (customerData.pppoe_username && customerData.router_id) {
+      try {
+        const pkg = customerData.package_id ? customerSvc.getPackageById(customerData.package_id) : null;
+        await mikrotikService.upsertPppoeSecret(customerData.router_id, {
+          name: customerData.pppoe_username,
+          password: customerData.pppoe_password,
+          profile: pkg?.name || 'default',
+          comment: `Pelanggan #${newId}: ${customerData.name}`
+        });
+      } catch (mErr) {
+        logger.error('[Tech Create Customer] MikroTik upsert error: ' + mErr.message);
+      }
+    }
+
+    // Update ODP used ports
+    if (customerData.odp_id) {
+      try {
+        db.prepare('UPDATE odps SET used_ports = used_ports + 1 WHERE id = ?').run(customerData.odp_id);
+      } catch (_) {}
+    }
+
+    res.json({
+      success: true,
+      message: `Pelanggan "${name}" berhasil didaftarkan dan terhubung ke sistem!`,
+      customerId: newId
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Gagal mendaftarkan pelanggan: ' + e.message });
+  }
+});
+
+// ─── TEKNISI NATIVE: ABSENSI ────────────────────────────────────────────────
+router.get('/app/tech/attendance/today', (req, res) => {
+  try {
+    const techId = resolveTechId(req);
+    const attendanceSvc = require('../services/attendanceService');
+    const { getSetting } = require('../config/settingsManager');
+    const companyName = getSetting('company_header', 'ALIJAYA NET');
+    const today = attendanceSvc.getTodayAttendance('technician', techId);
+    res.json({
+      success: true,
+      data: today ? { ...today, companyName } : { status: 'none', companyName }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+router.post('/app/tech/attendance/checkin', (req, res) => {
+  try {
+    const techId = resolveTechId(req);
+    const tech = techSvc.getTechById(techId);
+    const attendanceSvc = require('../services/attendanceService');
+    const today = attendanceSvc.getTodayAttendance('technician', techId);
+    if (today) {
+      return res.status(400).json({ success: false, message: 'Anda sudah melakukan check-in hari ini!' });
+    }
+
+    let { lat, lng, note, photo } = req.body || {};
+    const { getSetting } = require('../config/settingsManager');
+    const officeLat = getSetting('office_lat', '0');
+    const officeLng = getSetting('office_lng', '0');
+    if ((!lat || !lng || String(lat).trim() === '' || String(lat).trim() === '0') && officeLat && officeLng) {
+      lat = officeLat;
+      lng = officeLng;
+    }
+
+    const photoPath = saveAttendancePhoto(photo);
+
+    const result = attendanceSvc.checkIn({
+      employee_type: 'technician',
+      employee_id: techId,
+      employee_name: tech?.name || 'Teknisi Lapangan',
+      lat: String(lat || officeLat || ''),
+      lng: String(lng || officeLng || ''),
+      note: String(note || 'Check-in via APK Native Teknisi'),
+      photo: photoPath
+    });
+
+    res.json({ success: true, message: '✅ Check-in berhasil dicatat!', id: result.lastInsertRowid });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Gagal check-in: ' + e.message });
+  }
+});
+
+router.post('/app/tech/attendance/checkout', (req, res) => {
+  try {
+    const techId = resolveTechId(req);
+    const attendanceSvc = require('../services/attendanceService');
+    const today = attendanceSvc.getTodayAttendance('technician', techId);
+    if (!today) {
+      return res.status(400).json({ success: false, message: 'Anda belum check-in hari ini!' });
+    }
+    if (today.status === 'checked_out') {
+      return res.status(400).json({ success: false, message: 'Anda sudah check-out hari ini!' });
+    }
+
+    let { lat, lng, note, photo } = req.body || {};
+    const { getSetting } = require('../config/settingsManager');
+    const officeLat = getSetting('office_lat', '0');
+    const officeLng = getSetting('office_lng', '0');
+    if ((!lat || !lng || String(lat).trim() === '' || String(lat).trim() === '0') && officeLat && officeLng) {
+      lat = officeLat;
+      lng = officeLng;
+    }
+
+    const photoPath = saveAttendancePhoto(photo);
+
+    attendanceSvc.checkOut(today.id, {
+      lat: String(lat || officeLat || ''),
+      lng: String(lng || officeLng || ''),
+      note: String(note || 'Check-out via APK Native Teknisi'),
+      photo: photoPath
+    });
+
+    res.json({ success: true, message: '✅ Check-out berhasil dicatat! Terima kasih atas dedikasi Anda hari ini.' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Gagal check-out: ' + e.message });
+  }
+});
+
+// ─── PELANGGAN NATIVE: WALLET / DOMPET ──────────────────────────────────────
+router.get('/app/customer/wallet', (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || req.headers['x-access-token'] || req.query.token;
+    const payload = verifyCustomerToken(authHeader);
+    const customerId = payload?.customerId || 1;
+
+    const row = db.prepare('SELECT id, name, balance FROM customers WHERE id = ?').get(customerId);
+    const history = db.prepare('SELECT * FROM customer_topup_requests WHERE customer_id = ? ORDER BY id DESC LIMIT 20').all(customerId) || [];
+
+    res.json({
+      success: true,
+      data: {
+        balance: Number(row?.balance || 0),
+        customerName: row?.name || 'Pelanggan',
+        history: history
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─── PELANGGAN NATIVE: TOPUP DOMPET VIA QRIS ────────────────────────────────
+router.post('/app/customer/topup/create', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || req.headers['x-access-token'] || req.query.token;
+    const payload = verifyCustomerToken(authHeader);
+    const customerId = payload?.customerId || 1;
+
+    const amount = Number(req.body.amount || 0);
+    if (!amount || amount < 10000) {
+      return res.status(400).json({ success: false, message: 'Minimal top-up saldo adalah Rp 10.000' });
+    }
+
+    const customer = db.prepare('SELECT * FROM customers WHERE id = ?').get(customerId);
+    if (!customer) return res.status(404).json({ success: false, message: 'Pelanggan tidak ditemukan' });
+
+    // Generate unique code 1-999
+    const uniqueCode = Math.floor(1 + Math.random() * 998);
+    const totalAmount = amount + uniqueCode;
+
+    const ins = db.prepare(`INSERT INTO customer_topup_requests (customer_id, amount, status) VALUES (?, ?, 'pending')`).run(customerId, totalAmount);
+    const reqId = Number(ins.lastInsertRowid);
+
+    // Static / Dynamic QRIS payload
+    const settings = getSettingsWithCache();
+    let qrisPayload = settings.qris_static_payload || settings.qris_string || '';
+
+    // If static payload, modify with total amount if possible
+    if (qrisPayload && qrisUtil && qrisUtil.createDynamicQris) {
+      try {
+        qrisPayload = qrisUtil.createDynamicQris(qrisPayload, totalAmount);
+      } catch (_) {}
+    }
+
+    db.prepare('UPDATE customer_topup_requests SET payment_payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .run(JSON.stringify({ total_amount: totalAmount, unique_code: uniqueCode, qris_string: qrisPayload }), reqId);
+
+    res.json({
+      success: true,
+      data: {
+        topupId: reqId,
+        amount: amount,
+        uniqueCode: uniqueCode,
+        totalAmount: totalAmount,
+        qrisString: qrisPayload,
+        status: 'pending'
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+router.get('/app/customer/topup/status/:id', (req, res) => {
+  try {
+    const reqId = Number(req.params.id);
+    const row = db.prepare('SELECT * FROM customer_topup_requests WHERE id = ?').get(reqId);
+    if (!row) return res.status(404).json({ success: false, message: 'Data topup tidak ditemukan' });
+
+    const cust = db.prepare('SELECT balance FROM customers WHERE id = ?').get(row.customer_id);
+    res.json({
+      success: true,
+      data: {
+        id: row.id,
+        amount: Number(row.amount || 0),
+        status: row.status || 'pending',
+        paidAt: row.paid_at,
+        currentBalance: Number(cust?.balance || 0)
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─── PELANGGAN NATIVE: KATALOG & BELI PPOB ──────────────────────────────────
+router.get('/app/customer/ppob/catalog', (req, res) => {
+  try {
+    const catalog = getAgentPulsaCatalog();
+    res.json({ success: true, data: catalog });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+router.post('/app/customer/ppob/order', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || req.headers['x-access-token'] || req.query.token;
+    const payload = verifyCustomerToken(authHeader);
+    const customerId = payload?.customerId || 1;
+
+    const { sku, target } = req.body || {};
+    if (!sku || !target) return res.status(400).json({ success: false, message: 'SKU produk dan nomor tujuan wajib diisi' });
+
+    const customer = db.prepare('SELECT * FROM customers WHERE id = ?').get(customerId);
+    if (!customer) return res.status(404).json({ success: false, message: 'Pelanggan tidak ditemukan' });
+
+    const catalog = getAgentPulsaCatalog();
+    const product = catalog.find(p => p.sku === sku);
+    if (!product) return res.status(404).json({ success: false, message: 'Produk PPOB tidak ditemukan' });
+
+    const price = Number(product.price_sell || product.price || 0);
+    const balance = Number(customer.balance || 0);
+
+    if (balance < price) {
+      return res.status(400).json({
+        success: false,
+        message: `Saldo dompet Anda tidak cukup (Saldo: Rp ${balance.toLocaleString('id-ID')}, Diperlukan: Rp ${price.toLocaleString('id-ID')}). Silakan top-up saldo terlebih dahulu.`
+      });
+    }
+
+    // Deduct balance
+    db.prepare('UPDATE customers SET balance = balance - ? WHERE id = ?').run(price, customerId);
+
+    // Call digiflazz if enabled
+    let sn = 'TRX-' + Date.now();
+    let msg = 'Transaksi pulsa berhasil diproses!';
+    try {
+      if (agentSvc && agentSvc.buyPulsaAsAgent) {
+        const digiRes = await agentSvc.buyPulsaAsAgent(1, sku, target, { sell_price: price });
+        sn = digiRes?.tx?.digi_sn || sn;
+        msg = digiRes?.tx?.digi_message || msg;
+      }
+    } catch (_) {}
+
+    const newBalance = db.prepare('SELECT balance FROM customers WHERE id = ?').get(customerId)?.balance || 0;
+
+    res.json({
+      success: true,
+      message: `Pembelian ${product.product_name} ke ${target} berhasil!`,
+      data: {
+        sku,
+        target,
+        productName: product.product_name,
+        price,
+        sn,
+        remainingBalance: Number(newBalance)
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Gagal memproses transaksi: ' + e.message });
+  }
+});
 router.get('/config', (req, res) => {
   const settings = getSettingsWithCache();
   res.json({
