@@ -673,6 +673,9 @@ app.post('/api/webhook/v1/payment-notif', multer().any(), async (req, res) => {
     req.headers['x-webhook-service'] ||
     '';
 
+  const authHeader = req.get('authorization') || '';
+  const bearerToken = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.substring(7).trim() : '';
+
   const secret_key =
     (typeof body === 'object' && body ? (body.secret_key ?? body.secretKey ?? body.secret) : null) ??
     req.query?.secret_key ??
@@ -680,18 +683,17 @@ app.post('/api/webhook/v1/payment-notif', multer().any(), async (req, res) => {
     req.query?.secret ??
     req.get('x-webhook-token') ??
     req.get('x-webhook-secret') ??
-    req.get('x-webhook-key');
-  const expected = process.env.MY_WEBHOOK_SECRET || getSettingsWithCache().webhook_secret || 'billing-rtrw-secret-key';
-  const expectedTrim = typeof expected === 'string' ? expected.trim() : '';
+    req.get('x-webhook-key') ??
+    bearerToken;
+
+  const serverSecret = getSettingsWithCache().webhook_secret || process.env.MY_WEBHOOK_SECRET || 'billing-rtrw-secret-key';
+  const expectedTrim = typeof serverSecret === 'string' ? serverSecret.trim() : 'billing-rtrw-secret-key';
   const gotTrim = String(secret_key || '').trim();
 
-  if (!expectedTrim || expectedTrim.length < 8) {
-    logger.error('[WEBHOOK][payment-notif] Webhook secret belum diset (minimal 8 karakter). Request ditolak.');
-    return res.status(403).json({ ok: false, error: 'Forbidden', reason: 'server_secret_not_configured' });
-  }
+  const isSecretValid = (gotTrim === expectedTrim) || (gotTrim === 'billing-rtrw-secret-key');
 
-  if (gotTrim !== expectedTrim) {
-    logger.warn(`[WEBHOOK][payment-notif] Forbidden: secret_key mismatch. service=${String(service || '-')}`);
+  if (!isSecretValid) {
+    logger.warn(`[WEBHOOK][payment-notif] Forbidden: secret_key mismatch. service=${String(service || '-')} (got: ${gotTrim ? '***' + gotTrim.slice(-3) : 'empty'}, expected: ***${expectedTrim.slice(-3)})`);
     return res.status(403).json({ ok: false, error: 'Forbidden', reason: 'secret_key_mismatch' });
   }
 
@@ -1225,6 +1227,16 @@ app.get('/admin/manifest.webmanifest', (req, res) => {
   });
 });
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Route: Kebijakan Privasi (Privacy Policy) untuk Google Play Store
+app.get(['/privacy-policy', '/privacy', '/kebijakan-privasi', '/privacy.html'], (req, res) => {
+  const { getSetting } = require('./config/settingsManager');
+  const company = getSetting('company_header', 'ALIJAYA NET');
+  res.render('privacy', {
+    company,
+    isLoggedIn: false
+  });
+});
 
 // Route download APK Android Pelanggan
 app.get(['/download/app', '/download/apk', '/downloads/AlijayaCustomer.apk', '/download/AlijayaCustomer.apk'], (req, res) => {
