@@ -1,1 +1,38 @@
-MY_WEBHOOK_SECRET=Qris-Statik-key
+# ==================================================
+# RTRWNET Management & Billing System
+# Environment Configuration Example
+# ==================================================
+# Copy file ini menjadi .env dan sesuaikan nilainya
+
+# Webhook & Security
+MY_WEBHOOK_SECRET=your-webhook-secret-key-here
+
+# Database Configuration (jika menggunakan external database)
+# DB_HOST=localhost
+# DB_PORT=5432
+# DB_NAME=billing_rtrw
+# DB_USER=billing_user
+# DB_PASSWORD=your_db_password
+
+# Server Configuration (jika tidak ingin menggunakan settings.json)
+# PORT=4000
+# NODE_ENV=production
+
+# Payment Gateway Webhooks
+# MIDTRANS_WEBHOOK_URL=http://your-domain.com/api/webhook/midtrans
+# TRIPAY_WEBHOOK_URL=http://your-domain.com/api/webhook/tripay
+# XENDIT_WEBHOOK_URL=http://your-domain.com/api/webhook/xendit
+# DUITKU_WEBHOOK_URL=http://your-domain.com/api/webhook/duitku
+
+# External Services
+# SENTRY_DSN=https://xxx@sentry.io/xxxxxx (untuk error tracking)
+
+# Logging
+# LOG_LEVEL=info
+# LOG_FILE=./logs/app.log
+
+# Catatan:
+# 1. Semua konfigurasi utama tersimpan di settings.json
+# 2. File .env ini hanya untuk override atau konfigurasi tambahan
+# 3. Jangan commit .env ke repository (sudah ada di .gitignore)
+# 4. Pastikan MY_WEBHOOK_SECRET sudah diubah dari nilai default
