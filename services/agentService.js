@@ -248,7 +248,27 @@ function deleteAgent(id) {
 }
 
 function getAgentPrices(agentId) {
-  return db
+  const agent = getAgentById(agentId);
+  const agentFee = Math.max(0, Number(agent?.billing_fee || 0));
+
+  // 1. Ambil paket resmi yang aktif dari voucher_packages (dikelola admin di /admin/vouchers/packages)
+  let masterPackages = [];
+  try {
+    masterPackages = db
+      .prepare(
+        `
+        SELECT vp.*, r.name AS router_name
+        FROM voucher_packages vp
+        LEFT JOIN routers r ON r.id = vp.router_id
+        WHERE vp.is_active = 1
+        ORDER BY vp.price ASC, vp.profile_name ASC
+      `
+      )
+      .all();
+  } catch (_) {}
+
+  // 2. Ambil kustomisasi harga agen (jika ada di agent_hotspot_prices)
+  const customPrices = db
     .prepare(
       `
       SELECT p.*, r.name AS router_name
@@ -259,6 +279,65 @@ function getAgentPrices(agentId) {
     `
     )
     .all(agentId);
+
+  const customMap = new Map();
+  for (const cp of customPrices) {
+    const key = `${cp.router_id ?? 'all'}__${String(cp.profile_name || '').trim().toLowerCase()}`;
+    customMap.set(key, cp);
+  }
+
+  // 3. Jika ada paket di voucher_packages, sinkronkan sepenuhnya
+  if (masterPackages && masterPackages.length > 0) {
+    const result = [];
+    for (const mp of masterPackages) {
+      const key = `${mp.router_id ?? 'all'}__${String(mp.profile_name || '').trim().toLowerCase()}`;
+      const custom = customMap.get(key);
+
+      if (custom) {
+        if (custom.is_active) {
+          result.push({
+            id: custom.id,
+            package_id: mp.id,
+            agent_id: agentId,
+            router_id: mp.router_id,
+            profile_name: mp.profile_name,
+            validity: custom.validity || mp.validity,
+            buy_price: Math.max(0, Number(custom.buy_price || 0)),
+            sell_price: Math.max(0, Number(custom.sell_price || mp.price)),
+            is_active: 1,
+            router_name: mp.router_name || custom.router_name || 'Hotspot',
+            prefix: mp.prefix || '',
+            code_length: mp.code_length || 6,
+            charset: mp.charset || 'numbers'
+          });
+        }
+      } else {
+        const sellPrice = Math.max(0, Number(mp.price || 0));
+        const discount = agentFee > 0 && agentFee < sellPrice ? agentFee : Math.floor(sellPrice * 0.10);
+        const buyPrice = Math.max(500, sellPrice - discount);
+
+        result.push({
+          id: mp.id,
+          package_id: mp.id,
+          agent_id: agentId,
+          router_id: mp.router_id,
+          profile_name: mp.profile_name,
+          validity: mp.validity || '24 Jam',
+          buy_price: buyPrice,
+          sell_price: sellPrice,
+          is_active: 1,
+          router_name: mp.router_name || 'Hotspot',
+          prefix: mp.prefix || '',
+          code_length: mp.code_length || 6,
+          charset: mp.charset || 'numbers'
+        });
+      }
+    }
+    return result;
+  }
+
+  // Fallback jika voucher_packages masih kosong: kembalikan customPrices yang aktif
+  return (customPrices || []).filter(cp => cp && cp.is_active);
 }
 
 function upsertAgentHotspotPrice(agentId, data) {
@@ -446,7 +525,11 @@ async function sellVoucherAsAgent(agentId, priceId, opts = {}) {
   const agent = getAgentById(agentId);
   if (!agent || !agent.is_active) throw new Error('Akun agent tidak aktif');
 
-  const price = db
+  let price = null;
+  let pkgMeta = null;
+
+  // 1. Coba cari di agent_hotspot_prices
+  price = db
     .prepare(
       `
       SELECT p.*, r.name AS router_name
@@ -457,7 +540,44 @@ async function sellVoucherAsAgent(agentId, priceId, opts = {}) {
     )
     .get(priceId, agentId);
 
-  if (!price) throw new Error('Harga/profile voucher tidak ditemukan');
+  // 2. Jika tidak ditemukan di custom agent, cari di voucher_packages (/admin/vouchers/packages)
+  if (!price) {
+    const vp = db
+      .prepare(
+        `
+        SELECT vp.*, r.name AS router_name
+        FROM voucher_packages vp
+        LEFT JOIN routers r ON r.id = vp.router_id
+        WHERE vp.id = ? AND vp.is_active = 1
+      `
+      )
+      .get(priceId);
+
+    if (vp) {
+      pkgMeta = vp;
+      const sellPrice = Math.max(0, Number(vp.price || 0));
+      const agentFee = Math.max(0, Number(agent.billing_fee || 0));
+      const discount = agentFee > 0 && agentFee < sellPrice ? agentFee : Math.floor(sellPrice * 0.10);
+      const buyPrice = Math.max(500, sellPrice - discount);
+
+      price = {
+        id: vp.id,
+        agent_id: agentId,
+        router_id: vp.router_id,
+        profile_name: vp.profile_name,
+        validity: vp.validity,
+        buy_price: buyPrice,
+        sell_price: sellPrice,
+        is_active: 1,
+        router_name: vp.router_name || 'Hotspot',
+        prefix: vp.prefix || '',
+        code_length: vp.code_length || 6,
+        charset: vp.charset || 'numbers'
+      };
+    }
+  }
+
+  if (!price) throw new Error('Paket voucher hotspot tidak ditemukan atau belum aktif di pengaturan');
 
   const buyPrice = Math.max(0, Number(price.buy_price || 0) || 0);
   const sellPrice = Math.max(0, Number(price.sell_price || 0) || 0);
@@ -475,14 +595,15 @@ async function sellVoucherAsAgent(agentId, priceId, opts = {}) {
     if (profileMeta?.validity) validity = profileMeta.validity;
   } catch (e) {}
 
-  const charset = opts.charset || 'numbers';
-  const length = Math.max(4, Math.min(16, Number(opts.code_length) || 6));
+  const prefix = opts.prefix || price.prefix || pkgMeta?.prefix || '';
+  const charset = opts.charset || price.charset || pkgMeta?.charset || 'numbers';
+  const length = Math.max(4, Math.min(16, Number(opts.code_length || price.code_length || pkgMeta?.code_length) || 6));
 
   let created = null;
   let attempt = 0;
   while (attempt < 10) {
     attempt++;
-    const code = genCode(length, charset);
+    const code = (prefix ? prefix : '') + genCode(length, charset);
     const password = opts.mode === 'member' ? genCode(length, charset) : code;
     const comment = `ag-${agent.username}-${code}-${profileName}`;
     const userData = { server: 'all', name: code, password, profile: profileName, comment };

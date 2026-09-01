@@ -486,7 +486,7 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
     description TEXT DEFAULT '',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT (NOW_LOCAL())
   );
 
   CREATE TABLE IF NOT EXISTS inventory_items (
@@ -498,7 +498,7 @@ db.exec(`
     unit TEXT DEFAULT 'pcs', -- pcs, meter, roll, etc.
     min_stock INTEGER DEFAULT 5,
     description TEXT DEFAULT '',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT (NOW_LOCAL())
   );
 
   CREATE TABLE IF NOT EXISTS inventory_stock (
@@ -511,8 +511,8 @@ db.exec(`
     status TEXT DEFAULT 'available', -- available, assigned, broken, lost
     assigned_to_customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
     note TEXT DEFAULT '',
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at DATETIME DEFAULT (NOW_LOCAL()),
+    created_at DATETIME DEFAULT (NOW_LOCAL())
   );
 
   CREATE TABLE IF NOT EXISTS inventory_logs (
@@ -523,7 +523,7 @@ db.exec(`
     quantity INTEGER NOT NULL DEFAULT 0,
     actor TEXT DEFAULT 'Admin',
     note TEXT DEFAULT '',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT (NOW_LOCAL())
   );
 
   CREATE INDEX IF NOT EXISTS idx_inventory_items_cat ON inventory_items(category_id);

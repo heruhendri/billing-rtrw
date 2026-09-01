@@ -29,7 +29,7 @@ function upsertPayrollSetting(data) {
         phone_allowance = ?, other_allowance = ?, other_allowance_note = ?,
         absence_deduction_per_day = ?, bonus_per_ticket = ?,
         commission_percentage = ?, working_days_per_month = ?,
-        updated_at = CURRENT_TIMESTAMP
+        updated_at = (NOW_LOCAL())
       WHERE employee_type = ? AND employee_id = ?
     `).run(
       parseInt(data.base_salary) || 0,
@@ -332,7 +332,7 @@ function approveSlip(id) {
   if (slip.status !== 'draft') throw new Error('Hanya slip draft yang bisa di-approve');
 
   return db.prepare(`
-    UPDATE payroll_slips SET status = 'approved', approved_at = CURRENT_TIMESTAMP WHERE id = ?
+    UPDATE payroll_slips SET status = 'approved', approved_at = (NOW_LOCAL()) WHERE id = ?
   `).run(id);
 }
 
@@ -342,7 +342,7 @@ function markSlipPaid(id) {
   if (slip.status !== 'approved') throw new Error('Hanya slip yang sudah approved yang bisa ditandai paid');
 
   const result = db.prepare(`
-    UPDATE payroll_slips SET status = 'paid', paid_at = CURRENT_TIMESTAMP WHERE id = ?
+    UPDATE payroll_slips SET status = 'paid', paid_at = (NOW_LOCAL()) WHERE id = ?
   `).run(id);
 
   // Auto Insert ke Tabel Pengeluaran (Expenses)
@@ -360,7 +360,7 @@ function markSlipPaid(id) {
 
 function bulkApprove(month, year) {
   return db.prepare(`
-    UPDATE payroll_slips SET status = 'approved', approved_at = CURRENT_TIMESTAMP
+    UPDATE payroll_slips SET status = 'approved', approved_at = (NOW_LOCAL())
     WHERE period_month = ? AND period_year = ? AND status = 'draft'
   `).run(month, year);
 }
@@ -369,7 +369,7 @@ function bulkMarkPaid(month, year) {
   const slipsToPay = db.prepare(`SELECT * FROM payroll_slips WHERE period_month = ? AND period_year = ? AND status = 'approved'`).all(month, year);
   
   const result = db.prepare(`
-    UPDATE payroll_slips SET status = 'paid', paid_at = CURRENT_TIMESTAMP
+    UPDATE payroll_slips SET status = 'paid', paid_at = (NOW_LOCAL())
     WHERE period_month = ? AND period_year = ? AND status = 'approved'
   `).run(month, year);
 

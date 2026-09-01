@@ -175,28 +175,23 @@ function formatPaymentSuccessMessage({
   const monthName = periodMonth ? getIndonesianMonthName(periodMonth) : '';
   const periodText = (monthName && periodYear) ? `${monthName} ${periodYear}` : (periodMonth && periodYear ? `${periodMonth}/${periodYear}` : '-');
 
-  let formattedTime = '';
-  if (paidAt) {
-    try {
-      const d = new Date(paidAt);
-      if (!isNaN(d.getTime())) {
-        const day = String(d.getDate()).padStart(2, '0');
-        const mo = getIndonesianMonthName(d.getMonth() + 1);
-        const yr = d.getFullYear();
-        const hr = String(d.getHours()).padStart(2, '0');
-        const min = String(d.getMinutes()).padStart(2, '0');
-        formattedTime = `${day} ${mo} ${yr}, ${hr}:${min} WIB`;
-      }
-    } catch {}
+  const tz = getSetting('timezone', 'Asia/Jakarta');
+  let tzSuffix = 'WIB';
+  if (/Makassar|Ujung_Pandang|Bali|Pontianak|Banjarmasin|Manado|Mataram|Kupang/i.test(tz)) {
+    tzSuffix = 'WITA';
+  } else if (/Jayapura|Ambon|Papua|Maluku/i.test(tz)) {
+    tzSuffix = 'WIT';
+  } else if (!/Jakarta|Bangkok|Asia\/Jakarta/i.test(tz)) {
+    tzSuffix = tz;
   }
-  if (!formattedTime) {
+
+  let formattedTime = '';
+  try {
+    const { formatDateLocal } = require('../config/settingsManager');
+    formattedTime = `${formatDateLocal(paidAt || new Date())} ${tzSuffix}`;
+  } catch {
     const now = new Date();
-    const day = String(now.getDate()).padStart(2, '0');
-    const mo = getIndonesianMonthName(now.getMonth() + 1);
-    const yr = now.getFullYear();
-    const hr = String(now.getHours()).padStart(2, '0');
-    const min = String(now.getMinutes()).padStart(2, '0');
-    formattedTime = `${day} ${mo} ${yr}, ${hr}:${min} WIB`;
+    formattedTime = `${now.toLocaleDateString('id-ID')} ${now.toLocaleTimeString('id-ID')} ${tzSuffix}`;
   }
 
   const formattedAmount = Number(amount || 0).toLocaleString('id-ID');

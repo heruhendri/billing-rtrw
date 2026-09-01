@@ -1430,7 +1430,8 @@ router.get('/app/admin/settings', (req, res) => {
         whatsapp_enabled: s.whatsapp_enabled || '0', telegram_enabled: s.telegram_enabled || '0',
         digiflazz_enabled: s.digiflazz_enabled || '0', radius_enabled: s.radius_enabled || '0',
         multi_router_mode: s.multi_router_mode || 'disabled',
-        auto_isolate_enabled: s.auto_isolate_enabled || '1'
+        auto_isolate_enabled: s.auto_isolate_enabled || '1',
+        webhook_secret: s.webhook_secret || 'billing-rtrw-secret-key'
       }
     });
   } catch (e) {
@@ -1440,7 +1441,7 @@ router.get('/app/admin/settings', (req, res) => {
 
 router.post('/app/admin/settings/update', (req, res) => {
   try {
-    const allowed = ['company_header', 'company_subheader', 'company_phone', 'company_address', 'timezone', 'qris_enabled', 'auto_isolate_enabled'];
+    const allowed = ['company_header', 'company_subheader', 'company_phone', 'company_address', 'timezone', 'qris_enabled', 'auto_isolate_enabled', 'webhook_secret'];
     const updates = req.body || {};
     const settingsPath = require('path').join(__dirname, '../settings.json');
     const current = JSON.parse(require('fs').readFileSync(settingsPath, 'utf8'));
@@ -1450,6 +1451,36 @@ router.post('/app/admin/settings/update', (req, res) => {
     }
     if (changed > 0) require('fs').writeFileSync(settingsPath, JSON.stringify(current, null, 2));
     res.json({ success: true, message: `${changed} pengaturan berhasil diperbarui` });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─── ADMIN NATIVE: WEBHOOK GATEWAY LOGS & TEST ──────────────────────────────
+router.get('/app/admin/webhook/logs', (req, res) => {
+  try {
+    const logs = db.prepare(`
+      SELECT id, service, content, parsed_amount, parsed_ok, matched_invoice_id, matched_voucher_order_id, matched_donation_order_id, created_at
+      FROM webhook_payment_notifs
+      ORDER BY id DESC
+      LIMIT 20
+    `).all();
+    res.json({ success: true, data: logs || [] });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+router.post('/app/admin/webhook/test', (req, res) => {
+  try {
+    const s = getSettingsWithCache();
+    const secret = s.webhook_secret || 'billing-rtrw-secret-key';
+    res.json({
+      success: true,
+      message: 'Koneksi Gateway Webhook Berhasil!',
+      server_time: new Date().toISOString(),
+      secret_configured: !!secret
+    });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
@@ -2215,7 +2246,7 @@ router.post('/app/customer/topup/create', async (req, res) => {
       } catch (_) {}
     }
 
-    db.prepare('UPDATE customer_topup_requests SET payment_payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+    db.prepare('UPDATE customer_topup_requests SET payment_payload = ?, updated_at = (NOW_LOCAL()) WHERE id = ?')
       .run(JSON.stringify({ total_amount: totalAmount, unique_code: uniqueCode, qris_string: qrisPayload }), reqId);
 
     res.json({
@@ -2744,7 +2775,7 @@ router.post('/tickets/create', requireCustomerApiAuth, async (req, res) => {
   try {
     const info = db.prepare(`
       INSERT INTO tickets (customer_id, subject, message, status, created_at, updated_at)
-      VALUES (?, ?, ?, 'open', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      VALUES (?, ?, ?, 'open', (NOW_LOCAL()), (NOW_LOCAL()))
     `).run(customer.id, subject, message);
 
     const ticketId = info.lastInsertRowid;
@@ -2892,7 +2923,7 @@ router.post('/tech/tickets/:id/update', requireTechApiAuth, express.json(), (req
     if (techSvc.updateTicket) {
       techSvc.updateTicket(req.params.id, req.tech.techId, { status: status || 'resolved', notes: notes || '' });
     } else {
-      db.prepare(`UPDATE tickets SET status = ?, technician_notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+      db.prepare(`UPDATE tickets SET status = ?, technician_notes = ?, updated_at = (NOW_LOCAL()) WHERE id = ?`)
         .run(status || 'resolved', notes || '', req.params.id);
     }
     res.json({ success: true, message: 'Status tiket berhasil diperbarui.' });
@@ -3046,16 +3077,7 @@ router.get('/agent/dashboard', requireAgentApiAuth, (req, res) => {
   try {
     const agentSvc = require('../services/agentService');
     const agent = agentSvc.getAgentById(req.agent.agentId) || req.agent;
-    let prices = (agentSvc.getAgentPrices ? agentSvc.getAgentPrices(agent.id) : []).filter(p => p && p.is_active);
-    
-    if (!prices || prices.length === 0) {
-      prices = [
-        { id: 1, profile_name: 'Paket 1 Hari', sell_price: 5000, buy_price: 4000, validity: '24 Jam', router_name: 'Default Hotspot' },
-        { id: 2, profile_name: 'Paket 3 Hari', sell_price: 10000, buy_price: 8500, validity: '3 Hari', router_name: 'Default Hotspot' },
-        { id: 3, profile_name: 'Paket 7 Hari', sell_price: 20000, buy_price: 17000, validity: '7 Hari', router_name: 'Default Hotspot' },
-        { id: 4, profile_name: 'Paket 30 Hari', sell_price: 50000, buy_price: 43000, validity: '30 Hari', router_name: 'Default Hotspot' }
-      ];
-    }
+    const prices = (agentSvc.getAgentPrices ? agentSvc.getAgentPrices(agent.id) : []).filter(p => p && p.is_active);
 
     const txs = (agentSvc.listAgentTransactions ? agentSvc.listAgentTransactions({ agentId: agent.id, limit: 30 }) : []) || [];
     res.json({
@@ -3174,6 +3196,48 @@ router.post('/agent/pulsa/order', requireAgentApiAuth, express.json(), async (re
     });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// Cek status terkini transaksi pulsa ke Digiflazz (Live Query & Sync)
+router.post('/agent/pulsa/check-status', requireAgentApiAuth, express.json(), async (req, res) => {
+  try {
+    const txId = Number(req.body?.tx_id || req.body?.id || 0);
+    const refId = String(req.body?.ref_id || req.body?.refId || '').trim();
+    if (!txId && !refId) {
+      return res.status(400).json({ success: false, message: 'ID transaksi atau Ref ID wajib diisi' });
+    }
+
+    const agentSvc = require('../services/agentService');
+    let targetTxId = txId;
+    if (!targetTxId && refId) {
+      const found = db.prepare('SELECT id FROM agent_transactions WHERE digi_ref_id = ? AND agent_id = ?').get(refId, req.agent.agentId);
+      if (found) targetTxId = found.id;
+    }
+
+    if (!targetTxId) {
+      return res.status(404).json({ success: false, message: 'Transaksi tidak ditemukan di database' });
+    }
+
+    const result = await agentSvc.checkPulsaStatusAsAgent(req.agent.agentId, targetTxId);
+    const updatedTx = db.prepare('SELECT * FROM agent_transactions WHERE id = ? AND agent_id = ?').get(targetTxId, req.agent.agentId);
+
+    res.json({
+      success: true,
+      message: 'Status transaksi berhasil diperbarui dari Digiflazz',
+      data: {
+        id: updatedTx?.id,
+        status: updatedTx?.digi_status,
+        sn: updatedTx?.digi_sn,
+        message: updatedTx?.digi_message,
+        sku: updatedTx?.digi_sku,
+        target: updatedTx?.digi_target,
+        refId: updatedTx?.digi_ref_id,
+        price: updatedTx?.amount_sell
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message || 'Gagal mengecek status ke Digiflazz' });
   }
 });
 

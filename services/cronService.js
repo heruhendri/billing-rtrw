@@ -317,7 +317,7 @@ function startCronJobs() {
                 if (tryAmt > 0) {
                   code = tryCode;
                   amt = tryAmt;
-                  db.prepare('UPDATE invoices SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=CURRENT_TIMESTAMP WHERE id=?').run(code, amt, invId);
+                  db.prepare('UPDATE invoices SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL()) WHERE id=?').run(code, amt, invId);
                 }
               }
 

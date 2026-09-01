@@ -386,7 +386,7 @@ router.post('/payment-request', requireCollectorSession, express.urlencoded({ ex
       // Insert request with approved status
       db.prepare(`
         INSERT INTO collector_payment_requests (collector_id, invoice_id, customer_id, amount, note, status, decided_by_role, decided_by_name, decided_note, decided_at)
-        VALUES (?, ?, ?, ?, ?, 'approved', 'system', 'Auto-Approve', 'Otomatis disetujui (kolektor setting aktif)', CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, 'approved', 'system', 'Auto-Approve', 'Otomatis disetujui (kolektor setting aktif)', (NOW_LOCAL()))
       `).run(collectorId, invoiceId, Number(inv.customer_id || 0), amount, note);
 
       // Auto-unisolate if customer status is currently suspended

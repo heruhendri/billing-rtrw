@@ -106,7 +106,7 @@ router.post('/create-payment', async (req, res) => {
           payment_reference = ?,
           payment_method = ?,
           payment_payload = ?,
-          updated_at = CURRENT_TIMESTAMP
+          updated_at = (NOW_LOCAL())
       WHERE id = ?
     `).run(
       result.gateway,

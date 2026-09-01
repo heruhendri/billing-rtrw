@@ -23,7 +23,7 @@ function updateUsage(customerId, deltaIn, deltaOut, totalIn, totalOut) {
           bytes_out = bytes_out + ?, 
           last_total_bytes_in = ?, 
           last_total_bytes_out = ?,
-          updated_at = CURRENT_TIMESTAMP
+          updated_at = (NOW_LOCAL())
       WHERE id = ?
     `).run(deltaIn, deltaOut, totalIn, totalOut, existing.id);
   } else {

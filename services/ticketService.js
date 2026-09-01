@@ -52,8 +52,8 @@ function createTicket(customerId, subject, message, extraData = {}) {
   const initialStatus = status || (techId ? 'in_progress' : 'open');
   
   return db.prepare(`
-    INSERT INTO tickets (customer_id, subject, message, status, technician_id, customer_photos, customer_photo_metadata)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tickets (customer_id, subject, message, status, technician_id, customer_photos, customer_photo_metadata, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, (NOW_LOCAL()), (NOW_LOCAL()))
   `).run(
     custId,
     subject,
@@ -70,13 +70,13 @@ function updateTicketStatus(id, status, technicianId = undefined) {
     const techId = (technicianId && parseInt(technicianId, 10) > 0) ? parseInt(technicianId, 10) : null;
     return db.prepare(`
       UPDATE tickets 
-      SET status = ?, technician_id = ?, updated_at = CURRENT_TIMESTAMP
+      SET status = ?, technician_id = ?, updated_at = (NOW_LOCAL())
       WHERE id = ?
     `).run(status, techId, id);
   } else {
     return db.prepare(`
       UPDATE tickets 
-      SET status = ?, updated_at = CURRENT_TIMESTAMP
+      SET status = ?, updated_at = (NOW_LOCAL())
       WHERE id = ?
     `).run(status, id);
   }

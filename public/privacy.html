@@ -1,18 +1,13 @@
 <!DOCTYPE html>
-<html lang="<%= lang || 'id' %>">
+<html lang="id">
 
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title><%= t('customer.pages.privacy.meta_title', 'Kebijakan Privasi') %> | <%= company %></title>
+  <title>Kebijakan Privasi | Alijaya Digital</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
-  <link rel="manifest" href="/manifest.webmanifest">
   <meta name="theme-color" content="#0f172a">
-  <meta name="mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <link rel="apple-touch-icon" href="/img/logo.png">
   <link rel="icon" href="/img/logo.png">
   <style>
     :root {
@@ -116,6 +111,8 @@
       padding: 10px 25px;
       font-weight: 600;
       transition: all 0.3s ease;
+      text-decoration: none;
+      display: inline-block;
     }
 
     .btn-back:hover {
@@ -137,17 +134,17 @@
 <body>
   <div class="hero-section text-center">
     <div class="container">
-      <h1 class="display-5"><%= t('customer.pages.privacy.title', 'Kebijakan Privasi') %></h1>
-      <p class="lead opacity-75"><%= t('customer.pages.privacy.subtitle', 'Bagaimana kami menjaga dan melindungi data pribadi Anda.') %></p>
+      <h1 class="display-5">Kebijakan Privasi</h1>
+      <p class="lead opacity-75">Bagaimana kami menjaga dan melindungi data pribadi Anda.</p>
     </div>
   </div>
 
   <div class="container">
     <div class="content-card">
-      <p><%- String(t('customer.pages.privacy.p1', 'Di <strong>{company}</strong>, privasi pelanggan kami adalah prioritas utama. Dokumen Kebijakan Privasi ini menjelaskan jenis informasi pribadi yang kami kumpulkan dan bagaimana kami menggunakannya.')).replace('{company}', company) %></p>
+      <p>Di <strong>Alijaya Digital</strong>, privasi pelanggan dan pengguna aplikasi kami adalah prioritas utama. Dokumen Kebijakan Privasi ini menjelaskan jenis informasi pribadi yang kami kumpulkan dan bagaimana kami menggunakannya.</p>
 
-      <h4><i class="bi bi-database-check"></i> 1. <%= t('customer.pages.privacy.s1_title', 'Informasi yang Kami Kumpulkan') %></h4>
-      <p><%= t('customer.pages.privacy.s1_body', 'Kami mengumpulkan informasi terbatas yang diperlukan untuk penyediaan layanan, termasuk:') %></p>
+      <h4><i class="bi bi-database-check"></i> 1. Informasi yang Kami Kumpulkan</h4>
+      <p>Kami mengumpulkan informasi terbatas yang diperlukan untuk penyediaan layanan, termasuk:</p>
       <ul>
         <li><strong>Data Akun & Kontak:</strong> Nama lengkap, nomor telepon/WhatsApp, dan alamat pemasangan layanan internet.</li>
         <li><strong>Izin Akses Lokasi (GPS):</strong> Data titik koordinat digunakan saat absensi kehadiran karyawan berbasis radius kantor (Geofencing), pemetaan lokasi ODP/tiang jaringan, dan navigasi penagihan kolektor lapangan.</li>
@@ -156,47 +153,38 @@
         <li><strong>Data Transaksi:</strong> Rincian tagihan bulanan dan status pembayaran melalui saluran payment gateway resmi.</li>
       </ul>
 
-      <h4><i class="bi bi-gear-wide-connected"></i> 2. <%= t('customer.pages.privacy.s2_title', 'Penggunaan Informasi') %></h4>
-      <p><%= t('customer.pages.privacy.s2_body', 'Informasi yang kami kumpulkan digunakan untuk:') %></p>
+      <h4><i class="bi bi-gear-wide-connected"></i> 2. Penggunaan Informasi</h4>
+      <p>Informasi yang kami kumpulkan digunakan untuk:</p>
       <ul>
-        <li><%= t('customer.pages.privacy.s2_li1', 'Memproses pendaftaran dan aktivasi layanan internet Anda.') %></li>
-        <li><%= t('customer.pages.privacy.s2_li2', 'Mengirimkan informasi tagihan dan pengingat pembayaran otomatis.') %></li>
-        <li><%= t('customer.pages.privacy.s2_li3', 'Memberikan dukungan teknis dan menanggapi keluhan Anda.') %></li>
+        <li>Memproses pendaftaran dan aktivasi layanan internet Anda.</li>
+        <li>Mengirimkan informasi tagihan dan pengingat pembayaran otomatis.</li>
+        <li>Memberikan dukungan teknis dan menanggapi keluhan gangguan Anda.</li>
         <li>Memvalidasi presensi kerja resmi karyawan dan penugasan lapangan.</li>
-        <li><%= t('customer.pages.privacy.s2_li4', 'Meningkatkan kualitas jaringan dan pengalaman pengguna.') %></li>
+        <li>Meningkatkan kualitas jaringan dan pengalaman pengguna aplikasi.</li>
       </ul>
 
-      <h4><i class="bi bi-shield-check"></i> 3. <%= t('customer.pages.privacy.s3_title', 'Keamanan Data') %></h4>
-      <p><%= t('customer.pages.privacy.s3_body', 'Kami menerapkan standar keamanan teknis dan enkripsi HTTPS/TLS untuk melindungi data Anda dari akses yang tidak sah. Data sensitif seperti kata sandi WiFi dan detail login disimpan dengan enkripsi di server kami.') %></p>
+      <h4><i class="bi bi-shield-check"></i> 3. Keamanan Data</h4>
+      <p>Kami menerapkan standar keamanan teknis dan enkripsi HTTPS/TLS untuk melindungi data Anda dari akses yang tidak sah. Data sensitif disimpan dengan enkripsi di server kami.</p>
 
-      <h4><i class="bi bi-people"></i> 4. <%= t('customer.pages.privacy.s4_title', 'Pihak Ketiga') %></h4>
-      <p><%= t('customer.pages.privacy.s4_body', 'Kami tidak menjual atau menyewakan data pribadi Anda kepada pihak ketiga mana pun. Kami hanya berbagi data transaksi dengan mitra payment gateway resmi (seperti Tripay/Xendit/Midtrans/Duitku) untuk memproses pembayaran Anda secara aman.') %></p>
+      <h4><i class="bi bi-people"></i> 4. Pihak Ketiga</h4>
+      <p>Kami tidak pernah menjual atau menyewakan data pribadi Anda kepada pihak ketiga mana pun. Kami hanya berbagi data transaksi dengan mitra payment gateway resmi (seperti Tripay/Xendit/Midtrans/Duitku) untuk memproses pembayaran Anda secara aman.</p>
 
       <h4><i class="bi bi-person-x"></i> 5. Hak Pengguna & Penghapusan Data</h4>
       <p>Pengguna berhak meminta informasi mengenai data pribadi yang tersimpan atau mengajukan permohonan penghapusan akun beserta riwayat datanya dengan menghubungi kontak customer support resmi kami.</p>
 
-      <h4><i class="bi bi-patch-check"></i> 6. <%= t('customer.pages.privacy.s5_title', 'Persetujuan') %></h4>
-      <p><%= t('customer.pages.privacy.s5_body', 'Dengan menggunakan layanan kami, Anda dengan ini menyetujui Kebijakan Privasi kami dan menyetujui ketentuan-ketentuannya.') %></p>
+      <h4><i class="bi bi-patch-check"></i> 6. Persetujuan</h4>
+      <p>Dengan menggunakan layanan dan aplikasi kami, Anda dengan ini menyetujui Kebijakan Privasi kami dan menyetujui ketentuan-ketentuannya.</p>
 
       <div class="mt-5 text-center">
-        <a href="<%= isLoggedIn ? '/customer/dashboard' : '/customer/login' %>" class="btn btn-back">
-          <i class="bi bi-arrow-left me-2"></i><%= t('common.back_to', 'Kembali ke') %> <%= isLoggedIn ? t('customer.dashboard_title', 'Dashboard Pelanggan') : t('common.portal', 'Portal') %>
+        <a href="/" class="btn btn-back">
+          <i class="bi bi-arrow-left me-2"></i>Kembali ke Portal
         </a>
       </div>
     </div>
   </div>
 
   <div class="footer">
-    &copy; <%= new Date().getFullYear() %>
-      <%= company %> • <%= t('customer.pages.privacy.footer_tagline', 'Keamanan Data Anda adalah Komitmen Kami') %>
+    &copy; 2026 Alijaya Digital • Keamanan Data Anda adalah Komitmen Kami
   </div>
-  <script>
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js', { scope: '/customer/' }).catch(() => {});
-      });
-    }
-  </script>
-  <%- include('partials/customer_bottom_nav', { activeNav: 'none' }) %>
 </body>
 </html>

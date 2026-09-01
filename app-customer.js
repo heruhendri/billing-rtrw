@@ -39,7 +39,7 @@ process.on('uncaughtException', (err) => {
 
 // Settings Management
 const session = require('express-session');
-const { getSetting, getSettingsWithCache, ensureDefaultSettings } = require('./config/settingsManager');
+const { getSetting, getSettingsWithCache, ensureDefaultSettings, getNowLocal, formatDateLocal, formatTimeLocal, parseDateInTimezone } = require('./config/settingsManager');
 const { SUPPORTED_LANGS, FALLBACK_LANG, normalizeLang, t } = require('./config/i18n');
 
 // Pastikan semua default settings ada (untuk migrasi/update dari GitHub)
@@ -141,9 +141,15 @@ app.use((req, res, next) => {
   }
   const saved = req.session?.lang || getSetting('default_lang', FALLBACK_LANG);
   const lang = normalizeLang(saved);
+  const tz = getSetting('timezone', 'Asia/Jakarta');
   res.locals.lang = lang;
   res.locals.availableLangs = Array.from(SUPPORTED_LANGS);
   res.locals.t = (key, fallback = '') => t(lang, key, fallback);
+  res.locals.tz = tz;
+  res.locals.formatDateLocal = formatDateLocal;
+  res.locals.formatTimeLocal = formatTimeLocal;
+  res.locals.parseDateInTimezone = parseDateInTimezone;
+  res.locals.getNowLocal = getNowLocal;
   next();
 });
 

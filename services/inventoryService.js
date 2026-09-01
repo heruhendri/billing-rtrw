@@ -111,7 +111,7 @@ function assignStockToCustomer(stockId, customerId, actor = 'Admin', note = '') 
   const run = db.transaction(() => {
     db.prepare(`
       UPDATE inventory_stock 
-      SET status = 'assigned', assigned_to_customer_id = ?, updated_at = CURRENT_TIMESTAMP
+      SET status = 'assigned', assigned_to_customer_id = ?, updated_at = (NOW_LOCAL())
       WHERE id = ?
     `).run(customerId, stockId);
 
@@ -130,7 +130,7 @@ function adjustStock(stockId, newQuantity, note, actor = 'Admin') {
 
   const run = db.transaction(() => {
     const diff = newQuantity - stock.quantity;
-    db.prepare('UPDATE inventory_stock SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(newQuantity, stockId);
+    db.prepare('UPDATE inventory_stock SET quantity = ?, updated_at = (NOW_LOCAL()) WHERE id = ?').run(newQuantity, stockId);
 
     db.prepare(`
       INSERT INTO inventory_logs (item_id, stock_id, type, quantity, actor, note)

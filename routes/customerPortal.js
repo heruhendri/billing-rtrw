@@ -511,7 +511,7 @@ function ensureInvoiceQrisUnique(inv, force = false) {
 
   const update = db.prepare(`
     UPDATE invoices
-    SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=CURRENT_TIMESTAMP
+    SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL())
     WHERE id=?
   `);
 
@@ -574,7 +574,7 @@ function ensureVoucherOrderQrisUnique(order, force = false) {
 
   const update = db.prepare(`
     UPDATE public_voucher_orders
-    SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+    SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL()), updated_at=(NOW_LOCAL())
     WHERE id=?
   `);
 
@@ -1377,8 +1377,8 @@ router.post('/public/voucher/create-payment', async (req, res) => {
           payment_expires_at = ?,
           qris_unique_code = ?,
           qris_amount_unique = ?,
-          qris_assigned_at = COALESCE(qris_assigned_at, CURRENT_TIMESTAMP),
-          updated_at = CURRENT_TIMESTAMP
+          qris_assigned_at = COALESCE(qris_assigned_at, (NOW_LOCAL())),
+          updated_at = (NOW_LOCAL())
         WHERE id = ?
       `).run(
         'qris_static',
@@ -1473,7 +1473,7 @@ router.post('/public/voucher/create-payment', async (req, res) => {
         payment_reference = ?,
         payment_payload = ?,
         payment_expires_at = ?,
-        updated_at = CURRENT_TIMESTAMP
+        updated_at = (NOW_LOCAL())
       WHERE id = ?
     `).run(
       gateway,
@@ -3048,7 +3048,7 @@ router.post('/voucher/proof/:orderId', uploadProof.single('proof'), async (req, 
     db.prepare(`
       UPDATE public_voucher_orders
       SET proof_url=?,
-          updated_at=CURRENT_TIMESTAMP
+          updated_at=(NOW_LOCAL())
       WHERE id=?
     `).run(proofUrl, orderId);
 
@@ -3203,7 +3203,7 @@ router.post('/payment/callback', express.json({
         logger.info(`[Webhook] Pembayaran Top-Up Pelanggan diterima via ${gateway} untuk Request ID: ${reqId}`);
         
         db.transaction(() => {
-          db.prepare(`UPDATE customer_topup_requests SET status='paid', paid_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(reqId);
+          db.prepare(`UPDATE customer_topup_requests SET status='paid', paid_at=(NOW_LOCAL()), updated_at=(NOW_LOCAL()) WHERE id=?`).run(reqId);
           db.prepare(`UPDATE customers SET balance = balance + ? WHERE id=?`).run(topupReq.amount, topupReq.customer_id);
         })();
 
@@ -3248,11 +3248,11 @@ router.post('/payment/callback', express.json({
           const balBefore = Number(freshAgent?.balance || 0);
           const balAfter = balBefore + creditAmount;
 
-          db.prepare(`UPDATE agent_topup_requests SET status='paid', paid_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(reqId);
+          db.prepare(`UPDATE agent_topup_requests SET status='paid', paid_at=(NOW_LOCAL()), updated_at=(NOW_LOCAL()) WHERE id=?`).run(reqId);
           db.prepare(`UPDATE agents SET balance = ? WHERE id=?`).run(balAfter, agentTopupReq.agent_id);
           db.prepare(`
             INSERT INTO agent_transactions (agent_id, type, amount_buy, amount_sell, fee, balance_before, balance_after, note, created_at)
-            VALUES (?, 'topup', ?, ?, 0, ?, ?, ?, datetime('now', 'localtime'))
+            VALUES (?, 'topup', ?, ?, 0, ?, ?, ?, (NOW_LOCAL()))
           `).run(agentTopupReq.agent_id, creditAmount, creditAmount, balBefore, balAfter, `Top-Up Deposit + Kode Unik (${uniqueCode > 0 ? '+Rp ' + uniqueCode : ''}) via ${String(gateway || 'Payment Gateway').toUpperCase()} (Req #${reqId})`);
         })();
 
@@ -3292,7 +3292,7 @@ router.post('/payment/callback', express.json({
         if (String(order.status) !== 'paid' && String(order.status) !== 'fulfilled') {
           db.prepare(`
             UPDATE public_voucher_orders
-            SET status='paid', paid_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+            SET status='paid', paid_at=(NOW_LOCAL()), updated_at=(NOW_LOCAL())
             WHERE id=?
           `).run(orderId);
         }
@@ -3351,11 +3351,11 @@ router.post('/payment/callback', express.json({
           db.prepare(`
             UPDATE public_voucher_orders
             SET status='fulfilled',
-                fulfilled_at=CURRENT_TIMESTAMP,
+                fulfilled_at=(NOW_LOCAL()),
                 voucher_code=?,
                 voucher_password=?,
                 voucher_comment=?,
-                updated_at=CURRENT_TIMESTAMP
+                updated_at=(NOW_LOCAL())
             WHERE id=?
           `).run(created.code, created.pass, created.comment, orderId);
 
@@ -3375,13 +3375,13 @@ router.post('/payment/callback', express.json({
               await sendWA(fresh.buyer_phone, msg);
               db.prepare(`
                 UPDATE public_voucher_orders
-                SET wa_sent=1, wa_sent_at=CURRENT_TIMESTAMP, wa_error='', updated_at=CURRENT_TIMESTAMP
+                SET wa_sent=1, wa_sent_at=(NOW_LOCAL()), wa_error='', updated_at=(NOW_LOCAL())
                 WHERE id=?
               `).run(orderId);
             } catch (waErr) {
               db.prepare(`
                 UPDATE public_voucher_orders
-                SET wa_sent=0, wa_error=?, updated_at=CURRENT_TIMESTAMP
+                SET wa_sent=0, wa_error=?, updated_at=(NOW_LOCAL())
                 WHERE id=?
               `).run(String(waErr?.message || waErr || ''), orderId);
             }
@@ -3573,11 +3573,11 @@ router.post('/ppob/buy', express.urlencoded({ extended: true }), async (req, res
     // Refund saldo jika gagal
     if (isFailed) {
       adjustCustomerBalance(customer.id, price, `Refund PPOB gagal - ${sku} -> ${target}`);
-      db.prepare(`UPDATE public_ppob_orders SET status='failed', digi_message=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(digiMsg || 'Gagal dari provider', orderId);
+      db.prepare(`UPDATE public_ppob_orders SET status='failed', digi_message=?, updated_at=(NOW_LOCAL()) WHERE id=?`).run(digiMsg || 'Gagal dari provider', orderId);
       return redirectErr('Transaksi ditolak provider, saldo otomatis dikembalikan. ' + (digiMsg || ''));
     }
 
-    db.prepare(`UPDATE public_ppob_orders SET status='fulfilled', fulfilled_at=CURRENT_TIMESTAMP, digi_trx_id=?, digi_sn=?, digi_message=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(digiTrxId, digiSn, digiMsg, orderId);
+    db.prepare(`UPDATE public_ppob_orders SET status='fulfilled', fulfilled_at=(NOW_LOCAL()), digi_trx_id=?, digi_sn=?, digi_message=?, updated_at=(NOW_LOCAL()) WHERE id=?`).run(digiTrxId, digiSn, digiMsg, orderId);
 
     const settings2 = getSettingsWithCache();
     if (settings2.whatsapp_enabled && customer.phone) {
@@ -3593,7 +3593,7 @@ router.post('/ppob/buy', express.urlencoded({ extended: true }), async (req, res
   } catch (e) {
     logger.error('[PPOB] Digiflazz error: ' + e.message);
     adjustCustomerBalance(customer.id, price, `Refund PPOB error - ${sku}`);
-    db.prepare(`UPDATE public_ppob_orders SET status='failed', digi_message=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(e.message, orderId);
+    db.prepare(`UPDATE public_ppob_orders SET status='failed', digi_message=?, updated_at=(NOW_LOCAL()) WHERE id=?`).run(e.message, orderId);
     return redirectErr('Gagal memproses transaksi, saldo dikembalikan. ' + e.message);
   }
 });
@@ -3738,7 +3738,7 @@ router.post('/topup/create', express.urlencoded({ extended: true }), async (req,
 
     if (!result.success) throw new Error(result.message || 'Gagal membuat transaksi');
 
-    db.prepare(`UPDATE customer_topup_requests SET payment_gateway=?, payment_order_id=?, payment_link=?, payment_reference=?, payment_payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`)
+    db.prepare(`UPDATE customer_topup_requests SET payment_gateway=?, payment_order_id=?, payment_link=?, payment_reference=?, payment_payload=?, updated_at=(NOW_LOCAL()) WHERE id=?`)
       .run(gateway, result.order_id||'', result.link||'', result.reference||'', result.payload ? JSON.stringify(result.payload) : null, reqId);
 
     return res.redirect(result.link);
@@ -3820,7 +3820,7 @@ router.post('/agent-topup/create', express.urlencoded({ extended: true }), async
 
     if (!result.success) throw new Error(result.message || 'Gagal membuat transaksi');
 
-    db.prepare(`UPDATE agent_topup_requests SET payment_gateway=?, payment_order_id=?, payment_link=?, payment_reference=?, payment_payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`)
+    db.prepare(`UPDATE agent_topup_requests SET payment_gateway=?, payment_order_id=?, payment_link=?, payment_reference=?, payment_payload=?, updated_at=(NOW_LOCAL()) WHERE id=?`)
       .run(gateway, result.order_id||'', result.link||'', result.reference||'', result.payload ? JSON.stringify(result.payload) : null, reqId);
 
     return res.redirect(result.link);

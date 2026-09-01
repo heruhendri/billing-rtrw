@@ -57,14 +57,14 @@ function takeTicket(ticketId, techId) {
     const fallback = db.prepare('SELECT id FROM technicians WHERE is_active = 1 ORDER BY id ASC LIMIT 1').get();
     if (fallback) validTechId = fallback.id;
   }
-  db.prepare("UPDATE tickets SET technician_id = ?, status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(validTechId, ticketId);
+  db.prepare("UPDATE tickets SET technician_id = ?, status = 'in_progress', updated_at = (NOW_LOCAL()) WHERE id = ?").run(validTechId, ticketId);
   return validTechId;
 }
 
 function updateTicketStatus(ticketId, techId, status, extraData = {}) {
   const { notes, photos, photoMetadata } = extraData;
   
-  const updates = ['status = ?', 'updated_at = CURRENT_TIMESTAMP'];
+  const updates = ['status = ?', 'updated_at = (NOW_LOCAL())'];
   const params = [status];
   
   if (techId) {

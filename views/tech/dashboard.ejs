@@ -33,7 +33,7 @@
           <% let statusLabel = ticket.status; if (ticket.status === 'open') statusLabel = t('tech.ticket.open', 'Belum Ditangani'); if (ticket.status === 'in_progress') statusLabel = t('tech.ticket.in_progress', 'Sedang Dikerjakan'); if (ticket.status === 'resolved') statusLabel = t('tech.ticket.resolved', 'Selesai'); %>
           <% if(ticket.status === 'in_progress') { %> <i class="bi bi-tools"></i> <%= statusLabel %> <% } else { %> <%= statusLabel %> <% } %>
         </span>
-        <span class="text-secondary" style="font-size: 11px;"><%= new Date(ticket.created_at).toLocaleTimeString('id-ID', {hour: '2-digit', minute:'2-digit'}) %></span>
+        <span class="text-secondary" style="font-size: 11px;"><%= typeof formatTimeLocal === 'function' ? formatTimeLocal(ticket.created_at) : (ticket.created_at ? new Date(ticket.created_at).toLocaleTimeString('id-ID', {hour: '2-digit', minute:'2-digit'}) : '-') %></span>
       </div>
       
       <div class="fw-bold mb-1" style="font-size: 15px;"><%= ticket.customer_name %></div>

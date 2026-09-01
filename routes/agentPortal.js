@@ -376,7 +376,7 @@ router.post('/topup/create', requireAgentSession, express.urlencoded({ extended:
       bank_holder: settings.bank_account_holder || ''
     };
 
-    db.prepare(`UPDATE agent_topup_requests SET payment_gateway=?, payment_order_id=?, payment_link=?, payment_reference=?, payment_payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`)
+    db.prepare(`UPDATE agent_topup_requests SET payment_gateway=?, payment_order_id=?, payment_link=?, payment_reference=?, payment_payload=?, updated_at=(NOW_LOCAL()) WHERE id=?`)
       .run(gateway || 'manual', result.order_id || `AGTOP${reqId}`, result.link || '', result.reference || '', JSON.stringify(payloadObj), reqId);
 
     return res.redirect(`/agent?topup_id=${reqId}`);

@@ -40,7 +40,7 @@
           <div style="font-size:10pt;color:#334155"><%= t('admin.nav.customer_tickets', 'Daftar Tiket Gangguan & Tugas Teknisi') %> &bull; Status: <%= filterStatus ? filterStatus.toUpperCase() : 'SEMUA' %></div>
         </div>
         <div style="text-align:right;font-size:8.5pt;color:#475569">
-          <div>Dicetak: <%= getNowLocal() %></div>
+          <div>Dicetak: <%= typeof getNowLocal === 'function' ? getNowLocal() : (typeof formatDateLocal === 'function' ? formatDateLocal(new Date()) : new Date().toLocaleString('id-ID')) %></div>
           <div>Total Tiket: <strong><%= tickets.length %> Kasus</strong></div>
         </div>
       </div>
@@ -88,7 +88,7 @@
             <tr>
               <td class="text-muted">#<%= ticket.id %></td>
               <td style="font-size:12px;color:var(--muted)">
-                <%= new Date(ticket.created_at).toLocaleString('id-ID', {dateStyle:'short', timeStyle:'short'}) %>
+                <%= typeof formatDateLocal === 'function' ? formatDateLocal(ticket.created_at) : (ticket.created_at ? new Date(ticket.created_at).toLocaleString('id-ID', {dateStyle:'short', timeStyle:'short'}) : '-') %>
               </td>
               <td>
                 <div class="fw6"><%= ticket.customer_name %></div>

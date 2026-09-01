@@ -443,9 +443,9 @@ async function createVoucherBatchAsync(batchId) {
 
   const updateVoucher = db.prepare('UPDATE vouchers SET code=?, password=?, comment=?, status=?, created_at=created_at WHERE id=?');
   const markVoucherCreated = db.prepare('UPDATE vouchers SET status=? WHERE id=?');
-  const incCreated = db.prepare("UPDATE voucher_batches SET qty_created = qty_created + 1, updated_at = CURRENT_TIMESTAMP WHERE id=?");
-  const incFailed = db.prepare("UPDATE voucher_batches SET qty_failed = qty_failed + 1, updated_at = CURRENT_TIMESTAMP WHERE id=?");
-  const setBatchStatus = db.prepare("UPDATE voucher_batches SET status=?, updated_at = CURRENT_TIMESTAMP WHERE id=?");
+  const incCreated = db.prepare("UPDATE voucher_batches SET qty_created = qty_created + 1, updated_at = (NOW_LOCAL()) WHERE id=?");
+  const incFailed = db.prepare("UPDATE voucher_batches SET qty_failed = qty_failed + 1, updated_at = (NOW_LOCAL()) WHERE id=?");
+  const setBatchStatus = db.prepare("UPDATE voucher_batches SET status=?, updated_at = (NOW_LOCAL()) WHERE id=?");
 
   const existsCode = db.prepare('SELECT 1 FROM vouchers WHERE router_id IS ? AND code = ? LIMIT 1');
 
@@ -1088,7 +1088,7 @@ router.post('/collector-payments/:id/approve', requireAdminSession, express.urle
     if (String(inv.status) === 'paid') {
       db.prepare(`
         UPDATE collector_payment_requests
-        SET status='rejected', decided_by_role=?, decided_by_name=?, decided_note=?, decided_at=CURRENT_TIMESTAMP
+        SET status='rejected', decided_by_role=?, decided_by_name=?, decided_note=?, decided_at=(NOW_LOCAL())
         WHERE id=?
       `).run(req.session.isCashier ? 'cashier' : 'admin', resolvePaidByName(req, 'Admin'), 'Invoice sudah lunas', id);
       req.session._msg = { type: 'error', text: 'Invoice sudah lunas, request ditolak.' };
@@ -1113,7 +1113,7 @@ router.post('/collector-payments/:id/approve', requireAdminSession, express.urle
 
     db.prepare(`
       UPDATE collector_payment_requests
-      SET status='approved', decided_by_role=?, decided_by_name=?, decided_note=?, decided_at=CURRENT_TIMESTAMP
+      SET status='approved', decided_by_role=?, decided_by_name=?, decided_note=?, decided_at=(NOW_LOCAL())
       WHERE id=?
     `).run(req.session.isCashier ? 'cashier' : 'admin', approver, decidedNote, id);
 
@@ -1151,7 +1151,7 @@ router.post('/collector-payments/:id/reject', requireAdminSession, express.urlen
     const approver = resolvePaidByName(req, 'Admin');
     db.prepare(`
       UPDATE collector_payment_requests
-      SET status='rejected', decided_by_role=?, decided_by_name=?, decided_note=?, decided_at=CURRENT_TIMESTAMP
+      SET status='rejected', decided_by_role=?, decided_by_name=?, decided_note=?, decided_at=(NOW_LOCAL())
       WHERE id=?
     `).run(req.session.isCashier ? 'cashier' : 'admin', approver, decidedNote, id);
     req.session._msg = { type: 'success', text: 'Request ditolak.' };
@@ -2734,7 +2734,7 @@ router.post('/billing/:id/qris-assign', requireAdminSession, (req, res) => {
     const exists = db.prepare('SELECT id FROM invoices WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1');
     const update = db.prepare(`
       UPDATE invoices
-      SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=CURRENT_TIMESTAMP
+      SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL())
       WHERE id=?
     `);
 
@@ -2831,7 +2831,7 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
         const exists = db.prepare('SELECT id FROM invoices WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1');
         const update = db.prepare(`
           UPDATE invoices
-          SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=CURRENT_TIMESTAMP
+          SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL())
           WHERE id=?
         `);
 
@@ -3687,7 +3687,7 @@ router.post('/digiflazz/sync-products', requireAdminSession, restrictToAdmin, as
     const upsert = db.prepare(
       `
       INSERT INTO digiflazz_products (sku, product_name, category, brand, price_modal, price_sell, status, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      VALUES (?, ?, ?, ?, ?, ?, ?, (NOW_LOCAL()))
       ON CONFLICT(sku) DO UPDATE SET
         product_name=excluded.product_name,
         category=excluded.category,
@@ -3695,7 +3695,7 @@ router.post('/digiflazz/sync-products', requireAdminSession, restrictToAdmin, as
         price_modal=excluded.price_modal,
         price_sell=excluded.price_sell,
         status=excluded.status,
-        updated_at=CURRENT_TIMESTAMP
+        updated_at=(NOW_LOCAL())
     `
     );
 
@@ -3757,7 +3757,7 @@ router.post('/digiflazz/products/update-price', requireAdminSession, restrictToA
     const sku = String(req.body.sku || '').trim();
     const priceSell = Math.max(0, Math.floor(Number(req.body.price_sell || 0) || 0));
     if (!sku) throw new Error('SKU wajib');
-    const info = db.prepare('UPDATE digiflazz_products SET price_sell=?, updated_at=CURRENT_TIMESTAMP WHERE sku=?').run(priceSell, sku);
+    const info = db.prepare('UPDATE digiflazz_products SET price_sell=?, updated_at=(NOW_LOCAL()) WHERE sku=?').run(priceSell, sku);
     if (info.changes === 0) throw new Error('SKU tidak ditemukan');
     req.session._msg = { type: 'success', text: `Harga jual diperbarui: ${sku}` };
   } catch (e) {
@@ -5194,9 +5194,9 @@ router.post('/api/vouchers/batches/:id/sync', requireAdmin, async (req, res) => 
     }
 
     const list = db.prepare('SELECT id, code, used_at FROM vouchers WHERE batch_id = ?').all(batchId);
-    const updSeen = db.prepare("UPDATE vouchers SET last_seen_comment=?, last_seen_uptime=?, last_seen_at=CURRENT_TIMESTAMP WHERE id=?");
-    const markUsed = db.prepare("UPDATE vouchers SET used_at=CURRENT_TIMESTAMP, status='used', last_seen_comment=?, last_seen_uptime=?, last_seen_at=CURRENT_TIMESTAMP WHERE id=?");
-    const markMissing = db.prepare("UPDATE vouchers SET status='missing', last_seen_at=CURRENT_TIMESTAMP WHERE id=?");
+    const updSeen = db.prepare("UPDATE vouchers SET last_seen_comment=?, last_seen_uptime=?, last_seen_at=(NOW_LOCAL()) WHERE id=?");
+    const markUsed = db.prepare("UPDATE vouchers SET used_at=(NOW_LOCAL()), status='used', last_seen_comment=?, last_seen_uptime=?, last_seen_at=(NOW_LOCAL()) WHERE id=?");
+    const markMissing = db.prepare("UPDATE vouchers SET status='missing', last_seen_at=(NOW_LOCAL()) WHERE id=?");
 
     let usedNew = 0;
     let missing = 0;
@@ -7170,7 +7170,7 @@ router.post('/radius/nas/edit', requireAdminSession, restrictToAdmin, async (req
 
     db.prepare(`
       UPDATE radius_nas
-      SET nasname = ?, shortname = ?, secret = ?, description = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
+      SET nasname = ?, shortname = ?, secret = ?, description = ?, is_active = ?, updated_at = (NOW_LOCAL())
       WHERE id = ?
     `).run(
       String(nasname).trim(),
@@ -7195,7 +7195,7 @@ router.post('/radius/nas/toggle', requireAdminSession, restrictToAdmin, async (r
     const nas = db.prepare(`SELECT id, nasname, is_active FROM radius_nas WHERE id = ?`).get(id);
     if (nas) {
       const newStatus = nas.is_active ? 0 : 1;
-      db.prepare(`UPDATE radius_nas SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(newStatus, id);
+      db.prepare(`UPDATE radius_nas SET is_active = ?, updated_at = (NOW_LOCAL()) WHERE id = ?`).run(newStatus, id);
       req.session._msg = { type: 'success', text: `Status NAS ${nas.nasname} diubah menjadi ${newStatus ? 'Aktif' : 'Non-Aktif'}.` };
     }
   } catch (error) {
