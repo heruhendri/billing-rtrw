@@ -140,135 +140,146 @@ router.get('/logout', (req, res) => {
   res.redirect('/agent/login');
 });
 
-router.get('/', requireAgentSession, async (req, res) => {
-  const agentId = req.session.agentId;
-  const agent = agentSvc.getAgentById(agentId);
-  const q = String(req.query.q || '').trim();
-
-  const invoices = q ? billingSvc.getInvoicesByAny(q) : [];
-  const visibleInvoices = Array.isArray(invoices) ? invoices : [];
-
-  const prices = agentSvc
-    .getAgentPrices(agentId)
-    .filter(p => p && p.is_active)
-    .sort((a, b) => {
-      const as = Number(a.sell_price || 0);
-      const bs = Number(b.sell_price || 0);
-      if (as !== bs) return as - bs;
-      const ab = Number(a.buy_price || 0);
-      const bb = Number(b.buy_price || 0);
-      if (ab !== bb) return ab - bb;
-      const ap = String(a.profile_name || '');
-      const bp = String(b.profile_name || '');
-      return ap.localeCompare(bp);
-    });
-  const txs = agentSvc.listAgentTransactions({ agentId, limit: 40 });
-
-  const digiflazzMarkup = Number(getSetting('digiflazz_markup', 0) || 0);
-  const digiflazzConfigured = Boolean(
-    String(getSetting('digiflazz_username', '') || '').trim() &&
-    String(getSetting('digiflazz_api_key', '') || '').trim()
-  );
-
-  const digiflazzCatalogProducts = digiflazzConfigured
-    ? agentSvc.listDigiflazzProducts({ include_inactive: false, limit: 3000 })
-    : [];
-
-  const digiflazzBrandsMap = new Map();
-  for (const p of (digiflazzCatalogProducts || [])) {
-    const brandName = String(p.brand || '').trim() || '-';
-    const categoryName = String(p.category || '').trim() || '-';
-    const key = `${categoryName}__${brandName}`;
-    if (!digiflazzBrandsMap.has(key)) {
-      digiflazzBrandsMap.set(key, { key, name: brandName, category: categoryName, items: [] });
-    }
-    digiflazzBrandsMap.get(key).items.push(p);
-  }
-  const digiflazzBrandsData = Array.from(digiflazzBrandsMap.values());
-  const digiflazzCategories = Array.from(new Set((digiflazzCatalogProducts || []).map(p => String(p.category || '').trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b));
-
-  // Fetch payment channels
-  let paymentChannels = [];
+router.get('/', requireAgentSession, async (req, res, next) => {
   try {
     const settings = getSettings();
-    const gateway = resolveConfiguredGateway(settings);
-    if (!gateway) {
-      paymentChannels = [];
-    } else if (gateway === 'tripay') {
-      paymentChannels = await paymentSvc.getTripayChannels();
-    } else if (gateway === 'midtrans') {
-      paymentChannels = [
-        { code: 'SNAP', name: 'Semua Metode (Snap)', group: 'E-Wallet', active: true },
-        { code: 'QRIS', name: 'QRIS', group: 'E-Wallet', active: true },
-        { code: 'BCAVA', name: 'BCA Virtual Account', group: 'Virtual Account', active: true },
-        { code: 'BNIVA', name: 'BNI Virtual Account', group: 'Virtual Account', active: true },
-        { code: 'BRIVA', name: 'BRI Virtual Account', group: 'Virtual Account', active: true },
-        { code: 'PERMATAVA', name: 'Permata Virtual Account', group: 'Virtual Account', active: true },
-        { code: 'MANDIRIVA', name: 'Mandiri Virtual Account', group: 'Virtual Account', active: true }
-      ];
-    } else if (gateway === 'xendit') {
-      paymentChannels = [
-        { code: 'XENDIT', name: 'Semua Metode', group: 'E-Wallet', active: true },
-        { code: 'QRIS', name: 'QRIS', group: 'E-Wallet', active: true },
-        { code: 'BCAVA', name: 'BCA Virtual Account', group: 'Virtual Account', active: true },
-        { code: 'BNIVA', name: 'BNI Virtual Account', group: 'Virtual Account', active: true },
-        { code: 'BRIVA', name: 'BRI Virtual Account', group: 'Virtual Account', active: true },
-        { code: 'PERMATAVA', name: 'Permata Virtual Account', group: 'Virtual Account', active: true },
-        { code: 'MANDIRIVA', name: 'Mandiri Virtual Account', group: 'Virtual Account', active: true }
-      ];
-    } else if (gateway === 'duitku') {
-      paymentChannels = [
-        { code: 'DUITKU', name: 'Semua Metode', group: 'E-Wallet', active: true },
-        { code: 'QRIS', name: 'QRIS', group: 'E-Wallet', active: true },
-        { code: 'BCAVA', name: 'BCA Virtual Account', group: 'Virtual Account', active: true },
-        { code: 'BNIVA', name: 'BNI Virtual Account', group: 'Virtual Account', active: true },
-        { code: 'BRIVA', name: 'BRI Virtual Account', group: 'Virtual Account', active: true },
-        { code: 'PERMATAVA', name: 'Permata Virtual Account', group: 'Virtual Account', active: true },
-        { code: 'MANDIRIVA', name: 'Mandiri Virtual Account', group: 'Virtual Account', active: true }
-      ];
+    const agentId = req.session.agentId;
+    const agent = agentSvc.getAgentById(agentId);
+    if (!agent) {
+      req.session.destroy();
+      return res.redirect('/agent/login');
     }
-    if (paymentChannels.length === 0) {
-      paymentChannels = [
-        { code: 'QRIS', name: 'QRIS Dinamis', group: 'Instant QRIS', active: true },
-        { code: 'MANUAL_BANK', name: 'Transfer Bank (Kode Unik Otomatis)', group: 'Transfer Bank', active: true }
-      ];
-    }
-  } catch(e) {
-    paymentChannels = [];
-  }
+    const q = String(req.query.q || '').trim();
 
-  let activeTopup = null;
-  const topupId = Number(req.query.topup_id || 0);
-  if (topupId > 0) {
-    const treq = db.prepare('SELECT * FROM agent_topup_requests WHERE id = ? AND agent_id = ?').get(topupId, agent.id);
-    if (treq && treq.status === 'pending') {
-      try {
-        treq.payloadObj = treq.payment_payload ? JSON.parse(treq.payment_payload) : {};
-      } catch (_) {
-        treq.payloadObj = {};
+    const invoices = q ? billingSvc.getInvoicesByAny(q) : [];
+    const visibleInvoices = Array.isArray(invoices) ? invoices : [];
+
+    const prices = agentSvc
+      .getAgentPrices(agentId)
+      .filter(p => p && p.is_active)
+      .sort((a, b) => {
+        const as = Number(a.sell_price || 0);
+        const bs = Number(b.sell_price || 0);
+        if (as !== bs) return as - bs;
+        const ab = Number(a.buy_price || 0);
+        const bb = Number(b.buy_price || 0);
+        if (ab !== bb) return ab - bb;
+        const ap = String(a.profile_name || '');
+        const bp = String(b.profile_name || '');
+        return ap.localeCompare(bp);
+      });
+    const txs = agentSvc.listAgentTransactions({ agentId, limit: 40 });
+
+    const digiflazzMarkup = Number(getSetting('digiflazz_markup', 0) || 0);
+    const digiflazzConfigured = Boolean(
+      String(getSetting('digiflazz_username', '') || '').trim() &&
+      String(getSetting('digiflazz_api_key', '') || '').trim()
+    );
+
+    const digiflazzCatalogProducts = digiflazzConfigured
+      ? agentSvc.listDigiflazzProducts({ include_inactive: false, limit: 3000 })
+      : [];
+
+    const digiflazzBrandsMap = new Map();
+    for (const p of (digiflazzCatalogProducts || [])) {
+      const brandName = String(p.brand || '').trim() || '-';
+      const categoryName = String(p.category || '').trim() || '-';
+      const key = `${categoryName}__${brandName}`;
+      if (!digiflazzBrandsMap.has(key)) {
+        digiflazzBrandsMap.set(key, { key, name: brandName, category: categoryName, items: [] });
       }
-      activeTopup = treq;
+      digiflazzBrandsMap.get(key).items.push(p);
     }
-  }
+    const digiflazzBrandsData = Array.from(digiflazzBrandsMap.values());
+    const digiflazzCategories = Array.from(new Set((digiflazzCatalogProducts || []).map(p => String(p.category || '').trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b));
 
-  res.render('agent/dashboard', {
-    title: 'Dashboard Agent',
-    company: company(),
-    agent,
-    q,
-    invoices: visibleInvoices,
-    prices,
-    txs,
-    digiflazzMarkup,
-    digiflazzConfigured,
-    digiflazzCategories,
-    digiflazzBrandsData,
-    paymentChannels,
-    activeTopup,
-    settings,
-    msg: flashMsg(req),
-    receipt: popReceipt(req)
-  });
+    // Fetch payment channels
+    let paymentChannels = [];
+    try {
+      const gateway = resolveConfiguredGateway(settings);
+      if (!gateway) {
+        paymentChannels = [];
+      } else if (gateway === 'tripay') {
+        paymentChannels = await Promise.race([
+          paymentSvc.getTripayChannels(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Tripay timeout')), 2500))
+        ]).catch(() => []);
+      } else if (gateway === 'midtrans') {
+        paymentChannels = [
+          { code: 'SNAP', name: 'Semua Metode (Snap)', group: 'E-Wallet', active: true },
+          { code: 'QRIS', name: 'QRIS', group: 'E-Wallet', active: true },
+          { code: 'BCAVA', name: 'BCA Virtual Account', group: 'Virtual Account', active: true },
+          { code: 'BNIVA', name: 'BNI Virtual Account', group: 'Virtual Account', active: true },
+          { code: 'BRIVA', name: 'BRI Virtual Account', group: 'Virtual Account', active: true },
+          { code: 'PERMATAVA', name: 'Permata Virtual Account', group: 'Virtual Account', active: true },
+          { code: 'MANDIRIVA', name: 'Mandiri Virtual Account', group: 'Virtual Account', active: true }
+        ];
+      } else if (gateway === 'xendit') {
+        paymentChannels = [
+          { code: 'XENDIT', name: 'Semua Metode', group: 'E-Wallet', active: true },
+          { code: 'QRIS', name: 'QRIS', group: 'E-Wallet', active: true },
+          { code: 'BCAVA', name: 'BCA Virtual Account', group: 'Virtual Account', active: true },
+          { code: 'BNIVA', name: 'BNI Virtual Account', group: 'Virtual Account', active: true },
+          { code: 'BRIVA', name: 'BRI Virtual Account', group: 'Virtual Account', active: true },
+          { code: 'PERMATAVA', name: 'Permata Virtual Account', group: 'Virtual Account', active: true },
+          { code: 'MANDIRIVA', name: 'Mandiri Virtual Account', group: 'Virtual Account', active: true }
+        ];
+      } else if (gateway === 'duitku') {
+        paymentChannels = [
+          { code: 'DUITKU', name: 'Semua Metode', group: 'E-Wallet', active: true },
+          { code: 'QRIS', name: 'QRIS', group: 'E-Wallet', active: true },
+          { code: 'BCAVA', name: 'BCA Virtual Account', group: 'Virtual Account', active: true },
+          { code: 'BNIVA', name: 'BNI Virtual Account', group: 'Virtual Account', active: true },
+          { code: 'BRIVA', name: 'BRI Virtual Account', group: 'Virtual Account', active: true },
+          { code: 'PERMATAVA', name: 'Permata Virtual Account', group: 'Virtual Account', active: true },
+          { code: 'MANDIRIVA', name: 'Mandiri Virtual Account', group: 'Virtual Account', active: true }
+        ];
+      }
+      if (paymentChannels.length === 0) {
+        paymentChannels = [
+          { code: 'QRIS', name: 'QRIS Dinamis', group: 'Instant QRIS', active: true },
+          { code: 'MANUAL_BANK', name: 'Transfer Bank (Kode Unik Otomatis)', group: 'Transfer Bank', active: true }
+        ];
+      }
+    } catch(e) {
+      paymentChannels = [];
+    }
+
+    let activeTopup = null;
+    const topupId = Number(req.query.topup_id || 0);
+    if (topupId > 0) {
+      const treq = db.prepare('SELECT * FROM agent_topup_requests WHERE id = ? AND agent_id = ?').get(topupId, agent.id);
+      if (treq && treq.status === 'pending') {
+        try {
+          treq.payloadObj = treq.payment_payload ? JSON.parse(treq.payment_payload) : {};
+        } catch (_) {
+          treq.payloadObj = {};
+        }
+        activeTopup = treq;
+      }
+    }
+
+    res.render('agent/dashboard', {
+      title: 'Dashboard Agent',
+      company: company(),
+      agent,
+      q,
+      invoices: visibleInvoices,
+      prices,
+      txs,
+      digiflazzMarkup,
+      digiflazzConfigured,
+      digiflazzCategories,
+      digiflazzBrandsData,
+      paymentChannels,
+      activeTopup,
+      settings,
+      msg: flashMsg(req),
+      receipt: popReceipt(req)
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 router.post('/topup/create', requireAgentSession, express.urlencoded({ extended: true }), async (req, res) => {

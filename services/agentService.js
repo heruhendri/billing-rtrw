@@ -605,7 +605,7 @@ async function sellVoucherAsAgent(agentId, priceId, opts = {}) {
     attempt++;
     const code = (prefix ? prefix : '') + genCode(length, charset);
     const password = opts.mode === 'member' ? genCode(length, charset) : code;
-    const comment = `ag-${agent.username}-${code}-${profileName}`;
+    const comment = `vc-${code}-${profileName}`;
     const userData = { server: 'all', name: code, password, profile: profileName, comment };
     if (validity) userData['limit-uptime'] = validity;
 
