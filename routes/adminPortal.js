@@ -1119,12 +1119,19 @@ router.post('/collector-payments/:id/approve', requireAdminSession, express.urle
 
     const customer = customerSvc.getCustomerById(inv.customer_id);
     if (customer && customer.phone) {
+      const pkg = customer.package_id ? customerSvc.getPackageById(customer.package_id) : null;
       await sendPaymentSuccessWA(
         customer.phone,
         customer.name,
         `${inv.period_month}/${inv.period_year}`,
         Number(inv.amount || 0).toLocaleString('id-ID'),
-        collectorLabel
+        collectorLabel,
+        {
+          invoiceId: inv.id,
+          username: customer.pppoe_username || customer.id,
+          packageName: pkg?.name || customer.package_name || '-',
+          paidAt: new Date()
+        }
       );
     }
 
@@ -2262,12 +2269,19 @@ router.post('/customers/:id/billing/pay', requireAdminSession, express.urlencode
 
       if (customer && customer.phone && done > 0) {
         const monthsText = (sum.paidMonths || []).join(', ');
+        const pkg = customer.package_id ? customerSvc.getPackageById(customer.package_id) : null;
         await sendPaymentSuccessWA(
           customer.phone,
           customer.name,
           `${monthsText} / ${sum.year}`,
           Number(total || 0).toLocaleString('id-ID'),
-          paidBy
+          paidBy,
+          {
+            invoiceId: '',
+            username: customer.pppoe_username || customer.id,
+            packageName: pkg?.name || customer.package_name || '-',
+            paidAt: new Date()
+          }
         );
       }
     } else {
@@ -2283,12 +2297,19 @@ router.post('/customers/:id/billing/pay', requireAdminSession, express.urlencode
           const invs = billingSvc.getInvoicesByAny(String(req.params.id)) || [];
           const inv = (Array.isArray(invs) ? invs : []).find(i => Number(i?.period_month) === Number(m) && Number(i?.period_year) === Number(y)) || null;
           const amount = inv ? Number(inv.amount || 0) : 0;
+          const pkg = customer.package_id ? customerSvc.getPackageById(customer.package_id) : null;
           await sendPaymentSuccessWA(
             customer.phone,
             customer.name,
             `${m}/${y}`,
             amount.toLocaleString('id-ID'),
-            paidBy
+            paidBy,
+            {
+              invoiceId: inv ? inv.id : '',
+              username: customer.pppoe_username || customer.id,
+              packageName: pkg?.name || customer.package_name || '-',
+              paidAt: new Date()
+            }
           );
         }
       }
@@ -2628,12 +2649,19 @@ router.post('/billing/pay-bulk', requireAdminSession, express.urlencoded({ exten
           .map(x => `${x.period_month}/${x.period_year}`)
           .slice(0, 10)
           .join(', ') + (paidInvoices.length > 10 ? `, +${paidInvoices.length - 10} lainnya` : '');
+        const pkg = customer.package_id ? customerSvc.getPackageById(customer.package_id) : null;
         await sendPaymentSuccessWA(
           customer.phone,
           customer.name,
           periods,
           Number(total || 0).toLocaleString('id-ID'),
-          paidBy
+          paidBy,
+          {
+            invoiceId: paidInvoices.map(x => x.id).join(', '),
+            username: customer.pppoe_username || customer.id,
+            packageName: pkg?.name || customer.package_name || '-',
+            paidAt: new Date()
+          }
         );
       }
     }
@@ -2681,12 +2709,19 @@ router.post('/billing/:id/pay', requireAdminSession, express.urlencoded({ extend
     // Check if customer is currently suspended and has no more unpaid invoices
     const customer = customerSvc.getCustomerById(inv.customer_id);
     if (!wasPaid && customer && customer.phone) {
+      const pkg = customer.package_id ? customerSvc.getPackageById(customer.package_id) : null;
       await sendPaymentSuccessWA(
         customer.phone,
         customer.name,
         `${inv.period_month}/${inv.period_year}`,
         Number(inv.amount || 0).toLocaleString('id-ID'),
-        paidBy
+        paidBy,
+        {
+          invoiceId: inv.id,
+          username: customer.pppoe_username || customer.id,
+          packageName: pkg?.name || customer.package_name || '-',
+          paidAt: new Date()
+        }
       );
     }
     if (customer && customer.status === 'suspended') {
@@ -5582,6 +5617,11 @@ router.get('/whatsapp', requireAdminSession, requireSidebarMenuAccess('whatsapp'
     meta_verify_token: getSetting('meta_verify_token', 'antigravity_meta_wa_secret'),
     meta_business_phone: getSetting('meta_business_phone', '')
   };
+  const fonnteSettings = {
+    fonnte_token: getSetting('fonnte_token', ''),
+    fonnte_api_url: getSetting('fonnte_api_url', 'https://api.fonnte.com/send'),
+    fonnte_country_code: getSetting('fonnte_country_code', '62')
+  };
 
   res.render('admin/whatsapp', {
     title: 'Status WhatsApp',
@@ -5590,26 +5630,54 @@ router.get('/whatsapp', requireAdminSession, requireSidebarMenuAccess('whatsapp'
     msg: flashMsg(req),
     waGatewayType,
     metaSettings,
+    fonnteSettings,
     host: req.get('host') || 'localhost:3001'
   });
 });
 
 router.post('/whatsapp/gateway-settings', requireAdminSession, express.urlencoded({ extended: true }), async (req, res) => {
   try {
-    const { wa_gateway_type, meta_phone_number_id, meta_waba_id, meta_access_token, meta_verify_token, meta_business_phone } = req.body;
+    const {
+      wa_gateway_type,
+      meta_phone_number_id,
+      meta_waba_id,
+      meta_access_token,
+      meta_verify_token,
+      meta_business_phone,
+      fonnte_token,
+      fonnte_api_url,
+      fonnte_country_code
+    } = req.body;
+
     saveSettings({
       wa_gateway_type: wa_gateway_type || 'baileys',
       meta_phone_number_id: String(meta_phone_number_id || '').trim(),
       meta_waba_id: String(meta_waba_id || '').trim(),
       meta_access_token: String(meta_access_token || '').trim(),
       meta_verify_token: String(meta_verify_token || '').trim() || 'antigravity_meta_wa_secret',
-      meta_business_phone: String(meta_business_phone || '').trim()
+      meta_business_phone: String(meta_business_phone || '').trim(),
+      fonnte_token: String(fonnte_token || '').trim(),
+      fonnte_api_url: String(fonnte_api_url || 'https://api.fonnte.com/send').trim(),
+      fonnte_country_code: String(fonnte_country_code || '62').trim()
     });
-    req.session._msg = { type: 'success', text: 'Pengaturan WhatsApp Gateway & Meta Cloud API berhasil disimpan.' };
+    req.session._msg = { type: 'success', text: 'Pengaturan WhatsApp Gateway (Baileys / Fonnte / Meta) berhasil disimpan.' };
   } catch (e) {
     req.session._msg = { type: 'danger', text: 'Gagal menyimpan pengaturan: ' + e.message };
   }
   res.redirect('/admin/whatsapp');
+});
+
+router.post('/whatsapp/test-fonnte', requireAdminSession, express.json(), async (req, res) => {
+  try {
+    const { phone, message } = req.body;
+    if (!phone) return res.status(400).json({ success: false, error: 'Nomor HP tujuan wajib diisi.' });
+
+    const fonnteSvc = require('../services/fonnteWhatsappService');
+    const result = await fonnteSvc.testFonnteConnection(phone, message);
+    res.json({ success: true, message: 'Pesan berhasil dikirim via Fonnte Gateway!', data: result });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 // LIVE CHAT ROUTES
@@ -5952,7 +6020,15 @@ router.post('/whatsapp/auto-billing', requireAdminSession, express.urlencoded({ 
 router.get('/api/whatsapp/status', requireAdmin, async (req, res) => {
     try {
       const gatewayType = getSetting('wa_gateway_type', 'baileys');
-      if (gatewayType === 'meta') {
+      if (gatewayType === 'fonnte') {
+        const token = getSetting('fonnte_token', '');
+        res.json({
+          connection: token ? 'open' : 'close',
+          gateway: 'fonnte',
+          user: { id: 'fonnte_gateway', name: 'Fonnte Gateway' },
+          lastUpdate: new Date().toISOString()
+        });
+      } else if (gatewayType === 'meta') {
         const phoneId = getSetting('meta_phone_number_id', '');
         const token = getSetting('meta_access_token', '');
         res.json({ connection: (phoneId && token) ? 'open' : 'connecting', gateway: 'meta' });
