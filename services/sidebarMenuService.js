@@ -33,6 +33,7 @@ const MENU_DEFINITIONS = [
   { key: 'promo_slides', section: 'billing', href: '/admin/promo-slides', icon: 'bi bi-image', labelKey: 'admin.nav.promo_slides', labelDefault: 'Promo Slides', roles: ['admin'], activePages: ['promo_slides'] },
 
   { key: 'customers', section: 'billing', href: '/admin/customers', icon: 'bi bi-people', labelKey: 'admin.nav.customers', labelDefault: 'Pelanggan', roles: ['admin', 'cashier'], bottomNav: true, activePages: ['customers'] },
+  { key: 'onu_stickers', section: 'billing', href: '/admin/onu-stickers', icon: 'bi bi-qr-code', labelKey: 'admin.nav.onu_stickers', labelDefault: 'Stiker Modem ONU', roles: ['admin', 'cashier'], activePages: ['onu_stickers'] },
   { key: 'packages', section: 'billing', href: '/admin/packages', icon: 'bi bi-box-seam', labelKey: 'admin.nav.internet_packages', labelDefault: 'Paket Internet', roles: ['admin', 'cashier'], activePages: ['packages'] },
   { key: 'voucher_packages', section: 'billing', href: '/admin/vouchers/packages', icon: 'bi bi-ticket-detailed', labelKey: 'admin.nav.voucher_packages', labelDefault: 'Paket Voucher', roles: ['admin', 'cashier'], activePages: ['voucher_packages'] },
   { key: 'billing', section: 'billing', href: '/admin/billing', icon: 'bi bi-receipt', labelKey: 'admin.nav.invoices', labelDefault: 'Tagihan', roles: ['admin', 'cashier'], bottomNav: true, activePages: ['billing'] },
@@ -81,6 +82,7 @@ const DEFAULT_MENU_STATES = {
   whatsapp_live_chat: STATE_VISIBLE,
   promo_slides: STATE_VISIBLE,
   customers: STATE_VISIBLE,
+  onu_stickers: STATE_VISIBLE,
   packages: STATE_VISIBLE,
   voucher_packages: STATE_VISIBLE,
   billing: STATE_VISIBLE,

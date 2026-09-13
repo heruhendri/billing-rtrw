@@ -3323,9 +3323,11 @@ router.post('/payment/callback', express.json({
           while (attempt < 10) {
             attempt++;
             const coreLen = Math.max(4, codeLength - prefix.length);
-            const code = prefix + genCustomCode(coreLen, charset);
-            const pass = code;
-            const comment = `vc-${code}-${fresh.profile_name}`;
+            const now = new Date();
+            const dd = String(now.getDate()).padStart(2, '0');
+            const mm = String(now.getMonth() + 1).padStart(2, '0');
+            const yy = String(now.getFullYear()).slice(-2);
+            const comment = `vc-online-${dd}.${mm}.${yy}`;
             const userData = {
               server: 'all',
               name: code,
@@ -3875,5 +3877,8 @@ router.post('/customer/reconnect', async (req, res) => {
     return res.redirect('/customer/dashboard');
   }
 });
+
+router.ensureInvoiceQrisUnique = ensureInvoiceQrisUnique;
+router.getStaticQrisQrUrlForAmount = getStaticQrisQrUrlForAmount;
 
 module.exports = router;

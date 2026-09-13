@@ -479,7 +479,7 @@ async function createVoucherBatchAsync(batchId) {
         }
 
         try {
-          const comment = `vc-${generated.userCode}-${batch.profile_name}`;
+          const comment = current.comment || `vc-${batch.created_by || 'admin'}`;
           const userData = {
             server: 'all',
             name: generated.userCode,
@@ -1553,6 +1553,113 @@ router.get('/devices', requireAdminSession, (req, res) => {
 router.get('/bulk', requireAdminSession, (req, res) => {
   const settings = getSettings();
   res.render('admin/dashboard', { title: 'Konfigurasi Massal', company: company(), version: '2.0.0', activePage: 'bulk', billing: null, custStats: null, settings });
+});
+
+// ─── ONU MODEM STICKER PRINT ───────────────────────────────────────────────
+router.get('/onu-stickers', requireAdminSession, requireSidebarMenuAccess('onu_stickers'), async (req, res) => {
+  try {
+    const settings = getSettings();
+    const mode = req.query.mode === 'customers' ? 'customers' : 'blank';
+    const count = Math.max(1, Math.min(100, Number(req.query.count || 10)));
+    const searchQuery = String(req.query.q || '').trim();
+    const selectedRouterId = req.selectedRouterId || (req.query.router_id ? Number(req.query.router_id) : null);
+    const csPhone = req.query.cs_phone || settings.company_phone || settings.company_whatsapp || '08xxxxxxxxxx';
+    const serverBaseUrl = `${req.protocol}://${req.get('host')}`;
+
+    const routers = mikrotikService.getAllRouters();
+    let stickers = [];
+
+    if (mode === 'blank') {
+      const qrPayload = `${serverBaseUrl}/app/connect`;
+      const qrCodeDataUrl = await QRCode.toDataURL(qrPayload, {
+        margin: 1,
+        width: 250,
+        errorCorrectionLevel: 'M'
+      });
+
+      for (let i = 0; i < count; i++) {
+        stickers.push({
+          name: '',
+          id_display: '',
+          package_name: '',
+          qrCodeDataUrl
+        });
+      }
+    } else {
+      const customers = customerSvc.getAllCustomers(searchQuery, selectedRouterId, 'active');
+      const targetCusts = (customers || []).slice(0, 100);
+
+      for (const c of targetCusts) {
+        const qrPayload = `${serverBaseUrl}/app/connect?cid=${encodeURIComponent(c.pppoe_username || c.id)}`;
+        const qrCodeDataUrl = await QRCode.toDataURL(qrPayload, {
+          margin: 1,
+          width: 250,
+          errorCorrectionLevel: 'M'
+        });
+
+        stickers.push({
+          name: c.name,
+          id_display: `${c.pppoe_username || ('ID:' + c.id)}`,
+          package_name: c.package_name || 'Reguler',
+          qrCodeDataUrl
+        });
+      }
+    }
+
+    res.render('admin/onu_stickers', {
+      company: company(),
+      companyLogo: settings.company_logo || '',
+      csPhone,
+      mode,
+      count,
+      searchQuery,
+      selectedRouterId,
+      routers,
+      stickers
+    });
+  } catch (e) {
+    logger.error(`[ONU Stickers] Error: ${e.message}`);
+    res.status(500).send(`Gagal memuat stiker: ${e.message}`);
+  }
+});
+
+router.get('/customers/:id/sticker-onu', requireAdminSession, async (req, res) => {
+  try {
+    const settings = getSettings();
+    const customer = customerSvc.getCustomerById(req.params.id);
+    if (!customer) return res.status(404).send('Pelanggan tidak ditemukan');
+
+    const csPhone = settings.company_phone || settings.company_whatsapp || '08xxxxxxxxxx';
+    const serverBaseUrl = `${req.protocol}://${req.get('host')}`;
+
+    const qrPayload = `${serverBaseUrl}/app/connect?cid=${encodeURIComponent(customer.pppoe_username || customer.id)}`;
+    const qrCodeDataUrl = await QRCode.toDataURL(qrPayload, {
+      margin: 1,
+      width: 250,
+      errorCorrectionLevel: 'M'
+    });
+
+    const stickers = [{
+      name: customer.name,
+      id_display: `${customer.pppoe_username || ('ID:' + customer.id)}`,
+      package_name: customer.package_name || 'Reguler',
+      qrCodeDataUrl
+    }];
+
+    res.render('admin/onu_stickers', {
+      company: company(),
+      companyLogo: settings.company_logo || '',
+      csPhone,
+      mode: 'customers',
+      count: 1,
+      searchQuery: '',
+      selectedRouterId: null,
+      routers: [],
+      stickers
+    });
+  } catch (e) {
+    res.status(500).send(`Gagal memuat stiker: ${e.message}`);
+  }
 });
 
 // ─── CUSTOMERS ─────────────────────────────────────────────────────────────
@@ -2704,7 +2811,9 @@ router.post('/billing/:id/pay', requireAdminSession, express.urlencoded({ extend
 
     const paidBy = resolvePaidByName(req, req.body.paid_by_name);
     const wasPaid = String(inv.status || '').toLowerCase() === 'paid';
-    billingSvc.markAsPaid(req.params.id, paidBy, req.body.notes);
+    if (!wasPaid) {
+      billingSvc.markAsPaid(req.params.id, paidBy, req.body.notes);
+    }
     
     // Check if customer is currently suspended and has no more unpaid invoices
     const customer = customerSvc.getCustomerById(inv.customer_id);
@@ -2725,13 +2834,13 @@ router.post('/billing/:id/pay', requireAdminSession, express.urlencoded({ extend
       );
     }
     if (customer && customer.status === 'suspended') {
-      const freshCustomer = customerSvc.getAllCustomers().find(c => c.id === inv.customer_id);
-      if (freshCustomer && freshCustomer.unpaid_count === 0) {
+      const unpaidCount = db.prepare("SELECT COUNT(*) as cnt FROM invoices WHERE customer_id=? AND status='unpaid'").get(inv.customer_id)?.cnt || 0;
+      if (unpaidCount === 0) {
         await customerSvc.activateCustomer(inv.customer_id);
       }
     }
 
-    req.session._msg = { type: 'success', text: 'Tagihan berhasil ditandai lunas.' };
+    req.session._msg = { type: 'success', text: wasPaid ? 'Tagihan ini memang sudah lunas sebelumnya.' : 'Tagihan berhasil ditandai lunas.' };
   } catch (e) {
     req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
   }
@@ -5157,13 +5266,20 @@ router.post('/api/vouchers/batches', requireAdmin, express.json(), async (req, r
     const meta = parseMikhmonOnLogin(profile.onLogin || profile['on-login']);
     if (!meta || !meta.validity) return res.status(400).json({ error: 'Profile belum memiliki metadata harga/durasi (Format Mikhmon)' });
 
-    const createdBy = req.session?.isAdmin ? (req.session.adminUser || 'admin') : (req.session.cashierName || 'staff');
+    const createdBy = req.session?.isAdmin ? (req.session.adminUser || 'admin') : (req.session.cashierName || 'kasir');
     let price = Number(meta.price || 0);
     if (priceInput !== undefined && priceInput !== null && String(priceInput).trim() !== '') {
       const p = Number(priceInput);
       if (!Number.isFinite(p) || p < 0) return res.status(400).json({ error: 'Harga tidak valid' });
       price = Math.floor(p);
     }
+
+    const now = new Date();
+    const dd = String(now.getDate()).padStart(2, '0');
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const yy = String(now.getFullYear()).slice(-2);
+    const defaultComment = `vc-${createdBy}-${dd}.${mm}.${yy}`;
+    const comment = String(req.body.comment || defaultComment).trim();
 
     const insertBatch = db.prepare(`
       INSERT INTO voucher_batches (router_id, profile_name, qty_total, qty_created, qty_failed, price, validity, prefix, code_length, status, created_by, mode, charset)
@@ -5200,7 +5316,7 @@ router.post('/api/vouchers/batches', requireAdmin, express.json(), async (req, r
 
     const tx = db.transaction((items) => {
       for (const c of items) {
-        insertVoucher.run(batchId, routerId, c.userCode, c.passCode, profileName, `vc-${c.userCode}-${profileName}`);
+        insertVoucher.run(batchId, routerId, c.userCode, c.passCode, profileName, comment);
       }
     });
     tx(initialVouchers);
@@ -5660,6 +5776,13 @@ router.post('/whatsapp/gateway-settings', requireAdminSession, express.urlencode
       fonnte_api_url: String(fonnte_api_url || 'https://api.fonnte.com/send').trim(),
       fonnte_country_code: String(fonnte_country_code || '62').trim()
     });
+
+    if ((wa_gateway_type || 'baileys') === 'baileys') {
+      import('../services/whatsappBot.mjs').then(m => m.startWhatsAppBot()).catch(e => {
+        logger.error('Failed to start Baileys bot on gateway change: ' + e.message);
+      });
+    }
+
     req.session._msg = { type: 'success', text: 'Pengaturan WhatsApp Gateway (Baileys / Fonnte / Meta) berhasil disimpan.' };
   } catch (e) {
     req.session._msg = { type: 'danger', text: 'Gagal menyimpan pengaturan: ' + e.message };
@@ -6033,7 +6156,10 @@ router.get('/api/whatsapp/status', requireAdmin, async (req, res) => {
         const token = getSetting('meta_access_token', '');
         res.json({ connection: (phoneId && token) ? 'open' : 'connecting', gateway: 'meta' });
       } else {
-        const { whatsappStatus } = await import('../services/whatsappBot.mjs');
+        const { whatsappStatus, startWhatsAppBot, isBotRunning } = await import('../services/whatsappBot.mjs');
+        if (getSetting('whatsapp_enabled', true) && !isBotRunning() && whatsappStatus.connection !== 'open' && whatsappStatus.connection !== 'qr') {
+          startWhatsAppBot().catch(err => logger.error('Auto start Baileys error: ' + err.message));
+        }
         res.json(whatsappStatus);
       }
     } catch (e) {
@@ -6043,10 +6169,7 @@ router.get('/api/whatsapp/status', requireAdmin, async (req, res) => {
 
 router.post('/whatsapp/test-notification', requireAdminSession, async (req, res) => {
   try {
-    const { sendWA, whatsappStatus } = await import('../services/whatsappBot.mjs');
-    if (whatsappStatus.connection !== 'open') {
-      throw new Error('Bot WhatsApp belum terhubung. Silakan scan QR hingga status Terhubung.');
-    }
+    const waSvc = require('../services/whatsappService');
     const adminNumbers = getSetting('whatsapp_admin_numbers', []);
     const legacyNumbers = getSetting('admins', []);
     let adminPhone = '08977345640'; // fallback
@@ -6061,8 +6184,8 @@ router.post('/whatsapp/test-notification', requireAdminSession, async (req, res)
       `🧪 *TEST NOTIFIKASI WHATSAPP*\n\n` +
       `✅ Jika pesan ini masuk, berarti notifikasi WhatsApp dari Billing System sudah berfungsi.\n` +
       `📅 Waktu: ${getNowLocal()}`;
-    const ok = await sendWA(adminPhone, msg);
-    if (!ok) throw new Error('Gagal mengirim pesan test (sendWA=false).');
+    const ok = await waSvc.sendWhatsAppMessage(adminPhone, msg);
+    if (!ok) throw new Error('Gagal mengirim pesan test WhatsApp.');
     logger.info(`[WA Test] Test notifikasi sukses terkirim ke ${adminPhone}`);
     req.session._msg = { type: 'success', text: 'Test notifikasi WhatsApp berhasil dikirim ke ' + adminPhone };
   } catch (e) {
@@ -6093,7 +6216,24 @@ router.post('/whatsapp/reset', requireAdminSession, (req, res) => {
     res.redirect('/admin/whatsapp');
   } catch (e) {
     logger.error('Failed to reset WA session:', e.message);
-    req.session._msg = { text: 'Gagal menghapus sesi: ' + e.message + '. (Kemungkinan file sedang digunakan, silakan matikan aplikasi dulu lalu hapus folder ' + getSetting('whatsapp_auth_folder', 'auth_info_baileys') + ' secara manual)', type: 'danger' };
+    req.session._msg = { text: 'Gagal menghapus sesi: ' + e.message, type: 'danger' };
+    res.redirect('/admin/whatsapp');
+  }
+});
+
+router.post('/whatsapp/repair-keys', requireAdminSession, async (req, res) => {
+  try {
+    const { cleanStaleSessionKeys, restartWhatsAppBot } = await import('../services/whatsappBot.mjs');
+    const cleaned = cleanStaleSessionKeys();
+    await restartWhatsAppBot();
+    req.session._msg = {
+      text: `Berhasil membersihkan ${cleaned} cache session/pre-key usang. Bot Baileys telah di-refresh tanpa perlu scan QR ulang.`,
+      type: 'success'
+    };
+    res.redirect('/admin/whatsapp');
+  } catch (e) {
+    logger.error('Failed to repair WA session keys:', e.message);
+    req.session._msg = { text: 'Gagal memperbaiki session keys: ' + e.message, type: 'danger' };
     res.redirect('/admin/whatsapp');
   }
 });

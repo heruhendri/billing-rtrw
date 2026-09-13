@@ -180,11 +180,21 @@ function authenticate(username, password) {
 }
 
 function getAllAgents() {
-  return db.prepare('SELECT * FROM agents ORDER BY created_at DESC').all();
+  return db.prepare(`
+    SELECT a.*, r.name AS router_name
+    FROM agents a
+    LEFT JOIN routers r ON r.id = a.router_id
+    ORDER BY a.created_at DESC
+  `).all();
 }
 
 function getAgentById(id) {
-  return db.prepare('SELECT * FROM agents WHERE id = ?').get(id);
+  return db.prepare(`
+    SELECT a.*, r.name AS router_name
+    FROM agents a
+    LEFT JOIN routers r ON r.id = a.router_id
+    WHERE a.id = ?
+  `).get(id);
 }
 
 function normalizePhoneDigits(v) {
@@ -209,9 +219,12 @@ function getAgentByPhone(phone) {
 }
 
 function createAgent(data) {
+  const routerId = data.router_id !== undefined && data.router_id !== null && String(data.router_id).trim() !== ''
+    ? Number(data.router_id)
+    : null;
   return db
     .prepare(
-      'INSERT INTO agents (username, password, name, phone, balance, billing_fee, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)'
+      'INSERT INTO agents (username, password, name, phone, balance, billing_fee, is_active, router_id) VALUES (?, ?, ?, ?, ?, ?, 1, ?)'
     )
     .run(
       String(data.username || '').trim(),
@@ -219,7 +232,8 @@ function createAgent(data) {
       String(data.name || '').trim(),
       String(data.phone || '').trim(),
       Math.max(0, Number(data.balance || 0) || 0),
-      Math.max(0, Number(data.billing_fee || 0) || 0)
+      Math.max(0, Number(data.billing_fee || 0) || 0),
+      routerId
     );
 }
 
@@ -227,20 +241,25 @@ function updateAgent(id, data) {
   const existing = getAgentById(id);
   if (!existing) throw new Error('Agent tidak ditemukan');
 
+  const routerId = data.router_id !== undefined
+    ? (data.router_id !== null && String(data.router_id).trim() !== '' ? Number(data.router_id) : null)
+    : existing.router_id;
+
   const next = {
     username: String(data.username ?? existing.username).trim(),
     password: String(data.password ?? existing.password),
     name: String(data.name ?? existing.name).trim(),
     phone: String(data.phone ?? existing.phone).trim(),
     billing_fee: Math.max(0, Number(data.billing_fee ?? existing.billing_fee) || 0),
-    is_active: data.is_active !== undefined ? (String(data.is_active) === '1' ? 1 : 0) : existing.is_active
+    is_active: data.is_active !== undefined ? (String(data.is_active) === '1' ? 1 : 0) : existing.is_active,
+    router_id: routerId
   };
 
   return db
     .prepare(
-      'UPDATE agents SET username=?, password=?, name=?, phone=?, billing_fee=?, is_active=? WHERE id=?'
+      'UPDATE agents SET username=?, password=?, name=?, phone=?, billing_fee=?, is_active=?, router_id=? WHERE id=?'
     )
-    .run(next.username, next.password, next.name, next.phone, next.billing_fee, next.is_active, id);
+    .run(next.username, next.password, next.name, next.phone, next.billing_fee, next.is_active, next.router_id, id);
 }
 
 function deleteAgent(id) {
@@ -254,17 +273,31 @@ function getAgentPrices(agentId) {
   // 1. Ambil paket resmi yang aktif dari voucher_packages (dikelola admin di /admin/vouchers/packages)
   let masterPackages = [];
   try {
-    masterPackages = db
-      .prepare(
+    if (agent && agent.router_id) {
+      masterPackages = db
+        .prepare(
+          `
+          SELECT vp.*, r.name AS router_name
+          FROM voucher_packages vp
+          LEFT JOIN routers r ON r.id = vp.router_id
+          WHERE vp.is_active = 1 AND (vp.router_id = ? OR vp.router_id IS NULL)
+          ORDER BY vp.price ASC, vp.profile_name ASC
         `
-        SELECT vp.*, r.name AS router_name
-        FROM voucher_packages vp
-        LEFT JOIN routers r ON r.id = vp.router_id
-        WHERE vp.is_active = 1
-        ORDER BY vp.price ASC, vp.profile_name ASC
-      `
-      )
-      .all();
+        )
+        .all(agent.router_id);
+    } else {
+      masterPackages = db
+        .prepare(
+          `
+          SELECT vp.*, r.name AS router_name
+          FROM voucher_packages vp
+          LEFT JOIN routers r ON r.id = vp.router_id
+          WHERE vp.is_active = 1
+          ORDER BY vp.price ASC, vp.profile_name ASC
+        `
+        )
+        .all();
+    }
   } catch (_) {}
 
   // 2. Ambil kustomisasi harga agen (jika ada di agent_hotspot_prices)
@@ -583,7 +616,7 @@ async function sellVoucherAsAgent(agentId, priceId, opts = {}) {
   const sellPrice = Math.max(0, Number(price.sell_price || 0) || 0);
   if (buyPrice <= 0) throw new Error('Harga beli belum valid');
 
-  const routerId = price.router_id ?? null;
+  const routerId = price.router_id ?? agent.router_id ?? null;
   const profileName = String(price.profile_name || '').trim();
 
   let validity = String(price.validity || '').trim();
@@ -604,8 +637,12 @@ async function sellVoucherAsAgent(agentId, priceId, opts = {}) {
   while (attempt < 10) {
     attempt++;
     const code = (prefix ? prefix : '') + genCode(length, charset);
-    const password = opts.mode === 'member' ? genCode(length, charset) : code;
-    const comment = `vc-${code}-${profileName}`;
+    const now = new Date();
+    const dd = String(now.getDate()).padStart(2, '0');
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const yy = String(now.getFullYear()).slice(-2);
+    const agentName = String(agent.name || agent.username || 'Agent').trim().replace(/\s+/g, '_');
+    const comment = `vc-${agentName}-${dd}.${mm}.${yy}`;
     const userData = { server: 'all', name: code, password, profile: profileName, comment };
     if (validity) userData['limit-uptime'] = validity;
 

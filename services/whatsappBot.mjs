@@ -1,11 +1,13 @@
 import { createRequire } from 'module';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import fs from 'fs';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } from '@whiskeysockets/baileys';
 
 const require = createRequire(import.meta.url);
+const QRCodeNode = require('qrcode');
 const { logger } = require('../config/logger.js');
 const { getSetting, getNowLocal, formatDateLocal, getCurrentDateInTimezone } = require('../config/settingsManager.js');
 const db = require('../config/database.js');
@@ -19,11 +21,12 @@ const agentSvc = require('./agentService.js');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.join(__dirname, '..');
 
-// Cache Retry Counter untuk Baileys Signal Enkripsi (Mencegah "Waiting for this message" / Pesan tidak terbaca)
-class SimpleRetryCache {
-  constructor(ttlMs = 600000) {
+// Cache Store Berkinerja Tinggi untuk Baileys Signal Keys & Retries (Anti 'Waiting for this message')
+class BaileysCacheStore {
+  constructor(ttlMs = 600000, maxSize = 5000) {
     this.cache = new Map();
     this.ttlMs = ttlMs;
+    this.maxSize = maxSize;
   }
   get(key) {
     const item = this.cache.get(key);
@@ -35,22 +38,108 @@ class SimpleRetryCache {
     return item.val;
   }
   set(key, val) {
+    if (this.cache.size >= this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+    }
     this.cache.set(key, { val, time: Date.now() });
   }
   del(key) {
     this.cache.delete(key);
   }
+  flushAll() {
+    this.cache.clear();
+  }
 }
-const msgRetryCounterCache = new SimpleRetryCache();
 
-const sentMessageMap = new Map();
+const msgRetryCounterCache = new BaileysCacheStore(600000);
+const userDevicesCache = new BaileysCacheStore(3600000);
+const placeholderResendCache = new BaileysCacheStore(600000);
+
+// Multi-Layer Message Store (Memory LRU + SQLite Fallback) untuk menangani permintaan retry dari WhatsApp
+class MultiLayerMessageStore {
+  constructor(maxSize = 5000) {
+    this.store = new Map();
+    this.maxSize = maxSize;
+  }
+
+  cache(key, message) {
+    if (!key || !key.id || !message) return;
+    const msgId = String(key.id);
+    const remote = String(key.remoteJid || '');
+    const combinedKey = `${remote}:${msgId}`;
+
+    let protoMsg = message;
+    if (message.message) protoMsg = message.message;
+
+    this.store.set(combinedKey, protoMsg);
+    this.store.set(msgId, protoMsg);
+
+    if (this.store.size > this.maxSize * 2) {
+      const keysToDelete = Array.from(this.store.keys()).slice(0, 500);
+      for (const k of keysToDelete) this.store.delete(k);
+    }
+  }
+
+  async get(key) {
+    if (!key || !key.id) return undefined;
+    const msgId = String(key.id);
+    const remote = String(key.remoteJid || '');
+    const combinedKey = `${remote}:${msgId}`;
+
+    if (this.store.has(combinedKey)) {
+      return this.store.get(combinedKey);
+    }
+    if (this.store.has(msgId)) {
+      return this.store.get(msgId);
+    }
+
+    for (const [k, v] of this.store.entries()) {
+      if (k.endsWith(`:${msgId}`) || k === msgId) {
+        return v;
+      }
+    }
+
+    // Database Fallback dari wa_chat_messages
+    try {
+      const row = db.prepare('SELECT message_text FROM wa_chat_messages WHERE meta_message_id = ? LIMIT 1').get(msgId);
+      if (row && row.message_text) {
+        return { conversation: row.message_text };
+      }
+    } catch (_) {}
+
+    return undefined;
+  }
+}
+
+const messageStore = new MultiLayerMessageStore(5000);
 function cacheSentMessage(key, message) {
-  if (!key || !key.id || !message) return;
-  const storeKey = `${key.remoteJid || ''}:${key.id}`;
-  sentMessageMap.set(storeKey, message);
-  if (sentMessageMap.size > 2000) {
-    const firstKey = sentMessageMap.keys().next().value;
-    sentMessageMap.delete(firstKey);
+  messageStore.cache(key, message);
+}
+
+/**
+ * Membersihkan file session dan pre-key usang jika terjadi Bad MAC desync
+ * tanpa menghapus creds.json (tidak perlu scan QR ulang)
+ */
+export function cleanStaleSessionKeys(authFolder) {
+  try {
+    const folder = authFolder || path.resolve(projectRoot, getSetting('whatsapp_auth_folder', 'auth_info_baileys'));
+    if (!fs.existsSync(folder)) return 0;
+    const files = fs.readdirSync(folder);
+    let cleaned = 0;
+    for (const f of files) {
+      if (f.startsWith('session-') || f.startsWith('pre-key-') || f.startsWith('sender-key-') || f.startsWith('app-state-sync-')) {
+        try {
+          fs.unlinkSync(path.join(folder, f));
+          cleaned++;
+        } catch (_) {}
+      }
+    }
+    logger.info(`[WA Session Auto-Repair] Membersihkan ${cleaned} session/pre-key usang (creds.json tetap dipertahankan).`);
+    return cleaned;
+  } catch (err) {
+    logger.warn(`[WA Session Auto-Repair] Gagal membersihkan session keys: ${err.message}`);
+    return 0;
   }
 }
 
@@ -106,24 +195,105 @@ function checkCommandCooldown(phone) {
   return { allowed: true };
 }
 
+let authLidReverse = new Map();
+
+export function loadAuthLidReverseMap(authFolder) {
+  try {
+    const folder = authFolder || path.resolve(projectRoot, getSetting('whatsapp_auth_folder', 'auth_info_baileys'));
+    if (!fs.existsSync(folder)) return;
+    const files = fs.readdirSync(folder);
+    const next = new Map();
+    for (const f of files) {
+      const forward = /^lid-mapping-(\d+)\.json$/i.exec(f);
+      const reverse = /^lid-mapping-(\d+)_reverse\.json$/i.exec(f);
+      if (!forward && !reverse) continue;
+
+      const raw = fs.readFileSync(path.join(folder, f), 'utf8');
+      let value = null;
+      try {
+        value = JSON.parse(raw);
+      } catch (e) {
+        value = String(raw || '').trim().replace(/^"|"$/g, '');
+      }
+
+      if (forward) {
+        let phoneDigits = forward[1].replace(/\D/g, '');
+        if (phoneDigits.startsWith('0')) phoneDigits = '62' + phoneDigits.slice(1);
+        else if (phoneDigits.startsWith('8')) phoneDigits = '62' + phoneDigits;
+        const lidDigits = String(value || '').replace(/\D/g, '');
+        if (!phoneDigits || !lidDigits) continue;
+        next.set(lidDigits + '@lid', phoneDigits);
+        next.set(lidDigits, phoneDigits);
+        continue;
+      }
+
+      if (reverse) {
+        const lidDigits = String(reverse[1] || '').replace(/\D/g, '');
+        let phoneDigits = String(value || '').replace(/\D/g, '');
+        if (phoneDigits.startsWith('0')) phoneDigits = '62' + phoneDigits.slice(1);
+        else if (phoneDigits.startsWith('8')) phoneDigits = '62' + phoneDigits;
+        if (!phoneDigits || !lidDigits) continue;
+        next.set(lidDigits + '@lid', phoneDigits);
+        next.set(lidDigits, phoneDigits);
+        continue;
+      }
+    }
+    authLidReverse = next;
+    if (authLidReverse.size > 0) {
+      logger.info(`[WA LID Reverse Map] Memuat ${authLidReverse.size} pemetaan LID otomatis dari folder auth.`);
+    }
+  } catch (e) {
+    logger.warn(`[WA LID Reverse Map] Gagal memuat auth lid reverse map: ${e.message}`);
+  }
+}
+
 function getPhoneFromKey(key) {
   if (!key) return null;
   const remoteJid = key.remoteJid || key;
-  if (!remoteJid) return null;
+  if (!remoteJid || typeof remoteJid !== 'string') return null;
 
-  // Extract phone number from JID
+  // 1. Check senderPn jika ada
+  if (key.senderPn && key.senderPn.endsWith('@s.whatsapp.net')) {
+    let p = key.senderPn.split('@')[0].replace(/\D/g, '');
+    if (p.startsWith('0')) p = '62' + p.slice(1);
+    else if (p.startsWith('8')) p = '62' + p;
+    else if (!p.startsWith('62')) p = '62' + p;
+    return p;
+  }
+
+  // 2. Check jika remoteJid atau senderLid adalah @lid
+  if (remoteJid.endsWith('@lid') || (key.senderLid && key.senderLid.endsWith('@lid'))) {
+    const lidJid = remoteJid.endsWith('@lid') ? remoteJid : key.senderLid;
+    const lidUser = lidJid.split('@')[0];
+
+    // Cek authLidReverse
+    const fromAuth = authLidReverse.get(lidJid) || authLidReverse.get(lidUser);
+    if (fromAuth) return fromAuth;
+
+    // Cek lidStore
+    try {
+      const lidStore = getDefaultLidStore();
+      if (lidStore) {
+        const mapped = lidStore.get(lidJid) || lidStore.get(lidUser);
+        if (mapped) {
+          let p = String(mapped).replace(/\D/g, '');
+          if (p.startsWith('0')) p = '62' + p.slice(1);
+          else if (p.startsWith('8')) p = '62' + p;
+          else if (!p.startsWith('62')) p = '62' + p;
+          return p;
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 3. Extract phone number dari JID standar
   const [user, host] = remoteJid.split('@');
   if (!user || !host) return null;
 
-  // Remove non-digits
   const phone = user.replace(/\D/g, '');
   if (!phone) return null;
-
-  // Convert 0 to 62
-  if (phone.startsWith('0')) {
-    return '62' + phone.slice(1);
-  }
-
+  if (phone.startsWith('0')) return '62' + phone.slice(1);
+  if (phone.startsWith('8')) return '62' + phone;
   return phone;
 }
 
@@ -439,6 +609,14 @@ function parseCommand(text, isAdmin) {
 
   if (['menu', 'bantuan', 'help'].includes(cmd)) return { cmd: 'menu', rest: '' };
 
+  if (['saldo', 'ceksaldo', 'saldomenu', 'mysaldo'].includes(cmd)) {
+    return { cmd: 'agent_saldo' };
+  }
+
+  if (['bayar', 'bayartagihan', 'pay', 'bayartag', 'lunaskan'].includes(cmd)) {
+    return { cmd: 'agent_bayar', target: rest || (parts.length >= 2 ? parts.slice(1).join(' ') : '') };
+  }
+
   if (isAdmin && ['admin', 'adminmenu', 'menuadmin'].includes(cmd)) return { cmd: 'adminmenu', rest: '' };
 
   if (isAdmin && ['listonu', 'listdevice', 'daftarperangkat'].includes(cmd)) {
@@ -462,6 +640,11 @@ function parseCommand(text, isAdmin) {
   if (isAdmin && cmd === 'addhotspot' && parts.length >= 4) return { cmd: 'addhotspot', admin: true, args: parts.slice(1) };
   if (isAdmin && cmd === 'vcr' && parts.length >= 3) return { cmd: 'vcr', admin: true, args: parts.slice(1) };
   if (isAdmin && cmd === 'delhotspot' && parts.length >= 2) return { cmd: 'delhotspot', admin: true, args: parts.slice(1) };
+
+  // Agent / Hotspot Voucher (Sistem Saldo): vcr or vcr <paket>
+  if (['vcr', 'voucher', 'belivoucher', 'buatvoucher'].includes(cmd)) {
+    return { cmd: 'agent_voucher', pkgKey: rest || (parts.length >= 2 ? parts.slice(1).join(' ') : '') };
+  }
 
   // Admin Billing & Pelanggan
   if (isAdmin && cmd === 'ringkasan') return { cmd: 'ringkasan', admin: true };
@@ -648,8 +831,8 @@ async function notifyCustomer(sock, lidStore, tag, message) {
       try {
         const [waCheck] = await sock.onWhatsApp(directJid);
         if (waCheck && waCheck.exists) {
-          targetJid = waCheck.lid || waCheck.jid || directJid;
-          logger.info(`[WA notifyCustomer] JID terverifikasi dari WhatsApp server (menggunakan LID jika ada) untuk nomor ${phoneNumber}: ${targetJid}`);
+          targetJid = waCheck.jid || directJid || waCheck.lid;
+          logger.info(`[WA notifyCustomer] JID terverifikasi dari WhatsApp server untuk nomor ${phoneNumber}: ${targetJid}`);
         } else {
           logger.info(`[WA notifyCustomer] Nomor ${phoneNumber} tidak terdaftar menurut onWhatsApp`);
         }
@@ -675,7 +858,10 @@ async function notifyCustomer(sock, lidStore, tag, message) {
 
     if (targetJid) {
       logger.info(`[WA notifyCustomer] Mengirim pesan ke JID target: ${targetJid}`);
-      await sock.sendMessage(targetJid, { text });
+      const res = await sock.sendMessage(targetJid, { text });
+      if (res && res.key && res.message) {
+        cacheSentMessage(res.key, res.message);
+      }
       logger.info(`[WA notifyCustomer] Pesan berhasil dikirim ke JID target: ${targetJid}`);
       return true;
     }
@@ -817,12 +1003,18 @@ export const whatsappStatus = {
     this._pushName = val;
   },
   qr: null,
+  qrImage: null,
   lastUpdate: getCurrentDateInTimezone()
 };
 
 let currentSock = null;
 let qrShownSinceStart = false;
 let notifiedAdminForQr = false;
+let isStarting = false;
+
+export function isBotRunning() {
+  return !!currentSock;
+}
 
 function loadWhatsappAdminSendList() {
   const list = getWhatsappAdminNumbers();
@@ -908,7 +1100,10 @@ export async function sendMonitoringAlert(message, priority = 'medium') {
             throw new Error(`Gagal mengirim alert via ${gatewayType}`);
           }
         } else {
-          await currentSock.sendMessage(jid, { text: formattedMessage });
+          const res = await currentSock.sendMessage(jid, { text: formattedMessage });
+          if (res && res.key && res.message) {
+            cacheSentMessage(res.key, res.message);
+          }
           results.push({ jid, success: true });
           logger.info(`[WhatsApp] Alert monitoring terkirim ke ${jid}`);
         }
@@ -997,33 +1192,21 @@ export async function sendWA(to, text, options = {}) {
     return false;
   }
   try {
-    let digits = to.replace(/\D/g, '');
+    let digits = String(to || '').replace(/\D/g, '');
+    if (!digits) return false;
     if (digits.startsWith('0')) {
       digits = '62' + digits.slice(1);
+    } else if (digits.startsWith('8')) {
+      digits = '62' + digits;
     }
-    let jid = to.includes('@') ? to : `${digits}@s.whatsapp.net`;
-    logger.info(`[WA sendWA] Mengirim ke: ${to} -> JID Awal: ${jid}`);
-    if (jid.endsWith('@s.whatsapp.net')) {
-      try {
-        const waCheck = await currentSock.onWhatsApp(jid);
-        if (waCheck && waCheck.length > 0 && waCheck[0].exists) {
-          jid = waCheck[0].jid || waCheck[0].lid || jid;
-        }
-      } catch (err) {
-        logger.error(`[WA sendWA] Gagal check onWhatsApp untuk ${jid}: ${err.message}`);
-      }
-    }
+    const jid = digits + '@s.whatsapp.net';
+    logger.info(`[WA sendWA] Mengirim ke JID: ${jid}`);
 
-    if (options.simulateTyping !== false) {
-      await simulateHumanTyping(currentSock, jid, finalText);
-    }
-
-    logger.info(`[WA sendWA] Mengeksekusi sendMessage ke JID: ${jid}`);
     const result = await currentSock.sendMessage(jid, { text: finalText });
     if (result && result.key && result.message) {
       cacheSentMessage(result.key, result.message);
     }
-    logger.info(`[WA sendWA] sendMessage selesai! Result JID: ${result?.key?.remoteJid || 'null'}, ID: ${result?.key?.id || 'null'}`);
+    logger.info(`[WA sendWA] sendMessage sukses ke ${jid} (ID: ${result?.key?.id || 'ok'})`);
     return true;
   } catch (e) {
     logger.error('[WA sendWA] Gagal kirim WA:', e.message);
@@ -1066,28 +1249,20 @@ export async function sendWAImage(to, imageBuffer, caption = '', options = {}) {
   }
   try {
     let digits = String(to || '').replace(/\D/g, '');
+    if (!digits) return false;
     if (digits.startsWith('0')) {
       digits = '62' + digits.slice(1);
+    } else if (digits.startsWith('8')) {
+      digits = '62' + digits;
     }
-    let jid = String(to || '').includes('@') ? String(to) : `${digits}@s.whatsapp.net`;
-    if (jid.endsWith('@s.whatsapp.net')) {
-      try {
-        const [waCheck] = await currentSock.onWhatsApp(jid);
-        if (waCheck && waCheck.exists && waCheck.jid) {
-          jid = waCheck.jid;
-        }
-      } catch (err) {
-        logger.debug(`[WA] sendWAImage JID resolution failed for ${jid}: ${err.message}`);
-      }
-    }
+    const jid = digits + '@s.whatsapp.net';
     const img = Buffer.isBuffer(imageBuffer) ? imageBuffer : Buffer.from(imageBuffer || []);
     if (!img.length) return false;
 
-    if (options.simulateTyping !== false) {
-      await simulateHumanTyping(currentSock, jid, finalCaption);
+    const result = await currentSock.sendMessage(jid, { image: img, caption: String(finalCaption || '') });
+    if (result && result.key && result.message) {
+      cacheSentMessage(result.key, result.message);
     }
-
-    await currentSock.sendMessage(jid, { image: img, caption: String(finalCaption || '') });
     return true;
   } catch (e) {
     logger.error('Gagal kirim WA image:', e.message);
@@ -1130,33 +1305,25 @@ export async function sendWADocument(to, documentBuffer, filename = 'Invoice.pdf
   }
   try {
     let digits = String(to || '').replace(/\D/g, '');
+    if (!digits) return false;
     if (digits.startsWith('0')) {
       digits = '62' + digits.slice(1);
+    } else if (digits.startsWith('8')) {
+      digits = '62' + digits;
     }
-    let jid = String(to || '').includes('@') ? String(to) : `${digits}@s.whatsapp.net`;
-    if (jid.endsWith('@s.whatsapp.net')) {
-      try {
-        const [waCheck] = await currentSock.onWhatsApp(jid);
-        if (waCheck && waCheck.exists && waCheck.jid) {
-          jid = waCheck.jid;
-        }
-      } catch (err) {
-        logger.debug(`[WA] sendWADocument JID resolution failed for ${jid}: ${err.message}`);
-      }
-    }
+    const jid = digits + '@s.whatsapp.net';
     const doc = Buffer.isBuffer(documentBuffer) ? documentBuffer : Buffer.from(documentBuffer || []);
     if (!doc.length) return false;
 
-    if (options.simulateTyping !== false) {
-      await simulateHumanTyping(currentSock, jid, finalCaption);
-    }
-
-    await currentSock.sendMessage(jid, {
+    const result = await currentSock.sendMessage(jid, {
       document: doc,
       mimetype: mimetype || 'application/pdf',
       fileName: filename || 'Document.pdf',
       caption: String(finalCaption || '')
     });
+    if (result && result.key && result.message) {
+      cacheSentMessage(result.key, result.message);
+    }
     return true;
   } catch (e) {
     logger.error('Gagal kirim WA document:', e.message);
@@ -1263,9 +1430,12 @@ export async function processIncomingCommand({
           const agent = phone ? agentSvc.getAgentByPhone(phone) : null;
           if (agent) {
             body +=
-              '\n\n📱 *MENU AGENT*\n' +
-              '⚡ `pulsa SKU TARGET` — Beli pulsa/produk Digiflazz\n' +
-              '🔎 `cekpulsa TXID` — Cek status transaksi pulsa';
+              `\n\n📱 *MENU AGENT (@${agent.username || agent.name})*\n` +
+              '💳 `saldo` — Cek sisa saldo & komisi agent\n' +
+              '💰 `bayar <nama/nohp/id>` — Bayar tagihan pelanggan (potong saldo)\n' +
+              '🎟️ `vcr` / `vcr <paket>` — Buat voucher hotspot (potong saldo)\n' +
+              '⚡ `pulsa <SKU> <TARGET>` — Beli pulsa/produk Digiflazz\n' +
+              '🔎 `cekpulsa <TXID>` — Cek status transaksi pulsa';
           }
           await reply(body);
           return true;
@@ -1671,6 +1841,293 @@ export async function processIncomingCommand({
           return true;
         }
 
+        if (parsed.cmd === 'agent_saldo') {
+          try {
+            const agent = phone ? agentSvc.getAgentByPhone(phone) : null;
+            if (!agent) {
+              if (isAdmin) {
+                const r = await agentSvc.digiflazzCheckBalance().catch(() => null);
+                const digiDeposit = Number(r?.deposit || 0);
+                await reply(
+                  `🏦 *SALDO DIGIFLAZZ (ADMIN)*\n\n` +
+                  `💳 Deposit: *Rp ${digiDeposit.toLocaleString('id-ID')}*\n\n` +
+                  `💡 _Nomor ini adalah Admin. Untuk cek saldo agent, daftarkan nomor ini di Menu Agent._`
+                );
+                return true;
+              }
+              await reply('❌ Nomor WhatsApp ini belum terdaftar sebagai Agent aktif.');
+              return true;
+            }
+
+            const fresh = agentSvc.getAgentById(agent.id);
+            const balance = Number(fresh?.balance || 0);
+            const fee = Number(fresh?.billing_fee || 0);
+            const { sep } = waBrand();
+
+            const msg =
+              `💳 *SALDO AGENT*\n` +
+              `${sep}\n` +
+              `👤 Agent: *${fresh.name}* (@${fresh.username})\n` +
+              `📞 No HP: *${fresh.phone || '-'}*\n` +
+              `💰 *Sisa Saldo: Rp ${balance.toLocaleString('id-ID')}*\n` +
+              `🎁 Komisi Tagihan: *Rp ${fee.toLocaleString('id-ID')} / transaksi*\n` +
+              `${sep}\n` +
+              `📋 *Perintah Transaksi:*\n` +
+              `• \`bayar <nama/nohp/id>\` — Bayar tagihan pelanggan\n` +
+              `• \`vcr\` — Lihat daftar paket voucher hotspot\n` +
+              `• \`vcr <paket>\` — Buat voucher hotspot\n` +
+              `• \`pulsa <sku> <nomor>\` — Beli pulsa/produk Digiflazz`;
+
+            await reply(msg);
+          } catch (e) {
+            await reply('❌ Gagal cek saldo agent: ' + e.message);
+          }
+          return true;
+        }
+
+        if (parsed.cmd === 'agent_bayar') {
+          try {
+            const agent = phone ? agentSvc.getAgentByPhone(phone) : null;
+            if (!agent) {
+              await reply('❌ Fitur pembayaran tagihan via saldo hanya untuk nomor WhatsApp yang terdaftar sebagai Agent.');
+              return true;
+            }
+
+            const keyRaw = String(parsed.target || '').trim();
+            if (!keyRaw) {
+              await reply(
+                '❌ *Format Perintah:*\n' +
+                '`bayar <nama/nohp/pppoe/id_pelanggan/id_tagihan>`\n\n' +
+                '💡 *Contoh:*\n' +
+                '• `bayar Budi`\n' +
+                '• `bayar 081234567890`\n' +
+                '• `bayar 105`'
+              );
+              return true;
+            }
+
+            const isNumeric = /^\d+$/.test(keyRaw);
+            let targetInv = null;
+
+            // 1. Cek apakah input adalah ID Invoice
+            if (isNumeric) {
+              targetInv = billingSvc.getInvoiceById(Number(keyRaw));
+            }
+
+            // 2. Jika bukan ID invoice atau tidak ketemu, cari pelanggan
+            if (!targetInv) {
+              let cust =
+                (isNumeric ? customerSvc.getCustomerById(Number(keyRaw)) : null) ||
+                customerSvc.findCustomerByAny(keyRaw);
+
+              if (!cust) {
+                const candidates = customerSvc.getAllCustomers(keyRaw) || [];
+                const unique = Array.from(new Map(candidates.map(c => [c.id, c])).values());
+                if (unique.length === 1) {
+                  cust = customerSvc.getCustomerById(unique[0].id);
+                } else if (unique.length > 1) {
+                  const top = unique.slice(0, 5).map(c =>
+                    `- ID:${c.id} • ${c.name || '-'} • ${c.phone || '-'} • PPPoE:${c.pppoe_username || '-'}`
+                  ).join('\n');
+                  await reply(`⚠️ Ditemukan ${unique.length} pelanggan bernama serupa:\n\n${top}\n\nKetik lebih spesifik: \`bayar IDPELANGGAN\` atau \`bayar NOHP\``);
+                  return true;
+                }
+              }
+
+              if (cust) {
+                const unpaid = billingSvc.getUnpaidInvoicesByCustomerId(cust.id);
+                if (unpaid && unpaid.length > 0) {
+                  targetInv = unpaid[0];
+                } else {
+                  await reply(`✅ Pelanggan *${cust.name}* (ID: ${cust.id}) tidak memiliki tagihan menunggak.`);
+                  return true;
+                }
+              }
+            }
+
+            if (!targetInv) {
+              await reply(`❌ Data tagihan atau pelanggan "*${keyRaw}*" tidak ditemukan.`);
+              return true;
+            }
+
+            if (targetInv.status === 'paid') {
+              await reply(`✅ Invoice *#${targetInv.id}* sudah berstatus LUNAS.`);
+              return true;
+            }
+
+            // Hitung pemotongan saldo: tagihan dikurangi komisi
+            const fee = Math.max(0, Number(agent.billing_fee || 0) || 0);
+            const invoiceAmount = Number(targetInv.amount || 0);
+            const cost = Math.max(0, invoiceAmount - fee);
+
+            const freshAgent = agentSvc.getAgentById(agent.id);
+            const currentBalance = Number(freshAgent?.balance || 0);
+
+            if (currentBalance < cost) {
+              await reply(
+                `❌ *SALDO AGENT TIDAK MENCUKUPI*\n\n` +
+                `🧾 Tagihan: Rp ${invoiceAmount.toLocaleString('id-ID')}\n` +
+                `🎁 Komisi Agent: Rp ${fee.toLocaleString('id-ID')}\n` +
+                `💰 Potong Saldo: *Rp ${cost.toLocaleString('id-ID')}*\n` +
+                `💳 Sisa Saldo Anda: *Rp ${currentBalance.toLocaleString('id-ID')}*\n\n` +
+                `Silakan hubungi Admin untuk top up saldo agent.`
+              );
+              return true;
+            }
+
+            const result = await agentSvc.payInvoiceAsAgent(agent.id, targetInv.id, 'Via WhatsApp Bot');
+            const customer = customerSvc.getCustomerById(targetInv.customer_id);
+            const customerName = String(targetInv.customer_name || customer?.name || '-');
+            const remainingBalance = Number(result?.agent?.balance ?? result?.tx?.after ?? (currentBalance - cost));
+
+            const { sep } = waBrand();
+            const receiptMsg =
+              `✅ *PEMBAYARAN TAGIHAN BERHASIL*\n` +
+              `${sep}\n` +
+              `👤 Pelanggan: *${customerName}* (ID: ${targetInv.customer_id})\n` +
+              `🧾 No Invoice: *#${targetInv.id}*\n` +
+              `📦 Paket: *${targetInv.package_name || customer?.package_name || '-'}*\n` +
+              `📅 Periode: *${targetInv.period_month}/${targetInv.period_year}*\n` +
+              `💵 Total Tagihan: Rp ${invoiceAmount.toLocaleString('id-ID')}\n` +
+              `🎁 Komisi Agent: Rp ${fee.toLocaleString('id-ID')}\n` +
+              `${sep}\n` +
+              `💰 *Potong Saldo:* Rp ${cost.toLocaleString('id-ID')}\n` +
+              `💳 *SISA SALDO AGENT: Rp ${remainingBalance.toLocaleString('id-ID')}*\n` +
+              `${sep}\n` +
+              `Terima kasih telah bertransaksi.`;
+
+            await reply(receiptMsg);
+
+            // Notifikasi ke pelanggan jika ada nomor kontak
+            const notifyTag = customer?.genieacs_tag || customer?.pppoe_username || customer?.phone || targetInv.customer_phone || '';
+            if (notifyTag) {
+              const formatter = new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 });
+              notifyCustomer(
+                currentSockInstance,
+                currentLidStore,
+                notifyTag,
+                waWrap(
+                  '✅ *PEMBAYARAN BERHASIL*',
+                  `Tagihan internet Anda telah *LUNAS* dibayarkan via Agent *${agent.name}*.\n\n` +
+                  `🧾 *No Invoice:* #${targetInv.id}\n` +
+                  `👤 *Nama:* ${customerName}\n` +
+                  `📅 *Periode:* ${targetInv.period_month}/${targetInv.period_year}\n` +
+                  `💰 *Total:* ${formatter.format(invoiceAmount)}\n\n` +
+                  `🟢 Layanan internet Anda aktif.\n\n` +
+                  `Terima kasih.`
+                )
+              ).catch(() => {});
+            }
+          } catch (e) {
+            logger.error('[WA agent_bayar] Gagal bayar tagihan: ' + e.message);
+            await reply('❌ Gagal memproses pembayaran tagihan: ' + e.message);
+          }
+          return true;
+        }
+
+        if (parsed.cmd === 'agent_voucher') {
+          try {
+            const agent = phone ? agentSvc.getAgentByPhone(phone) : null;
+            if (!agent) {
+              await reply('❌ Fitur pembuatan voucher hotspot via saldo hanya untuk nomor WhatsApp yang terdaftar sebagai Agent.');
+              return true;
+            }
+
+            const pkgKeyRaw = String(parsed.pkgKey || '').trim();
+            const prices = agentSvc.getAgentPrices(agent.id) || [];
+
+            if (!prices || prices.length === 0) {
+              await reply('⚠️ Belum ada paket voucher hotspot yang aktif untuk akun Agent Anda. Silakan hubungi Admin.');
+              return true;
+            }
+
+            const freshAgent = agentSvc.getAgentById(agent.id);
+            const currentBalance = Number(freshAgent?.balance || 0);
+
+            // Jika tanpa argumen, tampilkan daftar paket voucher
+            if (!pkgKeyRaw) {
+              const { sep } = waBrand();
+              let listStr =
+                `🎟️ *DAFTAR PAKET VOUCHER HOTSPOT*\n` +
+                `${sep}\n` +
+                `💳 *Sisa Saldo Anda: Rp ${currentBalance.toLocaleString('id-ID')}*\n\n` +
+                `Pilih paket di bawah ini:\n`;
+
+              prices.forEach((p, idx) => {
+                const buyPrice = Number(p.buy_price || 0);
+                const sellPrice = Number(p.sell_price || 0);
+                const profit = Math.max(0, sellPrice - buyPrice);
+                listStr +=
+                  `\n*${idx + 1}. ${p.profile_name}* (ID: \`${p.id}\`)` +
+                  `\n   ⏳ Masa Aktif: ${p.validity || '24 Jam'}` +
+                  `\n   💰 Potong Saldo: Rp ${buyPrice.toLocaleString('id-ID')}` +
+                  `\n   🏷️ Harga Jual: Rp ${sellPrice.toLocaleString('id-ID')} (Untung: Rp ${profit.toLocaleString('id-ID')})` +
+                  `\n   👉 Ketik: \`vcr ${p.id}\` atau \`vcr ${p.profile_name}\`\n`;
+              });
+
+              listStr += `\n${sep}\n💡 _Ketik \`vcr <ID/NamaPaket>\` untuk langsung membuat voucher._`;
+              await reply(listStr);
+              return true;
+            }
+
+            // Cari paket berdasarkan ID atau substring nama profile
+            const isNumeric = /^\d+$/.test(pkgKeyRaw);
+            let matchedPrice = null;
+            if (isNumeric) {
+              matchedPrice = prices.find(p => Number(p.id) === Number(pkgKeyRaw));
+            }
+            if (!matchedPrice) {
+              const pkgLc = pkgKeyRaw.toLowerCase();
+              matchedPrice = prices.find(p => String(p.profile_name || '').toLowerCase() === pkgLc) ||
+                             prices.find(p => String(p.profile_name || '').toLowerCase().includes(pkgLc));
+            }
+
+            if (!matchedPrice) {
+              await reply(`❌ Paket voucher "*${pkgKeyRaw}*" tidak ditemukan.\n\nKetik \`vcr\` untuk melihat daftar paket yang tersedia.`);
+              return true;
+            }
+
+            const buyPrice = Number(matchedPrice.buy_price || 0);
+            const sellPrice = Number(matchedPrice.sell_price || 0);
+
+            if (currentBalance < buyPrice) {
+              await reply(
+                `❌ *SALDO AGENT TIDAK MENCUKUPI*\n\n` +
+                `🎟️ Paket: *${matchedPrice.profile_name}*\n` +
+                `💰 Potong Saldo: *Rp ${buyPrice.toLocaleString('id-ID')}*\n` +
+                `💳 Sisa Saldo Anda: *Rp ${currentBalance.toLocaleString('id-ID')}*\n\n` +
+                `Silakan hubungi Admin untuk top up saldo agent.`
+              );
+              return true;
+            }
+
+            const result = await agentSvc.sellVoucherAsAgent(agent.id, matchedPrice.id);
+            const voucher = result.voucher;
+            const remainingBalance = Number(result?.agent?.balance ?? result?.tx?.after ?? (currentBalance - buyPrice));
+            const { sep } = waBrand();
+
+            const voucherMsg =
+              `🎟️ *VOUCHER HOTSPOT BERHASIL DIBUAT*\n` +
+              `${sep}\n` +
+              `👤 *Username:* \`${voucher.code}\`\n` +
+              `🔑 *Password:* \`${voucher.password}\`\n` +
+              `🏷️ *Paket:* ${matchedPrice.profile_name}\n` +
+              `⏳ *Masa Aktif:* ${result.receipt?.validity || matchedPrice.validity || '24 Jam'}\n` +
+              `💵 *Harga Jual:* Rp ${sellPrice.toLocaleString('id-ID')}\n` +
+              `${sep}\n` +
+              `💰 *Potong Saldo:* Rp ${buyPrice.toLocaleString('id-ID')}\n` +
+              `💳 *SISA SALDO AGENT: Rp ${remainingBalance.toLocaleString('id-ID')}*\n` +
+              `${sep}\n` +
+              `_Voucher siap digunakan pelanggan._`;
+
+            await reply(voucherMsg);
+          } catch (e) {
+            logger.error('[WA agent_voucher] Gagal buat voucher: ' + e.message);
+            await reply('❌ Gagal membuat voucher: ' + e.message);
+          }
+          return true;
+        }
+
         if (parsed.cmd === 'agent_pulsa') {
           try {
             /* phone already defined */
@@ -1993,192 +2450,283 @@ export async function processIncomingCommand({
 }
 
 export async function startWhatsAppBot() {
-  if (currentSock) {
-    try {
-      logger.info('WhatsApp: Menutup koneksi socket lama yang masih aktif sebelum reconnect...');
-      currentSock.ev.removeAllListeners();
-      currentSock.end();
-    } catch (e) {
-      logger.error('WhatsApp: Gagal menutup socket lama:', e.message);
-    }
-    currentSock = null;
+  if (isStarting) {
+    logger.info('WhatsApp: startWhatsAppBot sedang berjalan, melewati panggilan duplikat.');
+    return;
   }
-
-  const authFolder = path.resolve(projectRoot, getSetting('whatsapp_auth_folder', 'auth_info_baileys'));
-  const lidMapPath = path.resolve(projectRoot, getSetting('whatsapp_lid_map_file', 'data/wa-lid-map.json'));
-  const lidStore = getDefaultLidStore();
-
-  const { state, saveCreds } = await useMultiFileAuthState(authFolder);
-  let version = [2, 3000, 1017531287]; // Fallback version
+  isStarting = true;
   try {
-    const latest = await fetchLatestBaileysVersion();
-    if (latest && latest.version) {
-      version = latest.version;
-    }
-  } catch (err) {
-    logger.warn(`WhatsApp: Gagal mengambil versi terbaru Baileys: ${err.message}. Menggunakan fallback.`);
-  }
-
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    browser: Browsers.ubuntu('Chrome'),
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-    generateHighQualityLinkPreview: false,
-    msgRetryCounterCache,
-    getMessage: async (key) => {
-      if (key && key.id) {
-        const storeKey = `${key.remoteJid || ''}:${key.id}`;
-        const cached = sentMessageMap.get(storeKey);
-        if (cached) return cached;
+    if (currentSock) {
+      try {
+        logger.info('WhatsApp: Menutup koneksi socket lama yang masih aktif sebelum reconnect...');
+        currentSock.ev.removeAllListeners();
+        currentSock.end();
+      } catch (e) {
+        logger.error('WhatsApp: Gagal menutup socket lama:', e.message);
       }
-      return { conversation: '' };
-    },
-    keepAliveIntervalMs: 30000,
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 60000,
-    logger: pino({ level: 'silent' })
-  });
-
-  currentSock = sock;
-
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    whatsappStatus.lastUpdate = getCurrentDateInTimezone();
-
-    if (qr) {
-      whatsappStatus.qr = qr;
-      whatsappStatus.connection = 'qr';
-      qrShownSinceStart = true;
-      notifiedAdminForQr = false;
-      logger.info(`[WA] QR Code Baru Dihasilkan: ${qr.slice(0, 20)}...`);
-      qrcode.generate(qr, { small: true });
+      currentSock = null;
     }
 
-    if (connection) {
-      logger.info(`[WA] Connection Update: ${connection}`);
-    }
+    const authFolder = path.resolve(projectRoot, getSetting('whatsapp_auth_folder', 'auth_info_baileys'));
+    const lidMapPath = path.resolve(projectRoot, getSetting('whatsapp_lid_map_file', 'data/wa-lid-map.json'));
+    const lidStore = getDefaultLidStore();
 
-    if (connection === 'close') {
-      whatsappStatus.qr = null;
-      whatsappStatus.user = null;
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      whatsappStatus.connection = code === DisconnectReason.loggedOut ? 'loggedOut' : 'connecting';
+    const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+    loadAuthLidReverseMap(authFolder);
 
-      logger.warn(
-        `WhatsApp terputus (kode ${code}). ` +
-        (code === DisconnectReason.loggedOut
-          ? 'Sesi logout — hapus folder auth dan pindai QR lagi.'
-          : 'Mencoba reconnect dalam 3 detik...')
-      );
-      if (shouldReconnect) {
-        setTimeout(() => startWhatsAppBot(), 3000);
+    let version = [2, 3000, 1043857760]; // Fallback version terbaru
+    try {
+      const latest = await fetchLatestBaileysVersion();
+      if (latest && latest.version) {
+        version = latest.version;
       }
-    } else if (connection === 'open') {
-      whatsappStatus.qr = null;
-      whatsappStatus.connection = 'open';
-      whatsappStatus.user = sock.user;
-      logger.info('WhatsApp bot terhubung. Akun Bot JID: ' + (sock.user?.id || 'unknown') + ', Name: ' + (sock.user?.name || 'unknown'));
+    } catch (err) {
+      logger.warn(`WhatsApp: Gagal mengambil versi terbaru Baileys: ${err.message}. Menggunakan fallback.`);
+    }
 
-      // Pre-resolve admin LIDs
-      (async () => {
-        try {
-          const adminList = getWhatsappAdminNumbers();
-          for (const n of adminList) {
-            const digits = String(n).replace(/\D/g, '');
-            if (digits.length >= 8) {
-              const formatted = digits.startsWith('0') ? '62' + digits.slice(1) : digits.startsWith('62') ? digits : '62' + digits;
-              const jid = `${formatted}@s.whatsapp.net`;
-              const waCheck = await sock.onWhatsApp(jid).catch(() => []);
-              if (waCheck && waCheck.length > 0 && waCheck[0].exists && waCheck[0].lid) {
-                const lidJid = waCheck[0].lid;
-                const lidUser = lidJid.split('@')[0];
-                lidStore.set(lidJid, formatted);
-                lidStore.set(lidUser, formatted);
-                logger.info(`[WA Admin Pre-resolve] Nomor admin ${formatted} terpetakan ke LID: ${lidJid}`);
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      browser: Browsers.ubuntu('Chrome'),
+      syncFullHistory: false,
+      markOnlineOnConnect: true,
+      generateHighQualityLinkPreview: false,
+      msgRetryCounterCache,
+      userDevicesCache,
+      placeholderResendCache,
+      retryRequestDelayMs: 250,
+      maxMsgRetryCount: 5,
+      keepAliveIntervalMs: 30000,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      appStateMacVerification: {
+        patch: false,
+        snapshot: false
+      },
+      patchMessageBeforeSending: (message) => {
+        const requiresPatch = !!(
+          message.buttonsMessage ||
+          message.templateMessage ||
+          message.listMessage
+        );
+        if (requiresPatch) {
+          message = {
+            viewOnceMessage: {
+              message: {
+                messageContextInfo: {
+                  deviceListMetadataVersion: 2,
+                  deviceListMetadata: {},
+                },
+                ...message,
+              },
+            },
+          };
+        }
+        return message;
+      },
+      getMessage: async (key) => {
+        return await messageStore.get(key);
+      },
+      logger: pino({ level: 'silent' })
+    });
+
+    currentSock = sock;
+
+    sock.ev.on('creds.update', () => {
+      saveCreds();
+      loadAuthLidReverseMap(authFolder);
+    });
+
+    // Merekam pemetaan nomor HP dari kontak (LID Mapping real-time)
+    sock.ev.on('contacts.upsert', (contacts) => {
+      for (const contact of contacts) {
+        if (contact.id && contact.id.endsWith('@lid') && contact.phoneNumber) {
+          let digits = String(contact.phoneNumber).replace(/\D/g, '');
+          if (digits.startsWith('0')) digits = '62' + digits.slice(1);
+          else if (digits.startsWith('8')) digits = '62' + digits;
+          lidStore.set(contact.id, digits);
+          authLidReverse.set(contact.id, digits);
+          authLidReverse.set(contact.id.split('@')[0], digits);
+        }
+      }
+    });
+
+    sock.ev.on('messaging-history.set', ({ contacts }) => {
+      if (contacts) {
+        for (const contact of contacts) {
+          if (contact.id && contact.id.endsWith('@lid') && contact.phoneNumber) {
+            let digits = String(contact.phoneNumber).replace(/\D/g, '');
+            if (digits.startsWith('0')) digits = '62' + digits.slice(1);
+            else if (digits.startsWith('8')) digits = '62' + digits;
+            lidStore.set(contact.id, digits);
+            authLidReverse.set(contact.id, digits);
+            authLidReverse.set(contact.id.split('@')[0], digits);
+          }
+        }
+      }
+    });
+
+    sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      whatsappStatus.lastUpdate = getCurrentDateInTimezone();
+
+      if (qr) {
+        whatsappStatus.qr = qr;
+        whatsappStatus.connection = 'qr';
+        qrShownSinceStart = true;
+        notifiedAdminForQr = false;
+        logger.info(`[WA] QR Code Baru Dihasilkan: ${qr.slice(0, 20)}...`);
+        qrcode.generate(qr, { small: true });
+        QRCodeNode.toDataURL(qr, { margin: 2, scale: 6 })
+          .then((url) => {
+            whatsappStatus.qrImage = url;
+          })
+          .catch(() => {
+            whatsappStatus.qrImage = null;
+          });
+      }
+
+      if (connection) {
+        logger.info(`[WA] Connection Update: ${connection}`);
+      }
+
+      if (connection === 'close') {
+        whatsappStatus.qr = null;
+        whatsappStatus.qrImage = null;
+        whatsappStatus.user = null;
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const errorMsg = lastDisconnect?.error?.message || '';
+        const shouldReconnect = code !== DisconnectReason.loggedOut;
+        whatsappStatus.connection = code === DisconnectReason.loggedOut ? 'loggedOut' : 'connecting';
+
+        // Auto-repair jika terjadi desinkronisasi sesi/Bad MAC
+        const isBadMac = errorMsg.includes('Bad MAC') || errorMsg.includes('MAC mismatch') || code === 401;
+        if (isBadMac && code !== DisconnectReason.loggedOut) {
+          logger.warn(`[WA Auto-Repair] Terdeteksi desinkronisasi sesi/Bad MAC (${errorMsg}). Membersihkan pre-key usang...`);
+          cleanStaleSessionKeys(authFolder);
+        }
+
+        logger.warn(
+          `WhatsApp terputus (kode ${code}). ` +
+          (code === DisconnectReason.loggedOut
+            ? 'Sesi logout — hapus folder auth dan pindai QR lagi.'
+            : 'Mencoba reconnect dalam 3 detik...')
+        );
+        if (shouldReconnect) {
+          const delay = code === DisconnectReason.restartRequired ? 500 : 3000;
+          setTimeout(() => startWhatsAppBot(), delay);
+        }
+      } else if (connection === 'open') {
+        whatsappStatus.qr = null;
+        whatsappStatus.qrImage = null;
+        whatsappStatus.connection = 'open';
+        whatsappStatus.user = sock.user;
+        logger.info('WhatsApp bot terhubung. Akun Bot JID: ' + (sock.user?.id || 'unknown') + ', Name: ' + (sock.user?.name || 'unknown'));
+
+        // Pre-resolve admin LIDs
+        (async () => {
+          try {
+            const adminList = getWhatsappAdminNumbers();
+            for (const n of adminList) {
+              const digits = String(n).replace(/\D/g, '');
+              if (digits.length >= 8) {
+                const formatted = digits.startsWith('0') ? '62' + digits.slice(1) : digits.startsWith('62') ? digits : '62' + digits;
+                const jid = `${formatted}@s.whatsapp.net`;
+                const waCheck = await sock.onWhatsApp(jid).catch(() => []);
+                if (waCheck && waCheck.length > 0 && waCheck[0].exists && waCheck[0].lid) {
+                  const lidJid = waCheck[0].lid;
+                  const lidUser = lidJid.split('@')[0];
+                  lidStore.set(lidJid, formatted);
+                  lidStore.set(lidUser, formatted);
+                  authLidReverse.set(lidJid, formatted);
+                  authLidReverse.set(lidUser, formatted);
+                  logger.info(`[WA Admin Pre-resolve] Nomor admin ${formatted} terpetakan ke LID: ${lidJid}`);
+                }
               }
             }
+          } catch (e) {
+            logger.warn(`[WA Admin Pre-resolve] Pre-resolve error: ${e.message}`);
           }
-        } catch (e) {
-          logger.warn(`[WA Admin Pre-resolve] Pre-resolve error: ${e.message}`);
-        }
-      })();
+        })();
 
-      if (qrShownSinceStart && !notifiedAdminForQr) {
-        notifiedAdminForQr = true;
-        const toList = loadWhatsappAdminSendList();
-        if (toList.length > 0) {
-          const wid = sock.user?.id ? String(sock.user.id).split(':')[0] : '-';
-          const body =
-            `✅ QR berhasil dipindai dan bot sudah aktif.\n\n` +
-            `Nomor Bot: ${wid}\n` +
-            `Waktu: ${getNowLocal()}\n\n` +
-            `Silakan gunakan menu Admin untuk fitur billing, notifikasi, dan broadcast.\n\n` +
-            `🙏 Jika aplikasi ini bermanfaat dan Anda ingin mendukung pengembangan, Anda dapat berdonasi secara sukarela ke nomor: 081947215703.\n` +
-            `Terima kasih atas dukungannya.`;
-          const msg = waWrap('🤖 *WHATSAPP BOT AKTIF*', body);
-          for (const digits of toList) {
-            const jid = `${digits}@s.whatsapp.net`;
-            sock.sendMessage(jid, { text: msg }).catch(() => { });
-          }
-        }
-        qrShownSinceStart = false;
-      }
-    }
-  });
-
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    for (const m of messages) {
-      try {
-        const selfPn = sock.user && sock.user.id ? sock.user.id.split(':')[0].split('@')[0] : null;
-        const selfLid = sock.user && sock.user.lid ? sock.user.lid.split('@')[0] : null;
-        const remoteUser = m.key.remoteJid ? m.key.remoteJid.split('@')[0] : null;
-        const isSelf = m.key.fromMe && (remoteUser === selfPn || (selfLid && remoteUser === selfLid));
-        if (m.key.fromMe && !isSelf) continue;
-        const text = getMessageText(m);
-        if (!text) continue;
-
-        const remote = m.key.remoteJid;
-        if (!remote || remote.endsWith('@g.us')) continue;
-
-        const reply = async (msg) => {
-          logger.info(`[WA reply] Menyiapkan balasan ke ${remote}: "${msg.substring(0, 60)}..."`);
-          try {
-            const targetJid = (m.key.senderPn && m.key.senderPn.endsWith('@s.whatsapp.net')) 
-              ? m.key.senderPn 
-              : remote;
-
-            logger.info(`[WA reply] Mengirim balasan ke JID target: ${targetJid}`);
-            if (targetJid.endsWith('@lid')) {
-              await sock.sendMessage(targetJid, { text: waAutoWrap(msg) });
-            } else {
-              await sock.sendMessage(targetJid, { text: waAutoWrap(msg) }, { quoted: m });
+        if (qrShownSinceStart && !notifiedAdminForQr) {
+          notifiedAdminForQr = true;
+          const toList = loadWhatsappAdminSendList();
+          if (toList.length > 0) {
+            const wid = sock.user?.id ? String(sock.user.id).split(':')[0] : '-';
+            const body =
+              `✅ QR berhasil dipindai dan bot sudah aktif.\n\n` +
+              `Nomor Bot: ${wid}\n` +
+              `Waktu: ${getNowLocal()}\n\n` +
+              `Silakan gunakan menu Admin untuk fitur billing, notifikasi, dan broadcast.\n\n` +
+              `🙏 Jika aplikasi ini bermanfaat dan Anda ingin mendukung pengembangan, Anda dapat berdonasi secara sukarela ke nomor: 081947215703.\n` +
+              `Terima kasih atas dukungannya.`;
+            const msg = waWrap('🤖 *WHATSAPP BOT AKTIF*', body);
+            for (const digits of toList) {
+              const jid = `${digits}@s.whatsapp.net`;
+              sock.sendMessage(jid, { text: msg }).then(res => {
+                if (res && res.key && res.message) cacheSentMessage(res.key, res.message);
+              }).catch(() => { });
             }
-            logger.info(`[WA reply] Balasan berhasil dikirim ke JID target: ${targetJid}`);
-          } catch (sendErr) {
-            logger.error('[WA reply] Gagal mengirim balasan: ' + sendErr.message);
           }
-        };
-
-        const phone = getPhoneFromKey(m.key);
-        await processIncomingCommand({
-          senderPhone: phone,
-          text: text,
-          reply: reply,
-          senderName: m.pushName || '',
-          key: m.key,
-          sock: sock,
-          lidStore: lidStore
-        });
-      } catch (e) {
-        logger.error('WhatsApp message handler:', e.message || e);
+          qrShownSinceStart = false;
+        }
       }
-    }
-  });
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+      for (const m of messages) {
+        try {
+          if (m.key && m.message) {
+            cacheSentMessage(m.key, m.message);
+          }
+          const selfPn = sock.user && sock.user.id ? sock.user.id.split(':')[0].split('@')[0] : null;
+          const selfLid = sock.user && sock.user.lid ? sock.user.lid.split('@')[0] : null;
+          const remoteUser = m.key.remoteJid ? m.key.remoteJid.split('@')[0] : null;
+          const isSelf = m.key.fromMe && (remoteUser === selfPn || (selfLid && remoteUser === selfLid));
+          if (m.key.fromMe && !isSelf) continue;
+          const text = getMessageText(m);
+          if (!text) continue;
+
+          const remote = m.key.remoteJid;
+          if (!remote || remote.endsWith('@g.us')) continue;
+
+          const phone = getPhoneFromKey(m.key);
+          const targetJid = (phone && phone.length >= 8) ? `${phone}@s.whatsapp.net` : remote;
+
+          // Pengiriman balasan langsung tanpa quote untuk mencegah isu "Menunggu pesan ini"
+          const reply = async (msg) => {
+            logger.info(`[WA reply] Menyiapkan balasan ke ${targetJid} (dari ${remote}): "${msg.substring(0, 60)}..."`);
+            try {
+              const result = await sock.sendMessage(targetJid, { text: waAutoWrap(msg) });
+              if (result && result.key && result.message) {
+                cacheSentMessage(result.key, result.message);
+              }
+              logger.info(`[WA reply] Balasan berhasil dikirim ke JID: ${targetJid}`);
+            } catch (sendErr) {
+              logger.error('[WA reply] Gagal mengirim balasan: ' + sendErr.message);
+            }
+          };
+
+          await processIncomingCommand({
+            senderPhone: phone,
+            text: text,
+            reply: reply,
+            senderName: m.pushName || '',
+            key: m.key,
+            sock: sock,
+            lidStore: lidStore
+          });
+        } catch (e) {
+          logger.error('WhatsApp message handler:', e.message || e);
+        }
+      }
+    });
+  } catch (err) {
+    logger.error('Gagal inisialisasi Baileys WhatsApp bot:', err);
+    throw err;
+  } finally {
+    isStarting = false;
+  }
 }

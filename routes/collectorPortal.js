@@ -389,16 +389,21 @@ router.post('/payment-request', requireCollectorSession, express.urlencoded({ ex
         VALUES (?, ?, ?, ?, ?, 'approved', 'system', 'Auto-Approve', 'Otomatis disetujui (kolektor setting aktif)', (NOW_LOCAL()))
       `).run(collectorId, invoiceId, Number(inv.customer_id || 0), amount, note);
 
-      // Auto-unisolate if customer status is currently suspended
+      // Auto-unisolate if customer status is currently suspended and NO MORE unpaid invoices remain
       const customer = customerSvc.getCustomerById(inv.customer_id);
       let unisolatedText = '';
       if (customer && customer.status === 'suspended') {
-        try {
-          await customerSvc.activateCustomer(customer.id);
-          unisolatedText = ' dan layanan pelanggan di-unisolate';
-          logger.info(`[Collector Auto-Approve] Customer ${customer.id} (${customer.name}) auto-unisolated on payment.`);
-        } catch (actErr) {
-          logger.error(`[Collector Auto-Approve] Failed to auto-activate customer ${customer.id}:`, actErr);
+        const unpaidCount = db.prepare("SELECT COUNT(*) as cnt FROM invoices WHERE customer_id=? AND status='unpaid'").get(inv.customer_id)?.cnt || 0;
+        if (unpaidCount === 0) {
+          try {
+            await customerSvc.activateCustomer(customer.id);
+            unisolatedText = ' dan layanan pelanggan di-unisolate';
+            logger.info(`[Collector Auto-Approve] Customer ${customer.id} (${customer.name}) auto-unisolated on payment.`);
+          } catch (actErr) {
+            logger.error(`[Collector Auto-Approve] Failed to auto-activate customer ${customer.id}:`, actErr);
+          }
+        } else {
+          logger.info(`[Collector Auto-Approve] Customer ${customer.id} (${customer.name}) remains suspended because ${unpaidCount} unpaid invoice(s) still exist.`);
         }
       }
 

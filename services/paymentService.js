@@ -465,6 +465,71 @@ async function getTripayChannels() {
   }
 }
 
+function isEnabledFlag(val) {
+  return val === true || val === 'true' || val === 1 || val === '1' || val === 'yes';
+}
+
+function isGatewayConfigured(settings, gateway) {
+  const g = String(gateway || '').toLowerCase();
+  if (g === 'tripay') {
+    return (
+      isEnabledFlag(settings.tripay_enabled) &&
+      String(settings.tripay_api_key || '').trim() &&
+      String(settings.tripay_private_key || '').trim() &&
+      String(settings.tripay_merchant_code || '').trim()
+    );
+  }
+  if (g === 'midtrans') {
+    return isEnabledFlag(settings.midtrans_enabled) && String(settings.midtrans_server_key || '').trim();
+  }
+  if (g === 'xendit') {
+    return isEnabledFlag(settings.xendit_enabled) && String(settings.xendit_api_key || '').trim();
+  }
+  if (g === 'duitku') {
+    return (
+      isEnabledFlag(settings.duitku_enabled) &&
+      String(settings.duitku_merchant_code || '').trim() &&
+      String(settings.duitku_api_key || '').trim()
+    );
+  }
+  return false;
+}
+
+function resolveConfiguredGatewayForAmount(settings, amount) {
+  const amt = Number(amount || 0) || 0;
+  const min = {
+    qris_static: 0,
+    tripay: 0,
+    midtrans: 10000,
+    xendit: 1000,
+    duitku: 1000
+  };
+
+  const def = String(settings?.default_gateway || 'tripay').toLowerCase();
+  const fallbackOrder = ['qris_static', 'tripay', 'xendit', 'duitku', 'midtrans'];
+
+  const ok = (g) => {
+    if (g === 'qris_static') {
+      const enabled = isEnabledFlag(settings?.qris_static_enabled) && (settings?.qris_static_payload || settings?.qris_static_qr_url);
+      if (!enabled) return false;
+      const minAmt = min[g] ?? 0;
+      return amt >= minAmt;
+    }
+    if (!isGatewayConfigured(settings, g)) return false;
+    const minAmt = min[g] ?? 0;
+    return amt >= minAmt;
+  };
+
+  if (ok(def)) return def;
+
+  for (const g of fallbackOrder) {
+    if (g === def) continue;
+    if (ok(g)) return g;
+  }
+
+  return null;
+}
+
 module.exports = {
   createTripayTransaction,
   createMidtransTransaction,
@@ -474,5 +539,8 @@ module.exports = {
   verifyTripayWebhook,
   verifyMidtransWebhook,
   verifyDuitkuWebhook,
-  getFallbackEmail
+  getFallbackEmail,
+  isGatewayConfigured,
+  resolveConfiguredGatewayForAmount
 };
+

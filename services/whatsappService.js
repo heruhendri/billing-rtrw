@@ -6,7 +6,7 @@ const fonnteWAService = require('./fonnteWhatsappService');
 
 /**
  * Unified WhatsApp Gateway Service
- * Menangani routing pengiriman pesan baik via Baileys (Unofficial Web), Fonnte API, maupun Meta Cloud API (Official Meta).
+ * Menangani routing pengiriman pesan baik via Baileys (Unofficial Socket), Fonnte API, maupun Meta Cloud API (Official Meta).
  */
 
 /**
@@ -37,7 +37,7 @@ async function sendWhatsAppMessage(toPhone, messageText, options = {}) {
       return await metaWAService.sendMetaTextMessage(toPhone, messageText);
     }
   } else {
-    // Mode BAILEYS WEB (Default Existing)
+    // Mode BAILEYS WEB (Default Socket)
     const { sendWA, whatsappStatus } = await import('./whatsappBot.mjs');
 
     if (!whatsappStatus || whatsappStatus.connection !== 'open') {

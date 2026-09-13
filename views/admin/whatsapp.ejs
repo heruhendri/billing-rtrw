@@ -44,7 +44,7 @@
     <% } %>
 
     <div class="wa-tabs">
-      <a href="/admin/whatsapp" class="wa-tab <%= waTab==='status' ? 'active' : '' %>"><i class="bi bi-phone"></i> Status Baileys</a>
+      <a href="/admin/whatsapp" class="wa-tab <%= waTab==='status' ? 'active' : '' %>"><i class="bi bi-phone"></i> Status WhatsApp Bot</a>
       <a href="/admin/whatsapp/broadcast" class="wa-tab <%= waTab==='broadcast' ? 'active' : '' %>"><i class="bi bi-megaphone"></i> Broadcast & Pengingat</a>
       <a href="/admin/whatsapp/templates" class="wa-tab <%= waTab==='templates' ? 'active' : '' %>"><i class="bi bi-chat-left-quote"></i> Template Pesan</a>
       <a href="/admin/whatsapp/live-chat" class="wa-tab"><i class="bi bi-chat-dots-fill"></i> Live Chat (Pesan Langsung)</a>
@@ -59,8 +59,8 @@
           <div class="fg">
             <label class="fl">Pilihan Provider / Gateway WhatsApp</label>
             <select class="fs" name="wa_gateway_type" id="wa_gateway_type" onchange="toggleGatewayFields()">
-              <option value="baileys" <%= waGatewayType === 'baileys' ? 'selected' : '' %>>🌐 Baileys Web (Unofficial - Internal & Scan QR Code)</option>
               <option value="fonnte" <%= waGatewayType === 'fonnte' ? 'selected' : '' %>>🚀 Fonnte API Gateway (Cloud Resmi & Self-Hosted Ready)</option>
+              <option value="baileys" <%= waGatewayType === 'baileys' ? 'selected' : '' %>>🌐 Baileys Web (Unofficial Socket - Ringan)</option>
               <option value="meta" <%= waGatewayType === 'meta' ? 'selected' : '' %>>🟢 Meta Cloud API (Official - Resmi Meta & Anti-Banned)</option>
             </select>
           </div>
@@ -233,10 +233,13 @@
           <p><%= t('admin.whatsapp.last_updated', 'Terakhir diperbarui:') %> <span id="wa-time">-</span></p>
         </div>
 
-        <div class="mt-5" style="display:flex; justify-content:center; gap:10px">
+        <div class="mt-5" style="display:flex; justify-content:center; flex-wrap:wrap; gap:10px">
           <button class="btn btn-g" onclick="checkStatus()"><i class="bi bi-arrow-clockwise"></i> <%= t('admin.whatsapp.refresh_status', 'Refresh Status') %></button>
           <form method="POST" action="/admin/whatsapp/test-notification" onsubmit="return confirm('<%= t('admin.whatsapp.confirm_test', 'Kirim test notifikasi WhatsApp ke admin sekarang?') %>');">
             <button class="btn btn-p"><i class="bi bi-send-check"></i> <%= t('admin.whatsapp.test_notification', 'Kirim Test Notif') %></button>
+          </form>
+          <form method="POST" action="/admin/whatsapp/repair-keys" onsubmit="return confirm('Bersihkan cache pre-keys & sesi usang untuk mengatasi masalah pesan pending / Bad-MAC tanpa perlu scan QR ulang?');">
+            <button class="btn btn-g" style="border-color: #3b82f6; color: #2563eb;"><i class="bi bi-wrench-adjustable"></i> Perbaiki Sesi (Anti Waiting)</button>
           </form>
           <form method="POST" action="/admin/whatsapp/reset" onsubmit="return confirm('<%= t('admin.whatsapp.confirm_reset', 'Apakah Anda yakin ingin menghapus sesi WhatsApp? Anda harus scan QR ulang setelah ini.') %>')">
             <button class="btn btn-d"><i class="bi bi-trash"></i> <%= t('admin.whatsapp.reset_session', 'Hapus Sesi / Reset') %></button>
@@ -290,7 +293,7 @@
         infoSection.style.display = 'block';
         document.getElementById('wa-user').innerText = status.user?.id || status.user?.name || I18N.deviceFallback;
         document.getElementById('wa-time').innerText = new Date(status.lastUpdate).toLocaleTimeString();
-      } else if (status.connection === 'qr' && status.qr) {
+      } else if (status.connection === 'qr' && (status.qr || status.qrImage)) {
         console.log('Generating QR Code Canvas...');
         icon.classList.add('status-qr');
         text.innerText = needScanLabel;
@@ -298,20 +301,31 @@
         qrSection.style.display = 'block';
         
         qrContainer.innerHTML = '';
-        if (typeof QRCode === 'undefined') {
-          console.error('QRCode library still not loaded!');
+        if (status.qrImage) {
+          const img = document.createElement('img');
+          img.src = status.qrImage;
+          img.style.width = '256px';
+          img.style.height = '256px';
+          img.style.borderRadius = '8px';
+          img.alt = 'Scan WhatsApp QR';
+          qrContainer.appendChild(img);
+        } else if (typeof QRCode !== 'undefined' && status.qr) {
+          QRCode.toCanvas(status.qr, { width: 256, margin: 2 }, function (error, canvas) {
+            if (error) {
+              console.error('QR Generate Error:', error);
+              qrContainer.innerText = I18N.qrFail;
+            } else {
+              console.log('QR Code Canvas generated successfully.');
+              qrContainer.appendChild(canvas);
+            }
+          });
+        } else {
           qrContainer.innerText = I18N.waitQrLib;
-          return;
         }
-        QRCode.toCanvas(status.qr, { width: 256, margin: 2 }, function (error, canvas) {
-          if (error) {
-            console.error('QR Generate Error:', error);
-            qrContainer.innerText = I18N.qrFail;
-          } else {
-            console.log('QR Code Canvas generated successfully.');
-            qrContainer.appendChild(canvas);
-          }
-        });
+      } else if (status.connection === 'connecting') {
+        icon.classList.add('status-qr');
+        text.innerText = 'Menghubungkan...';
+        desc.innerText = status.loadingProgress || 'Autentikasi berhasil, sedang menyinkronkan chat WhatsApp Web... Harap tunggu beberapa detik.';
       } else {
         icon.classList.add('status-close');
         text.innerText = I18N.descOffPrefix + ' (' + (status.connection || 'off') + ')';

@@ -79,19 +79,21 @@ function startCronJobs() {
 
     let isolatedCount = 0;
     const BATCH_SIZE = 100;
-    let offset = 0;
+    let lastId = 0;
 
     while (true) {
       const batch = db.prepare(
         `SELECT c.*, p.billing_type AS package_billing_type
          FROM customers c LEFT JOIN packages p ON c.package_id = p.id
-         WHERE c.status = 'active'
-         LIMIT ? OFFSET ?`
-      ).all(BATCH_SIZE, offset);
+         WHERE c.status = 'active' AND c.id > ?
+         ORDER BY c.id ASC
+         LIMIT ?`
+      ).all(lastId, BATCH_SIZE);
 
       if (batch.length === 0) break;
 
       for (const c of batch) {
+        lastId = c.id;
         const isAutoIsolateEnabled = c.auto_isolate !== 0;
         if (!isAutoIsolateEnabled) continue;
 
@@ -125,7 +127,6 @@ function startCronJobs() {
         }
       }
 
-      offset += BATCH_SIZE;
       if (batch.length === BATCH_SIZE) {
         await new Promise(r => setTimeout(r, 300)); // Jeda 300ms antar batch
       }

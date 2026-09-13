@@ -112,6 +112,7 @@
         <h6><i class="bi bi-people"></i> <%= t('admin.customers.list', 'Daftar Pelanggan') %> (<%= customers.length %>)</h6>
         <div style="display:flex;gap:8px">
           <button type="button" class="btn btn-g btn-sm" onclick="window.print()" title="Cetak Data Pelanggan"><i class="bi bi-printer"></i> Cetak</button>
+          <a href="/admin/onu-stickers" class="btn btn-g btn-sm" title="Cetak Stiker Modem / ONU"><i class="bi bi-qr-code-scan"></i> Stiker ONU</a>
           <a href="/admin/customers/export" class="btn btn-g btn-sm"><i class="bi bi-file-earmark-excel"></i> <%= t('admin.customers.export_excel', 'Export Excel') %></a>
           <button class="btn btn-g btn-sm" onclick="openModal('importModal')"><i class="bi bi-file-earmark-arrow-up"></i> <%= t('admin.customers.import_excel', 'Import Excel') %></button>
           <button class="btn btn-p btn-sm" onclick="openModal('addModal')"><i class="bi bi-plus-lg"></i> <%= t('admin.customers.add', 'Tambah Pelanggan') %></button>
@@ -259,6 +260,7 @@
               </td>
               <td>
                 <button class="btn btn-g btn-icon btn-sm" title="Lihat Detail & Koneksi MikroTik" onclick="viewCustDetail(<%= i %>)"><i class="bi bi-eye"></i></button>
+                <a href="/admin/customers/<%= c.id %>/sticker-onu" target="_blank" class="btn btn-g btn-icon btn-sm" title="Cetak Stiker Modem / ONU"><i class="bi bi-qr-code"></i></a>
                 <button class="btn btn-s btn-icon btn-sm" title="<%= t('admin.customers.actions.generate_invoice', 'Generate Tagihan') %>" data-idx="<%= i %>" onclick="openGenInvoice(+this.dataset.idx)"><i class="bi bi-lightning-charge"></i></button>
                 <button class="btn btn-p btn-icon btn-sm" title="<%= t('admin.customers.actions.pay_invoice', 'Bayar Tagihan') %>" data-idx="<%= i %>" onclick="openPayInvoice(+this.dataset.idx)"><i class="bi bi-cash-coin"></i></button>
                 <% if (typeof session !== 'undefined' && session && !session.isCashier) { %>

@@ -15,6 +15,7 @@
   "admin_username": "admin",
   "admin_password": "admin123",
   "admin_api_key": "admin-api-key-change-this",
+  "webhook_secret": "billing-rtrw-secret-key",
   "whatsapp_enabled": true,
   "whatsapp_auth_folder": "auth_info_baileys",
   "whatsapp_lid_map_file": "data/wa-lid-map.json",
@@ -87,5 +88,9 @@
   "radius_ip_pool_enabled": "1",
   "radius_ip_pool_start": "10.10.10.2",
   "radius_ip_pool_end": "10.10.10.254",
-  "radius_framed_pool": "pool-pppoe"
+  "radius_framed_pool": "pool-pppoe",
+  "radius_send_group": "0",
+  "wa_gateway_type": "baileys",
+  "fonnte_token": "",
+  "fonnte_api_url": "https://api.fonnte.com/send"
 }

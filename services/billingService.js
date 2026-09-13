@@ -404,30 +404,44 @@ function renewCustomerPrepaidValidity(customerId, multiplier = 1) {
 }
 
 function markAsPaid(invoiceId, paidByName, notes, actor = null) {
-  const result = db.prepare(`
-    UPDATE invoices SET status='paid', paid_at=NOW_LOCAL(), paid_by_name=?, notes=? WHERE id=?
-  `).run(paidByName || 'Admin', notes || '', invoiceId);
+  const invId = Number(invoiceId);
+  if (!invId) return { changes: 0, error: 'Invalid invoice ID' };
 
-  const invoice = db.prepare('SELECT id, customer_id, period_month, period_year, amount FROM invoices WHERE id=?').get(invoiceId);
-  if (invoice && invoice.customer_id) {
-    renewCustomerPrepaidValidity(invoice.customer_id, 1);
+  const existing = db.prepare('SELECT id, customer_id, period_month, period_year, amount, status, notes FROM invoices WHERE id=?').get(invId);
+  if (!existing) return { changes: 0, error: 'Invoice tidak ditemukan' };
+  if (existing.status === 'paid') {
+    return { changes: 0, alreadyPaid: true, invoice: existing };
+  }
+
+  // Gabungkan notes jika sudah ada
+  let finalNotes = existing.notes || '';
+  if (notes) {
+    finalNotes = finalNotes ? `${finalNotes} | ${notes}` : notes;
+  }
+
+  const result = db.prepare(`
+    UPDATE invoices SET status='paid', paid_at=NOW_LOCAL(), paid_by_name=?, notes=? WHERE id=? AND status != 'paid'
+  `).run(paidByName || 'Admin', finalNotes, invId);
+
+  if (result.changes > 0 && existing.customer_id) {
+    renewCustomerPrepaidValidity(existing.customer_id, 1);
   }
 
   // Catat audit trail jika berhasil
-  if (result.changes > 0 && actor && invoice) {
+  if (result.changes > 0 && actor) {
     auditTrail.logAuditTrail({
       action: 'MARK_INVOICE_PAID',
       entity_type: 'invoice',
-      entity_id: String(invoiceId),
+      entity_id: String(invId),
       actor_type: actor.type || 'unknown',
       actor_id: actor.id || null,
       actor_name: actor.name || null,
       details: {
-        customer_id: invoice.customer_id,
-        period: `${invoice.period_month}/${invoice.period_year}`,
-        amount: invoice.amount,
+        customer_id: existing.customer_id,
+        period: `${existing.period_month}/${existing.period_year}`,
+        amount: existing.amount,
         paid_by: paidByName || 'Admin',
-        notes: notes || ''
+        notes: finalNotes
       },
       ip_address: actor.ip || null,
       user_agent: actor.userAgent || null
@@ -677,7 +691,7 @@ function createInstallProrataCatchUpInvoice(customerId) {
 
   return {
     invoiceId: r.lastInsertRowid,
-    amount,
+    amount: finalAmount,
     periodMonth,
     periodYear,
     customerName: customer.name,
