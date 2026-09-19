@@ -551,19 +551,20 @@ router.post('/pulsa', requireAgentSession, express.urlencoded({ extended: true }
     const isFailed = status === 'failed';
 
     let waSent = false;
-    if (getSetting('whatsapp_enabled', false) && buyerPhone) {
+    // HANYA kirim WA struk jika transaksi sudah terkonfirmasi SUKSES
+    if (isSuccess && getSetting('whatsapp_enabled', false) && buyerPhone) {
       try {
         const { sendWA, whatsappStatus } = await import('../services/whatsappBot.mjs');
         if (whatsappStatus.connection === 'open') {
           const msg =
-            `${isSuccess ? '✅' : isFailed ? '❌' : '⏳'} *TRANSAKSI PULSA*\n\n` +
+            `✅ *TRANSAKSI PULSA BERHASIL*\n\n` +
             `📦 *SKU:* ${sku}\n` +
             `🎯 *Target:* ${target}\n` +
+            `💰 *Harga:* Rp ${Number(result?.tx?.amount_sell || 0).toLocaleString('id-ID')}\n` +
             `🧾 *Ref ID:* ${result?.tx?.digi_ref_id || '-'}\n` +
-            `📡 *Status:* ${status.toUpperCase()}\n` +
-            `${result?.tx?.digi_sn ? `🔢 *SN:* ${result.tx.digi_sn}\n` : ''}` +
-            `${result?.tx?.digi_message ? `💬 *Pesan:* ${result.tx.digi_message}\n` : ''}` +
-            `\nTerima kasih.`;
+            (result?.tx?.digi_sn ? `🔢 *SN / Token:* \`${result.tx.digi_sn}\`\n` : '') +
+            (result?.tx?.digi_message ? `💬 *Pesan:* ${result.tx.digi_message}\n` : '') +
+            `\nTerima kasih telah bertransaksi.`;
           await sendWA(buyerPhone, msg);
           waSent = true;
         }
@@ -610,20 +611,20 @@ router.post('/api/pulsa/order', requireAgentSession, express.json({ limit: '50kb
     const isSuccess = status === 'success';
     const isFailed = status === 'failed';
     let waSent = false;
-    if (getSetting('whatsapp_enabled', false) && buyerPhone) {
+    // HANYA kirim WA struk jika transaksi sudah terkonfirmasi SUKSES
+    if (isSuccess && getSetting('whatsapp_enabled', false) && buyerPhone) {
       try {
         const { sendWA, whatsappStatus } = await import('../services/whatsappBot.mjs');
         if (whatsappStatus.connection === 'open') {
           const msg =
-            `${isSuccess ? '✅' : isFailed ? '❌' : '⏳'} *TRANSAKSI PULSA*\n\n` +
+            `✅ *TRANSAKSI PULSA BERHASIL*\n\n` +
             `📦 *SKU:* ${sku}\n` +
             `🎯 *Target:* ${target}\n` +
             `💰 *Harga:* Rp ${Number(result?.tx?.amount_sell || 0).toLocaleString('id-ID')}\n` +
             `🧾 *Ref ID:* ${result?.tx?.digi_ref_id || '-'}\n` +
-            `📡 *Status:* ${status.toUpperCase()}\n` +
-            `${result?.tx?.digi_sn ? `🔢 *SN:* ${result.tx.digi_sn}\n` : ''}` +
-            `${result?.tx?.digi_message ? `💬 *Pesan:* ${result.tx.digi_message}\n` : ''}` +
-            `\nTerima kasih.`;
+            (result?.tx?.digi_sn ? `🔢 *SN / Token:* \`${result.tx.digi_sn}\`\n` : '') +
+            (result?.tx?.digi_message ? `💬 *Pesan:* ${result.tx.digi_message}\n` : '') +
+            `\nTerima kasih telah bertransaksi.`;
           await sendWA(buyerPhone, msg);
           waSent = true;
         }

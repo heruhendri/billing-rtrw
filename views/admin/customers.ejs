@@ -177,6 +177,9 @@
                   <%= c.name %>
                   <i class="bi bi-info-circle-fill" style="font-size:12px;opacity:0.75;"></i>
                 </a>
+                <div style="font-size:11px;font-weight:700;color:#10b981;margin-top:2px;display:flex;align-items:center;gap:4px;" title="Saldo Dompet Pelanggan">
+                  <i class="bi bi-wallet2"></i> Rp <%= Number(c.balance || 0).toLocaleString('id-ID') %>
+                </div>
               </td>
               <td>
                 <div><%= c.phone || '-' %></div>
@@ -263,6 +266,7 @@
                 <a href="/admin/customers/<%= c.id %>/sticker-onu" target="_blank" class="btn btn-g btn-icon btn-sm" title="Cetak Stiker Modem / ONU"><i class="bi bi-qr-code"></i></a>
                 <button class="btn btn-s btn-icon btn-sm" title="<%= t('admin.customers.actions.generate_invoice', 'Generate Tagihan') %>" data-idx="<%= i %>" onclick="openGenInvoice(+this.dataset.idx)"><i class="bi bi-lightning-charge"></i></button>
                 <button class="btn btn-p btn-icon btn-sm" title="<%= t('admin.customers.actions.pay_invoice', 'Bayar Tagihan') %>" data-idx="<%= i %>" onclick="openPayInvoice(+this.dataset.idx)"><i class="bi bi-cash-coin"></i></button>
+                <button class="btn btn-g btn-icon btn-sm" title="Kelola / Top-Up Saldo Dompet" data-idx="<%= i %>" onclick="openTopupModal(+this.dataset.idx)" style="color:#10b981;"><i class="bi bi-wallet2"></i></button>
                 <% if (typeof session !== 'undefined' && session && !session.isCashier) { %>
                 <% if (c.package_id && (c.package_promo_cycles || 0) > 0) { %>
                 <form method="POST" action="/admin/customers/<%= c.id %>/billing/reset-promo-cycles" style="display:inline" onsubmit="return confirm('Reset counter siklus promo untuk pelanggan ini? Tagihan berikutnya akan memakai harga promo lagi sesuai pengaturan paket.')">
@@ -1098,6 +1102,13 @@
               <td id="v_expired_at" style="padding:6px 0">-</td>
             </tr>
             <tr>
+              <td style="color:var(--muted);padding:6px 0">Saldo Dompet Pelanggan</td>
+              <td style="padding:6px 0">
+                <span id="v_balance" style="font-weight:700;color:#10b981;font-size:14px">Rp 0</span>
+                <button type="button" class="btn btn-s btn-sm py-0 px-2 ms-2" onclick="openTopupFromDetail()"><i class="bi bi-wallet2"></i> Kelola Saldo</button>
+              </td>
+            </tr>
+            <tr>
               <td style="color:var(--muted);padding:6px 0">Tag ONU (GenieACS)</td>
               <td style="padding:6px 0">
                 <code id="v_genieacs" style="font-weight:700;color:var(--text);font-size:12px">-</code>
@@ -1122,6 +1133,97 @@
     </div>
   </div>
 </div>
+
+<!-- Modal Top-Up / Kelola Saldo Pelanggan -->
+<div class="mo" id="topupBalanceModal">
+  <div class="mb" style="max-width:540px;">
+    <div class="mh">
+      <span class="mt"><i class="bi bi-wallet2 text-success"></i> Kelola Saldo Dompet Pelanggan</span>
+      <button type="button" class="mc" onclick="closeModal('topupBalanceModal')">&times;</button>
+    </div>
+    <form method="POST" id="topupBalanceForm" action="">
+      <div class="mbody" style="padding:16px 20px;">
+        <!-- Info Pelanggan & Saldo Sekarang -->
+        <div style="background:var(--panel2);border:1px solid rgba(148,163,184,0.15);border-radius:10px;padding:12px;margin-bottom:16px;">
+          <div class="d-flex justify-content-between align-items-center">
+            <div>
+              <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:600;">Pelanggan</div>
+              <div id="topupCustomerName" style="font-weight:700;color:var(--text);font-size:15px;margin-top:2px;">-</div>
+            </div>
+            <div class="text-end">
+              <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;font-weight:600;">Saldo Saat Ini</div>
+              <div id="topupCurrentBalance" style="font-weight:800;color:#10b981;font-size:16px;margin-top:2px;">Rp 0</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tipe Aksi: Tambah vs Potong -->
+        <div class="fg" style="margin-bottom:14px;">
+          <label class="fl" style="font-weight:600;margin-bottom:6px;">Jenis Transaksi Saldo</label>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+            <label style="display:flex;align-items:center;gap:8px;padding:10px 14px;border:1.5px solid rgba(16,185,129,0.4);border-radius:10px;cursor:pointer;background:rgba(16,185,129,0.06);">
+              <input type="radio" name="action_type" value="add" checked onchange="updateTopupActionUI()" style="width:16px;height:16px;accent-color:#10b981;">
+              <div>
+                <div style="font-weight:700;font-size:13px;color:#10b981;"><i class="bi bi-plus-circle"></i> Tambah / Deposit</div>
+                <div style="font-size:10px;color:var(--muted);">Setor tunai / penambahan</div>
+              </div>
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;padding:10px 14px;border:1.5px solid rgba(239,68,68,0.3);border-radius:10px;cursor:pointer;background:rgba(239,68,68,0.04);">
+              <input type="radio" name="action_type" value="deduct" onchange="updateTopupActionUI()" style="width:16px;height:16px;accent-color:#ef4444;">
+              <div>
+                <div style="font-weight:700;font-size:13px;color:#ef4444;"><i class="bi bi-dash-circle"></i> Potong / Koreksi</div>
+                <div style="font-size:10px;color:var(--muted);">Penyesuaian / refund</div>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        <!-- Nominal Cepat -->
+        <div class="fg" style="margin-bottom:10px;">
+          <label class="fl" style="font-weight:600;margin-bottom:6px;">Pilih Nominal Cepat</label>
+          <div style="display:grid;grid-template-columns:repeat(3, 1fr);gap:6px;">
+            <button type="button" class="btn btn-g btn-sm" style="font-size:12px;font-weight:600;" onclick="setTopupNominal(10000)">10.000</button>
+            <button type="button" class="btn btn-g btn-sm" style="font-size:12px;font-weight:600;" onclick="setTopupNominal(20000)">20.000</button>
+            <button type="button" class="btn btn-g btn-sm" style="font-size:12px;font-weight:600;" onclick="setTopupNominal(50000)">50.000</button>
+            <button type="button" class="btn btn-g btn-sm" style="font-size:12px;font-weight:600;" onclick="setTopupNominal(100000)">100.000</button>
+            <button type="button" class="btn btn-g btn-sm" style="font-size:12px;font-weight:600;" onclick="setTopupNominal(200000)">200.000</button>
+            <button type="button" class="btn btn-g btn-sm" style="font-size:12px;font-weight:600;" onclick="setTopupNominal(500000)">500.000</button>
+          </div>
+        </div>
+
+        <!-- Input Nominal Manual -->
+        <div class="fg" style="margin-bottom:14px;">
+          <label class="fl" style="font-weight:600;">Nominal (Rp) <span class="text-danger">*</span></label>
+          <div style="position:relative;">
+            <span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-weight:700;color:var(--muted);">Rp</span>
+            <input type="number" class="fc" name="amount" id="topupAmount" min="1000" step="1000" required placeholder="0" style="padding-left:38px;font-size:15px;font-weight:700;" oninput="updateTopupEstimatedBalance()">
+          </div>
+          <div id="topupEstimateHelp" style="font-size:11px;color:var(--muted);margin-top:4px;"></div>
+        </div>
+
+        <!-- Catatan / Sumber Pembayaran -->
+        <div class="fg" style="margin-bottom:14px;">
+          <label class="fl" style="font-weight:600;">Catatan / Keterangan Transaksi</label>
+          <input type="text" class="fc" name="note" id="topupNote" placeholder="Contoh: Setor Tunai di Loket Kasir, Refund, dll.">
+          <div style="font-size:11px;color:var(--muted);margin-top:2px;">Catatan ini akan tersimpan di riwayat transaksi dan tertera di struk WhatsApp.</div>
+        </div>
+
+        <!-- Checkbox Notifikasi WhatsApp -->
+        <div class="fg" style="margin-bottom:6px;">
+          <label style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:rgba(34,197,94,0.06);border:1px solid rgba(34,197,94,0.25);border-radius:8px;cursor:pointer;">
+            <input type="checkbox" name="send_wa" id="topupSendWa" checked style="width:16px;height:16px;accent-color:#10b981;">
+            <span style="font-size:12px;font-weight:600;color:var(--text);"><i class="bi bi-whatsapp text-success me-1"></i> Kirim Struk / Notifikasi WhatsApp ke Pelanggan</span>
+          </label>
+        </div>
+      </div>
+      <div class="mf d-flex justify-content-between">
+        <button type="button" class="btn btn-g" onclick="closeModal('topupBalanceModal')">Batal</button>
+        <button type="submit" class="btn btn-s" id="topupSubmitBtn"><i class="bi bi-check-lg"></i> Proses Top-Up</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 
 <script id="customers-data" type="application/json"><%- JSON.stringify(customers) %></script>
 <script id="sessions-data" type="application/json"><%- JSON.stringify(Array.from(typeof activeSessionsMap !== 'undefined' && activeSessionsMap && activeSessionsMap.entries ? activeSessionsMap.entries() : [])) %></script>
@@ -1269,6 +1371,7 @@ function viewCustDetail(idx) {
     }
     if (document.getElementById('v_genieacs')) document.getElementById('v_genieacs').textContent = c.genieacs_tag || '-';
     if (document.getElementById('v_status_account')) document.getElementById('v_status_account').textContent = `Status: ${c.status || 'active'} | Auto Isolir: ${c.auto_isolate === 0 ? 'Nonaktif' : 'Aktif (Tgl ' + (c.isolate_day || '-') + ')'}`;
+    if (document.getElementById('v_balance')) document.getElementById('v_balance').textContent = 'Rp ' + Number(c.balance || 0).toLocaleString('id-ID');
 
     if (document.getElementById('v_disconnect_form')) {
       document.getElementById('v_disconnect_form').action = '/admin/customers/' + c.id + '/disconnect';
@@ -1578,6 +1681,90 @@ function openPayInvoice(idx) {
   openModal('payInvoiceModal');
   loadBillingYear();
 }
+
+let currentTopupCust = null;
+
+function openTopupModal(idx) {
+  const c = customersData[idx];
+  if (!c) return;
+  currentTopupCust = c;
+  document.getElementById('topupBalanceForm').action = '/admin/customers/' + c.id + '/topup';
+  document.getElementById('topupCustomerName').textContent = (c.name || '-') + (c.phone ? (' (' + c.phone + ')') : '');
+  const bal = Number(c.balance || 0);
+  document.getElementById('topupCurrentBalance').textContent = 'Rp ' + bal.toLocaleString('id-ID');
+  document.getElementById('topupAmount').value = '';
+  document.getElementById('topupNote').value = '';
+  const helpEl = document.getElementById('topupEstimateHelp');
+  if (helpEl) helpEl.textContent = '';
+  
+  const radioAdd = document.querySelector('#topupBalanceModal input[name="action_type"][value="add"]');
+  if (radioAdd) radioAdd.checked = true;
+  updateTopupActionUI();
+  
+  openModal('topupBalanceModal');
+}
+
+function openTopupFromDetail() {
+  if (currentDetailIdx === null) return;
+  const idx = currentDetailIdx;
+  closeModal('viewDetailModal');
+  setTimeout(() => openTopupModal(idx), 200);
+}
+
+function setTopupNominal(n) {
+  const amtInput = document.getElementById('topupAmount');
+  if (amtInput) {
+    amtInput.value = n;
+    updateTopupEstimatedBalance();
+  }
+}
+
+function updateTopupEstimatedBalance() {
+  if (!currentTopupCust) return;
+  const currentBal = Number(currentTopupCust.balance || 0);
+  const amt = Number(document.getElementById('topupAmount')?.value) || 0;
+  const isDeduct = document.querySelector('#topupBalanceModal input[name="action_type"]:checked')?.value === 'deduct';
+  const helpEl = document.getElementById('topupEstimateHelp');
+  if (!helpEl) return;
+  
+  if (amt <= 0) {
+    helpEl.textContent = '';
+    return;
+  }
+  
+  const finalBal = isDeduct ? Math.max(0, currentBal - amt) : (currentBal + amt);
+  helpEl.innerHTML = `Estimasi saldo akhir: <strong style="color:${isDeduct ? '#ef4444' : '#10b981'}">Rp ${finalBal.toLocaleString('id-ID')}</strong>`;
+}
+
+function updateTopupActionUI() {
+  const isDeduct = document.querySelector('#topupBalanceModal input[name="action_type"]:checked')?.value === 'deduct';
+  const submitBtn = document.getElementById('topupSubmitBtn');
+  const noteInput = document.getElementById('topupNote');
+  if (isDeduct) {
+    if (submitBtn) {
+      submitBtn.className = 'btn btn-d';
+      submitBtn.innerHTML = '<i class="bi bi-dash-circle"></i> Potong Saldo';
+    }
+    if (noteInput && !noteInput.value) {
+      noteInput.placeholder = 'Alasan / keterangan pemotongan saldo';
+    }
+  } else {
+    if (submitBtn) {
+      submitBtn.className = 'btn btn-s';
+      submitBtn.innerHTML = '<i class="bi bi-check-lg"></i> Proses Top-Up';
+    }
+    if (noteInput && !noteInput.value) {
+      noteInput.placeholder = 'Contoh: Setor Tunai di Loket Kasir, Refund, dll.';
+    }
+  }
+  updateTopupEstimatedBalance();
+}
+
+window.openTopupModal = openTopupModal;
+window.openTopupFromDetail = openTopupFromDetail;
+window.setTopupNominal = setTopupNominal;
+window.updateTopupActionUI = updateTopupActionUI;
+window.updateTopupEstimatedBalance = updateTopupEstimatedBalance;
 
 function toRupiah(n) {
   const v = Number(n) || 0;

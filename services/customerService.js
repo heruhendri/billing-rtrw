@@ -642,10 +642,30 @@ async function suspendCustomer(id) {
   return true;
 }
 
+function _handleUnsuspendInvoice(id, customer, wasSuspended, targetStatus) {
+  if (wasSuspended && (targetStatus === 'active' || targetStatus === 'ditangguhkan') && customer.package_id) {
+    try {
+      const now = new Date();
+      const curMonth = now.getMonth() + 1;
+      const curYear = now.getFullYear();
+      const existingCurInv = db.prepare('SELECT id FROM invoices WHERE customer_id = ? AND period_month = ? AND period_year = ? LIMIT 1').get(id, curMonth, curYear);
+      if (!existingCurInv) {
+        const billingSvc = require('./billingService');
+        billingSvc.generateInvoiceForCustomer(id, curMonth, curYear);
+        logger.info(`[activateCustomer] Pelanggan "${customer.name}" (ID: ${id}) dibuka dari isolir (status: ${targetStatus}). Tagihan periode berjalan ${curMonth}/${curYear} otomatis diterbitkan.`);
+      }
+    } catch (invErr) {
+      logger.error(`[activateCustomer] Gagal generate tagihan periode berjalan untuk pelanggan "${customer.name}" (ID: ${id}): ${invErr.message}`);
+    }
+  }
+}
+
 async function activateCustomer(id, targetStatus = 'active') {
   const customer = getCustomerById(id);
   if (!customer) throw new Error('Pelanggan tidak ditemukan');
   
+  const wasSuspended = (customer.status === 'suspended' || customer.status === 'isolated');
+
   // Get effective router_id (respects multi-router mode setting)
   const effectiveRouterId = getEffectiveRouterId(customer.router_id);
 
@@ -657,6 +677,7 @@ async function activateCustomer(id, targetStatus = 'active') {
   if (hasMikrotikConnection && !effectiveRouterId) {
     logger.warn(`[activateCustomer] Pelanggan "${customer.name}" (ID: ${id}) memiliki koneksi ${customer.connection_type} tapi router_id NULL dan tidak ada default router. Aktivasi lokal hanya, MikroTik tidak diupdate.`);
     updateCustomer(id, { ...customer, status: targetStatus });
+    _handleUnsuspendInvoice(id, customer, wasSuspended, targetStatus);
     return;
   }
 
@@ -708,12 +729,108 @@ async function activateCustomer(id, targetStatus = 'active') {
 
   // Update database status SETELAH MikroTik berhasil (atau gagal tapi continue)
   updateCustomer(id, { ...customer, status: targetStatus });
+  _handleUnsuspendInvoice(id, customer, wasSuspended, targetStatus);
   return true;
+}
+
+/**
+ * Top-up / Deposit or Adjust Customer Balance manually by Admin/Cashier
+ * @param {number|string} customerId 
+ * @param {number} amount - positive number
+ * @param {string} note - memo or payment source
+ * @param {string} actorName - admin or cashier name
+ * @param {'add'|'deduct'} actionType - 'add' or 'deduct'
+ * @param {boolean} sendWhatsApp - whether to send WA notification
+ */
+async function topupCustomerBalance(customerId, amount, note = '', actorName = 'Admin', actionType = 'add', sendWhatsApp = true) {
+  const cid = Number(customerId);
+  const amt = Math.abs(Number(amount) || 0);
+  if (!cid || amt <= 0) {
+    throw new Error('ID Pelanggan dan nominal valid wajib diisi.');
+  }
+
+  const customer = db.prepare('SELECT * FROM customers WHERE id = ?').get(cid);
+  if (!customer) {
+    throw new Error('Pelanggan tidak ditemukan.');
+  }
+
+  const isDeduct = actionType === 'deduct';
+  const delta = isDeduct ? -amt : amt;
+  const before = Number(customer.balance || 0);
+  const after = Math.max(0, before + delta);
+
+  // Execute in SQLite transaction
+  db.transaction(() => {
+    db.prepare('UPDATE customers SET balance = ? WHERE id = ?').run(after, cid);
+
+    const orderId = `MANUAL-${Date.now()}`;
+    const desc = note ? note.trim() : (isDeduct ? `Penyesuaian/Pemotongan Saldo oleh ${actorName}` : `Deposit Manual oleh ${actorName}`);
+    
+    try {
+      db.prepare(`
+        INSERT INTO customer_topup_requests (
+          customer_id, amount, payment_gateway, payment_order_id, payment_reference, payment_payload, status, paid_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'paid', (NOW_LOCAL()), (NOW_LOCAL()), (NOW_LOCAL()))
+      `).run(
+        cid,
+        delta,
+        'MANUAL_ADMIN',
+        orderId,
+        desc,
+        JSON.stringify({ actorName, actionType, note: desc, before, after, timestamp: new Date().toISOString() })
+      );
+    } catch (tblErr) {
+      logger.warn('[topupCustomerBalance] customer_topup_requests insert error: ' + tblErr.message);
+    }
+  })();
+
+  // WhatsApp Notification
+  if (sendWhatsApp && customer.phone) {
+    try {
+      const { getSettings } = require('../config/settingsManager');
+      const settings = getSettings();
+      if (settings.whatsapp_enabled) {
+        const { sendWA, whatsappStatus } = await import('./whatsappBot.mjs');
+        if (whatsappStatus.connection === 'open') {
+          const waMsg = !isDeduct
+            ? `✅ *DEPOSIT SALDO BERHASIL*\n\n` +
+              `Halo *${customer.name}*,\n` +
+              `Deposit saldo dompet Anda telah berhasil ditambahkan oleh pihak admin/kasir.\n\n` +
+              `💰 *Nominal:* Rp ${amt.toLocaleString('id-ID')}\n` +
+              `💳 *Total Saldo Sekarang:* Rp ${after.toLocaleString('id-ID')}\n` +
+              `📝 *Keterangan:* ${note || 'Setor Tunai / Manual'}\n` +
+              `👤 *Diterima oleh:* ${actorName}\n\n` +
+              `Saldo dapat langsung digunakan untuk pembelian pulsa, paket data, voucher, atau token PLN di portal/aplikasi Alijaya. Terima kasih!`
+            : `⚠️ *PENYESUAIAN SALDO DOMPET*\n\n` +
+              `Halo *${customer.name}*,\n` +
+              `Terdapat penyesuaian/pemotongan saldo dompet Anda oleh pihak admin.\n\n` +
+              `🔻 *Nominal:* -Rp ${amt.toLocaleString('id-ID')}\n` +
+              `💳 *Sisa Saldo:* Rp ${after.toLocaleString('id-ID')}\n` +
+              `📝 *Keterangan:* ${note || 'Penyesuaian Saldo'}\n` +
+              `👤 *Petugas:* ${actorName}`;
+
+          await sendWA(customer.phone, waMsg);
+        }
+      }
+    } catch (waErr) {
+      logger.error('[topupCustomerBalance] WA notification error: ' + waErr.message);
+    }
+  }
+
+  return {
+    success: true,
+    customerId: cid,
+    customer,
+    before,
+    after,
+    delta,
+    actionType
+  };
 }
 
 module.exports = {
   getAllCustomers, getAllCustomerAreas, getCustomerById, createCustomer, updateCustomer, deleteCustomer, getCustomerStats,
   getAllPackages, getPackageById, createPackage, updatePackage, deletePackage,
   suspendCustomer, activateCustomer, findCustomerByAny, updateCustomerCablePath,
-  resetPromoCyclesUsed, getEffectiveRouterId
+  resetPromoCyclesUsed, getEffectiveRouterId, topupCustomerBalance
 };

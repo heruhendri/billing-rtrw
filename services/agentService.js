@@ -643,6 +643,7 @@ async function sellVoucherAsAgent(agentId, priceId, opts = {}) {
     const yy = String(now.getFullYear()).slice(-2);
     const agentName = String(agent.name || agent.username || 'Agent').trim().replace(/\s+/g, '_');
     const comment = `vc-${agentName}-${dd}.${mm}.${yy}`;
+    const password = code; // untuk hotspot voucher, username = password = code
     const userData = { server: 'all', name: code, password, profile: profileName, comment };
     if (validity) userData['limit-uptime'] = validity;
 
@@ -931,14 +932,14 @@ function getDigiflazzStaffTransactionById(id) {
   return db.prepare('SELECT * FROM digiflazz_staff_transactions WHERE id = ?').get(txId);
 }
 
-async function buyPulsaAsAdmin({ sku, target, actorPhone = '', actorName = '' } = {}) {
+async function buyPulsaAsAdmin({ sku, target, actorPhone = '', actorName = '', refId: customRefId = '' } = {}) {
   const safeSku = String(sku || '').trim();
   const safeTarget = String(target || '').trim();
   if (!safeSku) throw new Error('SKU tidak valid');
   if (!safeTarget) throw new Error('Target tidak valid');
 
   const prod = getDigiflazzProductLocalBySku(safeSku) || await digiflazzGetProductBySku(safeSku);
-  const refId = makeStaffRefId('ADM');
+  const refId = customRefId ? String(customRefId).trim() : makeStaffRefId('ADM');
 
   let vendor = null;
   let status = 'pending';
@@ -977,7 +978,7 @@ async function buyPulsaAsAdmin({ sku, target, actorPhone = '', actorName = '' } 
   );
 
   const tx = getDigiflazzStaffTransactionById(Number(ins.lastInsertRowid || 0));
-  return { tx, product: prod, vendor };
+  return { tx, product: prod, vendor, refId };
 }
 
 async function checkPulsaStatusAsAdmin(txId) {

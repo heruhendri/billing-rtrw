@@ -2136,6 +2136,32 @@ router.post('/customers/:id/delete', requireAdminSession, async (req, res) => {
   res.redirect('/admin/customers');
 });
 
+router.post('/customers/:id/topup', requireAdminSession, async (req, res) => {
+  try {
+    const custId = Number(req.params.id);
+    const amount = Number(req.body.amount);
+    const actionType = req.body.action_type === 'deduct' ? 'deduct' : 'add';
+    const note = req.body.note ? String(req.body.note).trim() : '';
+    const sendWhatsApp = req.body.send_wa === 'on' || req.body.send_wa === 'true' || req.body.send_wa === true;
+    const actorName = req.session?.isCashier ? resolvePaidByName(req, 'Kasir') : (req.session.adminUser || 'Admin');
+
+    if (!custId || isNaN(amount) || amount <= 0) {
+      throw new Error('Nominal saldo harus lebih dari 0.');
+    }
+
+    const result = await customerSvc.topupCustomerBalance(custId, amount, note, actorName, actionType, sendWhatsApp);
+    const actionText = actionType === 'deduct' ? 'dipotong' : 'ditambahkan';
+    req.session._msg = {
+      type: 'success',
+      text: `Saldo pelanggan ${result.customer?.name || ''} berhasil ${actionText} Rp ${amount.toLocaleString('id-ID')}. Sisa saldo: Rp ${result.after.toLocaleString('id-ID')}`
+    };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal kelola saldo: ' + e.message };
+  }
+  res.redirect('/admin/customers');
+});
+
+
 router.post('/customers/:id/disconnect', requireAdminSession, async (req, res) => {
   try {
     const custId = Number(req.params.id);
@@ -2307,9 +2333,13 @@ router.post('/customers/:id/isolate', requireAdminSession, async (req, res) => {
 
 router.post('/customers/:id/unisolate', requireAdminSession, async (req, res) => {
   try {
-    await customerSvc.activateCustomer(req.params.id);
     const customer = customerSvc.getCustomerById(req.params.id);
-    req.session._msg = { type: 'success', text: `Layanan pelanggan "${customer.name}" berhasil diaktifkan kembali.` };
+    if (!customer) throw new Error('Pelanggan tidak ditemukan');
+    const unpaid = db.prepare("SELECT COUNT(*) as cnt FROM invoices WHERE customer_id=? AND status='unpaid'").get(req.params.id)?.cnt || 0;
+    const targetStatus = unpaid > 0 ? 'ditangguhkan' : 'active';
+    await customerSvc.activateCustomer(req.params.id, targetStatus);
+    const statusLabel = targetStatus === 'ditangguhkan' ? 'DITANGGUHKAN (Bebas auto-isolir sampai awal bulan berikutnya)' : 'AKTIF';
+    req.session._msg = { type: 'success', text: `Layanan pelanggan "${customer.name}" berhasil diaktifkan kembali (${statusLabel}).` };
   } catch (e) {
     req.session._msg = { type: 'error', text: 'Gagal aktivasi: ' + e.message };
   }
@@ -6172,11 +6202,14 @@ router.post('/whatsapp/test-notification', requireAdminSession, async (req, res)
     const waSvc = require('../services/whatsappService');
     const adminNumbers = getSetting('whatsapp_admin_numbers', []);
     const legacyNumbers = getSetting('admins', []);
-    let adminPhone = '08977345640'; // fallback
+    let adminPhone = getSetting('company_phone', '');
     if (Array.isArray(adminNumbers) && adminNumbers.length > 0) {
       adminPhone = adminNumbers[0];
     } else if (Array.isArray(legacyNumbers) && legacyNumbers.length > 0) {
       adminPhone = legacyNumbers[0];
+    }
+    if (!adminPhone) {
+      throw new Error('Nomor WhatsApp admin belum dikonfigurasi di Pengaturan WhatsApp / Perusahaan.');
     }
 
     logger.info(`[WA Test] Mengirim test notifikasi ke nomor admin: ${adminPhone}`);

@@ -3559,39 +3559,56 @@ router.post('/ppob/buy', express.urlencoded({ extended: true }), async (req, res
   // Potong saldo
   adjustCustomerBalance(customer.id, -price, `Beli PPOB ${productName} -> ${target}`);
 
-  // Catat pesanan
-  const ins = db.prepare(`INSERT INTO public_ppob_orders (customer_id, buyer_phone, sku, product_name, target, price, status) VALUES (?, ?, ?, ?, ?, ?, 'processing')`).run(customer.id, customer.phone, sku, productName, target, price);
+  const digiRefId = `CUST-${customer.id}-${Date.now()}`;
+
+  // Catat pesanan awal status processing
+  const ins = db.prepare(`INSERT INTO public_ppob_orders (customer_id, buyer_phone, sku, product_name, target, price, status, digi_ref_id) VALUES (?, ?, ?, ?, ?, ?, 'processing', ?)`).run(customer.id, customer.phone, sku, productName, target, price, digiRefId);
   const orderId = Number(ins.lastInsertRowid);
 
   // Eksekusi Digiflazz
   try {
-    const digiResult = await agentSvc.buyPulsaAsAdmin({ sku, target, actorName: `Pelanggan ${customer.name}`, actorPhone: customer.phone });
+    const digiResult = await agentSvc.buyPulsaAsAdmin({
+      sku,
+      target,
+      actorName: `Pelanggan ${customer.name}`,
+      actorPhone: customer.phone,
+      refId: digiRefId
+    });
     const digiSn = String(digiResult?.vendor?.sn || '');
     const digiTrxId = String(digiResult?.vendor?.trx_id || '');
     const digiMsg = String(digiResult?.vendor?.message || '');
     const digiStatus = String(digiResult?.vendor?.status || 'pending').toLowerCase();
+    const isSuccess = digiStatus === 'sukses' || digiStatus === 'success';
     const isFailed = digiStatus === 'gagal' || digiStatus === 'failed';
 
-    // Refund saldo jika gagal
+    // 1. Jika Gagal Langsung dari Provider
     if (isFailed) {
       adjustCustomerBalance(customer.id, price, `Refund PPOB gagal - ${sku} -> ${target}`);
-      db.prepare(`UPDATE public_ppob_orders SET status='failed', digi_message=?, updated_at=(NOW_LOCAL()) WHERE id=?`).run(digiMsg || 'Gagal dari provider', orderId);
+      db.prepare(`UPDATE public_ppob_orders SET status='failed', digi_message=?, digi_trx_id=?, updated_at=(NOW_LOCAL()) WHERE id=?`).run(digiMsg || 'Gagal dari provider', digiTrxId, orderId);
       return redirectErr('Transaksi ditolak provider, saldo otomatis dikembalikan. ' + (digiMsg || ''));
     }
 
-    db.prepare(`UPDATE public_ppob_orders SET status='fulfilled', fulfilled_at=(NOW_LOCAL()), digi_trx_id=?, digi_sn=?, digi_message=?, updated_at=(NOW_LOCAL()) WHERE id=?`).run(digiTrxId, digiSn, digiMsg, orderId);
+    // 2. Jika Langsung Sukses (SN sudah ada)
+    if (isSuccess) {
+      db.prepare(`UPDATE public_ppob_orders SET status='fulfilled', fulfilled_at=(NOW_LOCAL()), digi_trx_id=?, digi_sn=?, digi_message=?, wa_sent=1, updated_at=(NOW_LOCAL()) WHERE id=?`).run(digiTrxId, digiSn, digiMsg, orderId);
 
-    const settings2 = getSettingsWithCache();
-    if (settings2.whatsapp_enabled && customer.phone) {
-      try {
-        const { sendWA, whatsappStatus } = await import('../services/whatsappBot.mjs');
-        if (whatsappStatus.connection === 'open') {
-          await sendWA(customer.phone, `✅ *PPOB BERHASIL*\n\n📦 *Produk:* ${productName}\n🎯 *Tujuan:* ${target}\n💰 *Nominal:* Rp ${price.toLocaleString('id-ID')}\n${digiSn ? `🔢 *SN:* ${digiSn}\n` : ''}💳 *Sisa Saldo:* Rp ${getCustomerBalance(customer.id).toLocaleString('id-ID')}\n\nTerima kasih!`);
-        }
-      } catch (waErr) { logger.error('[PPOB] WA error: ' + waErr.message); }
+      const settings2 = getSettingsWithCache();
+      if (settings2.whatsapp_enabled && customer.phone) {
+        try {
+          const { sendWA, whatsappStatus } = await import('../services/whatsappBot.mjs');
+          if (whatsappStatus.connection === 'open') {
+            await sendWA(customer.phone, `✅ *PPOB BERHASIL*\n\n📦 *Produk:* ${productName}\n🎯 *Tujuan:* ${target}\n💰 *Nominal:* Rp ${price.toLocaleString('id-ID')}\n${digiSn ? `🔢 *SN:* ${digiSn}\n` : ''}💳 *Sisa Saldo:* Rp ${getCustomerBalance(customer.id).toLocaleString('id-ID')}\n\nTerima kasih!`);
+          }
+        } catch (waErr) { logger.error('[PPOB] WA error: ' + waErr.message); }
+      }
+
+      return res.redirect('/customer/ppob?info=' + encodeURIComponent(`Berhasil! ${productName} → ${target}${digiSn ? '. SN: ' + digiSn : ''}`));
     }
 
-    return res.redirect('/customer/ppob?info=' + encodeURIComponent(`Berhasil! ${productName} → ${target}${digiSn ? '. SN: ' + digiSn : ''}`));
+    // 3. Jika Masih Pending / Processing (JANGAN kirim WA dulu)
+    db.prepare(`UPDATE public_ppob_orders SET status='processing', digi_trx_id=?, digi_sn=?, digi_message=?, updated_at=(NOW_LOCAL()) WHERE id=?`).run(digiTrxId, digiSn, digiMsg || 'Sedang diproses oleh provider', orderId);
+
+    return res.redirect('/customer/ppob?info=' + encodeURIComponent(`Pesanan ${productName} ke ${target} sedang diproses provider. Notifikasi WA akan dikirim setelah berhasil.`));
   } catch (e) {
     logger.error('[PPOB] Digiflazz error: ' + e.message);
     adjustCustomerBalance(customer.id, price, `Refund PPOB error - ${sku}`);
@@ -3599,6 +3616,7 @@ router.post('/ppob/buy', express.urlencoded({ extended: true }), async (req, res
     return redirectErr('Gagal memproses transaksi, saldo dikembalikan. ' + e.message);
   }
 });
+
 
 // ─── TOP-UP SALDO via Payment Gateway ────────────────────────────────────────
 

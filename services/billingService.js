@@ -96,7 +96,8 @@ function computeInvoiceAmountAndMeta(customer, pkg, periodMonth, periodYear) {
 }
 
 function generateMonthlyInvoices(month, year) {
-  const customers = db.prepare("SELECT * FROM customers WHERE status IN ('active','suspended','ditangguhkan') AND package_id IS NOT NULL").all();
+  // Hanya generate untuk pelanggan aktif dan ditangguhkan. Pelanggan isolir (suspended) TIDAK di-generate tagihan baru.
+  const customers = db.prepare("SELECT * FROM customers WHERE status IN ('active','ditangguhkan') AND package_id IS NOT NULL").all();
   const existing  = db.prepare('SELECT customer_id FROM invoices WHERE period_month=? AND period_year=?').all(month, year);
   const existingIds = new Set(existing.map(e => e.customer_id));
   const insert = db.prepare(`INSERT INTO invoices (customer_id, period_month, period_year, amount, notes) VALUES (?, ?, ?, ?, ?)`);
@@ -111,7 +112,7 @@ function generateMonthlyInvoices(month, year) {
       insert.run(c.id, month, year, amount, notesAuto);
       if (bump) bumpPromo.run(c.id);
 
-      // Jika pelanggan berstatus 'ditangguhkan', otomatis ubah kembali ke 'active' saat tagihan baru terbit
+      // Jika pelanggan berstatus 'ditangguhkan', otomatis ubah kembali ke 'active' saat tagihan baru terbit di awal bulan
       if (c.status === 'ditangguhkan') {
         db.prepare("UPDATE customers SET status = 'active' WHERE id = ?").run(c.id);
       }
@@ -147,11 +148,6 @@ function generateInvoiceForCustomer(customerId, month, year) {
   const r = db.prepare('INSERT INTO invoices (customer_id, period_month, period_year, amount, notes) VALUES (?, ?, ?, ?, ?)').run(cid, m, y, amount, notesAuto);
   if (bump) {
     db.prepare('UPDATE customers SET promo_cycles_used = COALESCE(promo_cycles_used,0) + 1 WHERE id=?').run(cid);
-  }
-
-  // Jika pelanggan berstatus 'ditangguhkan', otomatis ubah kembali ke 'active' saat tagihan baru terbit
-  if (customer.status === 'ditangguhkan') {
-    db.prepare("UPDATE customers SET status = 'active' WHERE id = ?").run(cid);
   }
 
   return { created: true, invoiceId: r.lastInsertRowid, customerName: customer.name };

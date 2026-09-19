@@ -336,6 +336,7 @@ db.exec(`
     status TEXT DEFAULT 'pending', 
     paid_at DATETIME,
     fulfilled_at DATETIME,
+    digi_ref_id TEXT DEFAULT '',
     digi_trx_id TEXT DEFAULT '',
     digi_sn TEXT DEFAULT '',
     digi_message TEXT DEFAULT '',
@@ -803,9 +804,11 @@ try { db.exec("ALTER TABLE agent_transactions ADD COLUMN digi_sn TEXT DEFAULT ''
 try { db.exec("ALTER TABLE agent_transactions ADD COLUMN digi_status TEXT DEFAULT ''"); } catch (e) {}
 try { db.exec("ALTER TABLE agent_transactions ADD COLUMN digi_message TEXT DEFAULT ''"); } catch (e) {}
 try { db.exec("ALTER TABLE agent_transactions ADD COLUMN digi_price INTEGER NOT NULL DEFAULT 0"); } catch (e) {}
-try { db.exec("ALTER TABLE agent_transactions ADD COLUMN digi_refunded INTEGER NOT NULL DEFAULT 0"); } catch (e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_agent_tx_digi_ref ON agent_transactions(digi_ref_id)"); } catch (e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_agent_tx_type ON agent_transactions(type)"); } catch (e) {}
+try { db.exec("ALTER TABLE public_ppob_orders ADD COLUMN digi_ref_id TEXT DEFAULT ''"); } catch (e) {}
+try { db.exec("ALTER TABLE public_ppob_orders ADD COLUMN wa_sent INTEGER DEFAULT 0"); } catch (e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_public_ppob_orders_ref ON public_ppob_orders(digi_ref_id)"); } catch (e) {}
 try { db.exec("ALTER TABLE agents ADD COLUMN router_id INTEGER REFERENCES routers(id) ON DELETE SET NULL"); } catch (e) {}
 
 // Kolom untuk Dynamic Speed & FUP di tabel packages

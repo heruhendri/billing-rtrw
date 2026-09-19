@@ -1,5 +1,7 @@
 const dns = require('dns');
 const net = require('net');
+const fs = require('fs');
+const path = require('path');
 const { URL } = require('url');
 const { RouterOSClient } = require('routeros-client');
 const { getSettingsWithCache } = require('../config/settingsManager');
@@ -1798,6 +1800,222 @@ async function removeStaticIp(ip, routerId = null) {
     throw e;
   } finally {
     if (conn && conn.api) conn.api.close();
+  }
+}
+
+function stripAnsi(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
+}
+
+async function getLiveMikrotikExportViaSsh(host, user, password, port = 22, timeoutMs = 30000) {
+  const { Client } = require('ssh2');
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    let output = '';
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        try { conn.end(); } catch {}
+        reject(new Error(`Timeout (${timeoutMs}ms) saat mengambil export langsung dari MikroTik`));
+      }
+    }, timeoutMs);
+
+    conn.on('ready', () => {
+      conn.exec('/export compact', (err, stream) => {
+        if (err) {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            try { conn.end(); } catch {}
+            reject(err);
+          }
+          return;
+        }
+
+        stream.on('data', (data) => {
+          output += data.toString('utf8');
+        });
+
+        stream.stderr.on('data', (data) => {
+          output += data.toString('utf8');
+        });
+
+        stream.on('close', (code) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            try { conn.end(); } catch {}
+            const cleaned = stripAnsi(output).trim();
+            if (cleaned.length > 200) {
+              resolve(cleaned);
+            } else {
+              reject(new Error('Hasil export MikroTik terlalu pendek atau kosong'));
+            }
+          }
+        });
+      });
+    });
+
+    conn.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        try { conn.end(); } catch {}
+        reject(err);
+      }
+    });
+
+    conn.connect({
+      host,
+      port: Number(port) || 22,
+      username: user,
+      password,
+      readyTimeout: 10000,
+      keepaliveInterval: 5000
+    });
+  });
+}
+
+async function getBackup(routerId = null) {
+  try {
+    const rid = (routerId && routerId !== 'all') ? String(routerId) : null;
+    let router = null;
+    if (rid) {
+      router = db.prepare('SELECT * FROM routers WHERE id = ?').get(rid);
+    }
+    if (!router) {
+      router = db.prepare('SELECT * FROM routers WHERE is_active = 1 ORDER BY id ASC LIMIT 1').get();
+    }
+
+    const routerName = router ? router.name : 'MikroTik';
+    const routerHost = router ? router.host : '192.168.8.1';
+    const routerUser = router ? router.user : 'billing';
+    const routerPass = router ? router.password : '060111';
+    const sshPort = Number(router?.ssh_port || 22);
+
+    // 1. PRIORITAS UTAMA: Tarik LIVE /export compact langsung dari console MikroTik via SSH
+    try {
+      logger.info(`[getBackup] Mencoba menarik LIVE backup RSC langsung dari MikroTik (${routerHost}:${sshPort})...`);
+      const liveRsc = await getLiveMikrotikExportViaSsh(routerHost, routerUser, routerPass, sshPort, 25000);
+      if (liveRsc && liveRsc.length > 300) {
+        logger.info(`[getBackup] Berhasil menarik LIVE backup RSC langsung dari MikroTik (${liveRsc.length} bytes).`);
+        return liveRsc;
+      }
+    } catch (sshErr) {
+      logger.warn(`[getBackup] Live export via SSH tidak aktif atau gagal (${sshErr.message}). Beralih ke fallback file tersimpan / database...`);
+    }
+
+    // 2. FALLBACK KEDUA: Jika router 1 (atau default) dan file hasil kurasi ROS7 tersedia di server
+    const ros7RscPath = path.join(__dirname, '..', 'backup_rb4011_ros7_ready.rsc');
+    const baseRscPath = path.join(__dirname, '..', 'backup_rb4011.rsc');
+
+    if ((!rid || rid === '1') && fs.existsSync(ros7RscPath)) {
+      const savedContent = fs.readFileSync(ros7RscPath, 'utf8');
+      if (savedContent && savedContent.length > 500) {
+        return savedContent;
+      }
+    } else if ((!rid || rid === '1') && fs.existsSync(baseRscPath)) {
+      const savedContent = fs.readFileSync(baseRscPath, 'utf8');
+      if (savedContent && savedContent.length > 500) {
+        return savedContent;
+      }
+    }
+
+    // 3. FALLBACK KETIGA: Generate dinamis dari Database Billing (IP Pools, Secrets, Profiles, Queues, Isolir)
+    const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+    const rscLines = [];
+    rscLines.push(`# ===================================================`);
+    rscLines.push(`# ALIJAYANET MIKROTIK RSC BACKUP EXPORT`);
+    rscLines.push(`# Router   : ${routerName} (${routerHost})`);
+    rscLines.push(`# Tanggal  : ${nowStr}`);
+    rscLines.push(`# Format   : RouterOS Script (.rsc) ROS7 Ready`);
+    rscLines.push(`# Generator: Billing RTRW System`);
+    rscLines.push(`# ===================================================\n`);
+
+    // 1. IP Pools
+    rscLines.push(`/ip pool`);
+    rscLines.push(`add name=pool-pppoe ranges=192.168.10.10-192.168.10.250`);
+    rscLines.push(`add name=pool-hotspot ranges=192.168.100.10-192.168.100.250`);
+    rscLines.push(`add name=isolir ranges=192.168.205.10-192.168.205.250\n`);
+
+    // 2. PPP Profiles dari packages
+    const packages = db.prepare('SELECT * FROM packages WHERE is_active = 1').all();
+    rscLines.push(`/ppp profile`);
+    rscLines.push(`add local-address=192.168.205.1 name=isolir rate-limit=2k/2k remote-address=isolir`);
+    for (const pkg of packages) {
+      const up = Number(pkg.speed_up || 0) || 0;
+      const down = Number(pkg.speed_down || 0) || 0;
+      const rateLimit = (up > 0 && down > 0) ? `${Math.round(up/1000)}M/${Math.round(down/1000)}M` : '5M/5M';
+      rscLines.push(`add local-address=192.168.10.1 name="${pkg.name}" rate-limit="${rateLimit}" remote-address=pool-pppoe`);
+    }
+    rscLines.push('');
+
+    // 3. PPP Secrets dari database customers
+    const pppCustomers = db.prepare("SELECT * FROM customers WHERE connection_type = 'pppoe' AND pppoe_username IS NOT NULL AND pppoe_username != ''").all();
+    if (pppCustomers.length > 0) {
+      rscLines.push(`/ppp secret`);
+      for (const c of pppCustomers) {
+        const pkg = packages.find(p => p.id === c.package_id);
+        const profile = (c.status === 'suspended' || c.status === 'isolated') ? (c.isolir_profile || 'isolir') : (pkg ? pkg.name : 'default');
+        const pass = c.pppoe_password || c.pppoe_username;
+        let parts = [`add name="${c.pppoe_username}" password="${pass}" profile="${profile}" service=pppoe`];
+        if (c.name) parts.push(`comment="${c.name.replace(/"/g, '')} - ${c.phone || ''}"`);
+        if (c.status === 'inactive') parts.push(`disabled=yes`);
+        rscLines.push(parts.join(' '));
+      }
+      rscLines.push('');
+    }
+
+    // 4. Hotspot Profiles & Users
+    rscLines.push(`/ip hotspot user profile`);
+    rscLines.push(`add name=default shared-users=1`);
+    for (const pkg of packages) {
+      const up = Number(pkg.speed_up || 0) || 0;
+      const down = Number(pkg.speed_down || 0) || 0;
+      const rateLimit = (up > 0 && down > 0) ? `${Math.round(up/1000)}M/${Math.round(down/1000)}M` : '5M/5M';
+      rscLines.push(`add name="${pkg.name}" rate-limit="${rateLimit}" shared-users=1`);
+    }
+    rscLines.push('');
+
+    const hotspotCustomers = db.prepare("SELECT * FROM customers WHERE connection_type = 'hotspot' AND hotspot_username IS NOT NULL AND hotspot_username != ''").all();
+    if (hotspotCustomers.length > 0) {
+      rscLines.push(`/ip hotspot user`);
+      for (const c of hotspotCustomers) {
+        const pkg = packages.find(p => p.id === c.package_id);
+        const profile = pkg ? pkg.name : 'default';
+        const pass = c.hotspot_password || c.hotspot_username;
+        rscLines.push(`add name="${c.hotspot_username}" password="${pass}" profile="${profile}" comment="${c.name.replace(/"/g, '')}"`);
+      }
+      rscLines.push('');
+    }
+
+    // 5. Static IP Queues
+    const staticCustomers = db.prepare("SELECT * FROM customers WHERE connection_type = 'static' AND static_ip IS NOT NULL AND static_ip != ''").all();
+    if (staticCustomers.length > 0) {
+      rscLines.push(`/queue simple`);
+      for (const c of staticCustomers) {
+        const pkg = packages.find(p => p.id === c.package_id);
+        const up = Number(pkg?.speed_up || 0) || 0;
+        const down = Number(pkg?.speed_down || 0) || 0;
+        const rateLimit = (up > 0 && down > 0) ? `${Math.round(up/1000)}M/${Math.round(down/1000)}M` : '5M/5M';
+        rscLines.push(`add name="QUEUE_${c.name.replace(/"/g, '')}" target="${c.static_ip}/32" max-limit="${rateLimit}" comment="${c.name.replace(/"/g, '')}"`);
+      }
+      rscLines.push('');
+    }
+
+    // 6. Routing & Isolir Rules (ROS7 Ready)
+    rscLines.push(`/routing table\nadd disabled=no fib name=isolir\n`);
+    rscLines.push(`/ip route rule\nadd src-address=192.168.205.0/24 table=isolir\n`);
+    rscLines.push(`/ip firewall nat\nadd action=masquerade chain=srcnat comment="NAT MASQUERADE DEFAULT" out-interface-list=WAN\n`);
+
+    return rscLines.join('\r\n');
+  } catch (err) {
+    logger.error(`[getBackup] Error generating backup: ${err.message}`);
+    return `# Gagal generate backup RSC: ${err.message}\r\n`;
   }
 }
 

@@ -312,6 +312,35 @@ const insertAgentTxRefund = db.prepare(`
   ) VALUES (?, 'topup', ?, ?, 0, ?, ?, ?)
 `);
 
+const selectPublicPpobOrderByRefId = db.prepare(`
+  SELECT id, customer_id, buyer_phone, sku, product_name, target, price, status, wa_sent, digi_ref_id
+  FROM public_ppob_orders
+  WHERE digi_ref_id = ?
+  ORDER BY id DESC
+  LIMIT 1
+`);
+
+const updatePublicPpobOrderSuccessFromWebhook = db.prepare(`
+  UPDATE public_ppob_orders
+  SET status = 'fulfilled',
+      fulfilled_at = (NOW_LOCAL()),
+      digi_trx_id = ?,
+      digi_sn = ?,
+      digi_message = ?,
+      wa_sent = CASE WHEN ? = 1 THEN 1 ELSE wa_sent END,
+      updated_at = (NOW_LOCAL())
+  WHERE id = ?
+`);
+
+const updatePublicPpobOrderFailedFromWebhook = db.prepare(`
+  UPDATE public_ppob_orders
+  SET status = 'failed',
+      digi_trx_id = ?,
+      digi_message = ?,
+      updated_at = (NOW_LOCAL())
+  WHERE id = ?
+`);
+
 function normalizeDigiflazzStatus(status) {
   const s = String(status || '').toLowerCase();
   if (s === 'sukses' || s === 'success') return 'success';
@@ -1001,11 +1030,14 @@ app.post('/webhook/digiflazz', async (req, res) => {
   }
 
   let matchedTxId = null;
+  let matchedPpobOrderId = null;
   try {
+    const nextStatus = normalizeDigiflazzStatus(vendorStatus);
+
+    // 1. Cek matching agent_transactions
     const tx = selectAgentPulsaTxByRefId.get(refId);
     matchedTxId = tx?.id || null;
 
-    const nextStatus = normalizeDigiflazzStatus(vendorStatus);
     if (tx && tx.id) {
       updateAgentPulsaTxFromWebhook.run(
         nextStatus,
@@ -1042,15 +1074,86 @@ app.post('/webhook/digiflazz', async (req, res) => {
         runRefund();
       }
     }
+
+    // 2. Cek matching public_ppob_orders (Pelanggan Web & APK)
+    const custOrder = selectPublicPpobOrderByRefId.get(refId);
+    matchedPpobOrderId = custOrder?.id || null;
+
+    if (custOrder && custOrder.id) {
+      if (nextStatus === 'success') {
+        const wasSentBefore = Number(custOrder.wa_sent || 0) === 1;
+        updatePublicPpobOrderSuccessFromWebhook.run(
+          vendorTrxId,
+          vendorSn,
+          vendorMessage,
+          1,
+          custOrder.id
+        );
+
+        // Kirim notifikasi WA Sukses jika belum pernah dikirim
+        if (!wasSentBefore && custOrder.buyer_phone) {
+          try {
+            const { getSettings } = require('./config/settingsManager');
+            const settings = getSettings();
+            if (settings.whatsapp_enabled) {
+              const { sendWA, whatsappStatus } = await import('./services/whatsappBot.mjs');
+              if (whatsappStatus.connection === 'open') {
+                const custRow = db.prepare('SELECT balance, name FROM customers WHERE id = ?').get(custOrder.customer_id);
+                const curBal = custRow?.balance || 0;
+                await sendWA(custOrder.buyer_phone,
+                  `✅ *TRANSAKSI PPOB BERHASIL*\n\n` +
+                  `Halo *${custRow?.name || 'Pelanggan'}*,\n` +
+                  `Transaksi pembelian produk digital Anda berhasil diproses:\n\n` +
+                  `📦 *Produk:* ${custOrder.product_name}\n` +
+                  `🎯 *Tujuan:* ${custOrder.target}\n` +
+                  `💰 *Harga:* Rp ${Number(custOrder.price || 0).toLocaleString('id-ID')}\n` +
+                  (vendorSn ? `🔢 *SN / Token:* \`${vendorSn}\`\n` : '') +
+                  `💳 *Sisa Saldo:* Rp ${Number(curBal).toLocaleString('id-ID')}\n\n` +
+                  `Terima kasih telah bertransaksi!`
+                );
+              }
+            }
+          } catch (waErr) {
+            logger.error(`[WEBHOOK][digiflazz] WA send error for order #${custOrder.id}: ${waErr.message}`);
+          }
+        }
+      } else if (nextStatus === 'failed') {
+        if (String(custOrder.status || '').toLowerCase() !== 'failed') {
+          updatePublicPpobOrderFailedFromWebhook.run(
+            vendorTrxId,
+            vendorMessage || 'Ditolak provider',
+            custOrder.id
+          );
+
+          // Auto-refund saldo pelanggan
+          if (custOrder.customer_id && custOrder.price > 0) {
+            db.prepare('UPDATE customers SET balance = balance + ? WHERE id = ?').run(custOrder.price, custOrder.customer_id);
+            logger.info(`[WEBHOOK][digiflazz] Refunded customer #${custOrder.customer_id} amount Rp ${custOrder.price} for failed order #${custOrder.id}`);
+          }
+        }
+      }
+    }
+
+    // 3. Cek matching digiflazz_staff_transactions
+    try {
+      db.prepare(`
+        UPDATE digiflazz_staff_transactions
+        SET status = ?, trx_id = ?, sn = ?, message = ?, price = CASE WHEN ? > 0 THEN ? ELSE price END
+        WHERE ref_id = ?
+      `).run(nextStatus, vendorTrxId, vendorSn, vendorMessage, vendorPrice, vendorPrice, refId);
+    } catch (_) {}
+
   } catch (e) {
+    logger.error(`[WEBHOOK][digiflazz] Error processing webhook: ${e.message}`);
     try { insertDigiflazzWebhookLog.run(refId, vendorStatus, String(signature || ''), sigOk, matchedTxId, ip, raw); } catch {}
     return res.status(500).send('Internal Server Error');
   }
 
   try { insertDigiflazzWebhookLog.run(refId, vendorStatus, String(signature || ''), sigOk, matchedTxId, ip, raw); } catch {}
-  logger.info(`[WEBHOOK][digiflazz] event=${eventName || '-'} ua=${userAgent || '-'} ref=${refId} status=${vendorStatus} ok=${sigOk} match=${matchedTxId || '-'}`);
-  return res.json({ success: true, ref_id: refId, matched_agent_tx_id: matchedTxId });
+  logger.info(`[WEBHOOK][digiflazz] event=${eventName || '-'} ua=${userAgent || '-'} ref=${refId} status=${vendorStatus} ok=${sigOk} matchTx=${matchedTxId || '-'} matchOrder=${matchedPpobOrderId || '-'}`);
+  return res.json({ success: true, ref_id: refId, matched_agent_tx_id: matchedTxId, matched_ppob_order_id: matchedPpobOrderId });
 });
+
 
 // Inisialisasi database billing
 try {
@@ -1547,26 +1650,25 @@ app.get(['/terms-of-service', '/terms', '/tos', '/syarat-ketentuan', '/terms.htm
   });
 });
 
-// Route download APK Android Pelanggan
-app.get(['/download/app', '/download/apk', '/downloads/AlijayaCustomer.apk', '/download/AlijayaCustomer.apk'], (req, res) => {
-  const apkPath = path.join(__dirname, 'public', 'downloads', 'AlijayaCustomer.apk');
-  const fallbackPath = path.join(__dirname, 'AlijayaCustomer.apk');
+// Route download APK Android Pelanggan & Admin
+app.get(['/download/app', '/download/apk', '/downloads/billing-rtrw.apk', '/download/billing-rtrw.apk', '/downloads/AlijayaCustomer.apk', '/download/AlijayaCustomer.apk'], (req, res) => {
+  const candidates = [
+    path.join(__dirname, 'public', 'downloads', 'billing-rtrw.apk'),
+    path.join(__dirname, 'billing-rtrw.apk'),
+    path.join(__dirname, 'public', 'downloads', 'AlijayaCustomer.apk'),
+    path.join(__dirname, 'AlijayaCustomer.apk')
+  ];
 
-  let targetPath = null;
-  if (fs.existsSync(apkPath)) {
-    targetPath = apkPath;
-  } else if (fs.existsSync(fallbackPath)) {
-    targetPath = fallbackPath;
-  }
+  const targetPath = candidates.find(p => fs.existsSync(p));
 
   if (targetPath) {
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-    return res.download(targetPath, 'AlijayaCustomer.apk');
+    return res.download(targetPath, 'billing-rtrw.apk');
   }
 
   return res.status(404).json({
     success: false,
-    message: 'File APK belum di-upload ke server VPS. Silakan upload file AlijayaCustomer.apk ke folder public/downloads/ di server.'
+    message: 'File APK belum di-upload ke server VPS. Silakan upload file billing-rtrw.apk ke folder public/downloads/ di server.'
   });
 });
 
