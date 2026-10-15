@@ -11,6 +11,7 @@ const usageSvc = require('./usageService');
 const { getSetting } = require('../config/settingsManager');
 const db = require('../config/database');
 const qrisUtil = require('../utils/qrisUtil');
+const { formatUnpaidInvoicesSummary } = require('./whatsappService');
 
 // Helper: Random delay generator untuk smart rate limiting
 function getRandomDelay(baseDelayMs, varianceMs = 3000) {
@@ -210,6 +211,8 @@ function startCronJobs() {
       `Terima kasih atas kerja samanya.\n` +
       `Salam,\nAdmin ${getSetting('company_header', 'ISP')}`;
     const template = String(db.getAppSetting('whatsapp_auto_billing_message', defaultTemplate) || defaultTemplate);
+    const defaultQrisTemplate = `{Halo|Selamat Pagi|Yth.} Pelanggan {{nama}},\n\n{Berikut|Ini adalah} rincian tagihan + QRIS Pembayaran Anda:\n\n📦 *Paket:* {{paket}}\n📅 *Periode:* {{periode}}\n💰 *Nominal:* Rp {{qris_nominal}}\n\n{Silakan scan|Mohon scan} QRIS terlampir untuk melakukan pembayaran otomatis:\n{{qris_qr}}\n\nTerima kasih.`;
+    const templateQris = String(db.getAppSetting('whatsapp_billing_qris_message', defaultQrisTemplate) || defaultQrisTemplate);
 
     // Filter pelanggan yang perlu diingatkan
     const targetCustomers = [];
@@ -271,11 +274,16 @@ function startCronJobs() {
           await new Promise(r => setTimeout(r, randomDelay));
 
           const unpaidInvoices = billingSvc.getUnpaidInvoicesByCustomerId(c.id);
-          const totalTagihan = unpaidInvoices.reduce((sum, inv) => sum + (Number(inv.amount) || 0), 0);
-          const rincianBulan = unpaidInvoices.map(inv => `${inv.period_month}/${inv.period_year}`).join(', ');
+          const summary = formatUnpaidInvoicesSummary(unpaidInvoices);
+          const totalTagihan = summary.totalAmount;
+          const rincianBulan = summary.periodText;
+          const displayPeriode = summary.isMultiple
+            ? `${summary.periodText}\n\n📋 *Rincian Tunggakan:*\n${summary.breakdownText}`
+            : summary.periodText;
 
           // Process Dynamic QRIS if enabled & available
           let qrisImageBuffer = null;
+          let qrisUniqueCode = 0;
           let finalTagihanStr = totalTagihan.toLocaleString('id-ID');
 
           if (unpaidInvoices.length > 0) {
@@ -329,13 +337,18 @@ function startCronJobs() {
               }
 
               if (amt > 0) {
+                qrisUniqueCode = code;
                 finalTagihanStr = amt.toLocaleString('id-ID');
                 const qrisPayload = String(getSetting('qris_static_payload', '') || '').trim();
                 const qrisEnabledRaw = getSetting('qris_static_enabled', true);
                 const qrisEnabled = !(qrisEnabledRaw === false || qrisEnabledRaw === 'false' || qrisEnabledRaw === 0 || qrisEnabledRaw === '0');
 
                 if (qrisEnabled && qrisPayload && typeof qrisUtil.buildDynamicQrisJpgBuffer === 'function') {
-                  qrisImageBuffer = await qrisUtil.buildDynamicQrisJpgBuffer(qrisPayload, amt);
+                  qrisImageBuffer = await qrisUtil.buildDynamicQrisJpgBuffer(qrisPayload, amt, {
+                    customerName: c.name,
+                    invoiceNumber: inv ? inv.invoice_number : '',
+                    packageName: c.package_name || inv?.package_name || '-'
+                  });
                 }
               }
             } catch (qrisErr) {
@@ -344,10 +357,16 @@ function startCronJobs() {
           }
 
           // Format pesan dengan Spintax & variation untuk anti-spam
-          let formattedMsg = template
+          const activeTemplate = (qrisImageBuffer && templateQris) ? templateQris : template;
+          let formattedMsg = activeTemplate
             .replace(/{{nama}}/gi, c.name || 'Pelanggan')
             .replace(/{{tagihan}}/gi, finalTagihanStr)
-            .replace(/{{rincian}}/gi, rincianBulan || '-')
+            .replace(/{{qris_nominal}}/gi, finalTagihanStr)
+            .replace(/{{qris_kode}}/gi, String(qrisUniqueCode || '').padStart(3, '0'))
+            .replace(/{{qris_qr}}/gi, `QRIS terlampir (gambar).\n🌐 Portal Pelanggan: ${loginLink}`)
+            .replace(/{{rincian_detail}}/gi, summary.isMultiple ? `📋 *Rincian Tunggakan:*\n${summary.breakdownText}` : '')
+            .replace(/{{rincian}}/gi, displayPeriode || '-')
+            .replace(/{{periode}}/gi, displayPeriode || '-')
             .replace(/{{paket}}/gi, c.package_name || '-')
             .replace(/{{link}}/gi, loginLink);
 
@@ -357,7 +376,12 @@ function startCronJobs() {
           // Add subtle variation untuk menghindari spam detection
           formattedMsg = addMessageVariation(formattedMsg, i);
 
-          await waSvc.sendWhatsAppMessage(c.phone, formattedMsg);
+          const sendOptions = {};
+          if (qrisImageBuffer) {
+            sendOptions.image = qrisImageBuffer;
+          }
+
+          await waSvc.sendWhatsAppMessage(c.phone, formattedMsg, sendOptions);
           const ok = true;
           if (ok) {
             sent++;

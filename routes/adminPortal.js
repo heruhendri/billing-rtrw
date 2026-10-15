@@ -270,10 +270,13 @@ async function sendPaymentSuccessWA(customerPhone, customerName, periodText, amo
       periodYear = p[1];
     }
 
+    const custId = extraOpts.customerId || extraOpts.customer_id;
+
     const formattedMsg = whatsappService.formatPaymentSuccessMessage({
+      customerId: custId || null,
       customerName: customerName || 'Pelanggan',
       invoiceId: extraOpts.invoiceId || '',
-      customerUsername: extraOpts.username || extraOpts.customerId || '-',
+      customerUsername: extraOpts.username || custId || '-',
       packageName: extraOpts.packageName || '-',
       periodMonth: periodMonth || periodText,
       periodYear: periodYear || '',
@@ -283,7 +286,8 @@ async function sendPaymentSuccessWA(customerPhone, customerName, periodText, amo
       companyName: company(),
       companyPhone: settings.company_phone || '',
       portalUrl,
-      customTemplate: template
+      customTemplate: template,
+      remainingUnpaidInvoices: extraOpts.remainingUnpaidInvoices || null
     });
 
     return await trySendWhatsappPayment(customerPhone, formattedMsg);
@@ -607,6 +611,26 @@ router.get('/olts/:id/stats', requireAdminSession, async (req, res) => {
     res.json(stats);
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/olts/test-connection', requireAdminSession, restrictToAdmin, express.json(), async (req, res) => {
+  try {
+    const result = await oltSvc.testOltConnection(req.body);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+router.post('/olts/:id/test-connection', requireAdminSession, restrictToAdmin, async (req, res) => {
+  try {
+    const olt = oltSvc.getOltById(req.params.id);
+    if (!olt) return res.status(404).json({ success: false, message: 'OLT tidak ditemukan' });
+    const result = await oltSvc.testOltConnection(olt);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
   }
 });
 
@@ -1127,6 +1151,7 @@ router.post('/collector-payments/:id/approve', requireAdminSession, express.urle
         Number(inv.amount || 0).toLocaleString('id-ID'),
         collectorLabel,
         {
+          customerId: customer.id,
           invoiceId: inv.id,
           username: customer.pppoe_username || customer.id,
           packageName: pkg?.name || customer.package_name || '-',
@@ -1498,33 +1523,120 @@ router.get('/agents/reports', requireAdminSession, requireSidebarMenuAccess('age
   });
 });
 
-router.get('/api/agents/:id/prices', requireAdmin, restrictToAdmin, (req, res) => {
+// Middleware auth khusus JSON API Agen
+function requireAdminForAgentApi(req, res, next) {
+  if (req.session?.isAdmin) return next();
+  const adminKey = getSetting('admin_api_key', '');
+  const providedKey = req.headers['x-admin-key'] || req.query.key;
+  if (adminKey && providedKey === adminKey) return next();
+  return res.status(403).json({ success: false, error: 'Akses ditolak: Hanya Admin yang dapat mengelola harga agent.' });
+}
+
+router.get('/api/agents/:id/prices', requireAdminForAgentApi, (req, res) => {
   try {
-    const rows = agentSvc.getAgentPrices(Number(req.params.id));
-    res.json(rows);
+    const agentId = Number(req.params.id);
+    const agent = agentSvc.getAgentById(agentId);
+    if (!agent) {
+      return res.status(404).json({ success: false, error: 'Agent tidak ditemukan' });
+    }
+    const rows = agentSvc.getAgentPrices(agentId, { includeInactive: true });
+    res.json({
+      success: true,
+      agent: {
+        id: agent.id,
+        name: agent.name,
+        username: agent.username,
+        phone: agent.phone,
+        balance: agent.balance,
+        billing_fee: agent.billing_fee,
+        router_id: agent.router_id,
+        router_name: agent.router_name
+      },
+      prices: rows
+    });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
-router.post('/api/agents/:id/prices', requireAdmin, restrictToAdmin, express.json(), (req, res) => {
+router.post('/api/agents/:id/prices', requireAdminForAgentApi, express.json(), (req, res) => {
   try {
     const agentId = Number(req.params.id);
     const result = agentSvc.upsertAgentHotspotPrice(agentId, req.body);
-    res.json({ success: true, result });
+    res.json({ success: true, message: 'Harga paket berhasil disimpan', result });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(400).json({ success: false, error: e.message });
   }
 });
 
-router.post('/api/agents/:id/prices/:priceId/delete', requireAdmin, restrictToAdmin, (req, res) => {
+router.post('/api/agents/:id/prices/batch', requireAdminForAgentApi, express.json(), (req, res) => {
+  try {
+    const agentId = Number(req.params.id);
+    const agent = agentSvc.getAgentById(agentId);
+    if (!agent) {
+      return res.status(404).json({ success: false, error: 'Agent tidak ditemukan' });
+    }
+
+    const { billing_fee, items } = req.body || {};
+
+    if (billing_fee !== undefined && billing_fee !== null && billing_fee !== '') {
+      const feeNum = Math.max(0, Number(billing_fee) || 0);
+      agentSvc.updateAgent(agentId, { billing_fee: feeNum });
+    }
+
+    let updatedCount = 0;
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        if (!item || !item.profile_name) continue;
+        agentSvc.upsertAgentHotspotPrice(agentId, item);
+        updatedCount++;
+      }
+    }
+
+    const updatedAgent = agentSvc.getAgentById(agentId);
+    const updatedPrices = agentSvc.getAgentPrices(agentId, { includeInactive: true });
+
+    res.json({
+      success: true,
+      message: 'Semua pengaturan harga dan fee agen berhasil disimpan',
+      updatedCount,
+      agent: updatedAgent,
+      prices: updatedPrices
+    });
+  } catch (e) {
+    res.status(400).json({ success: false, error: e.message });
+  }
+});
+
+router.post('/api/agents/:id/prices/reset', requireAdminForAgentApi, express.json(), (req, res) => {
+  try {
+    const agentId = Number(req.params.id);
+    const agent = agentSvc.getAgentById(agentId);
+    if (!agent) {
+      return res.status(404).json({ success: false, error: 'Agent tidak ditemukan' });
+    }
+
+    agentSvc.resetAgentHotspotPrices(agentId);
+    const updatedPrices = agentSvc.getAgentPrices(agentId, { includeInactive: true });
+
+    res.json({
+      success: true,
+      message: 'Harga voucher hotspot agen berhasil dikembalikan ke master default',
+      prices: updatedPrices
+    });
+  } catch (e) {
+    res.status(400).json({ success: false, error: e.message });
+  }
+});
+
+router.post('/api/agents/:id/prices/:priceId/delete', requireAdminForAgentApi, (req, res) => {
   try {
     const agentId = Number(req.params.id);
     const priceId = Number(req.params.priceId);
     const result = agentSvc.deleteAgentHotspotPrice(agentId, priceId);
-    res.json({ success: true, result });
+    res.json({ success: true, message: 'Kustomisasi harga berhasil dihapus', result });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(400).json({ success: false, error: e.message });
   }
 });
 
@@ -2126,6 +2238,23 @@ router.post('/customers/:id/update', requireAdminSession, express.urlencoded({ e
   res.redirect('/admin/customers');
 });
 
+router.post('/customers/delete-bulk', requireAdminSession, express.urlencoded({ extended: true }), async (req, res) => {
+  try {
+    const { customer_ids } = req.body;
+    const ids = Array.isArray(customer_ids) ? customer_ids : [customer_ids];
+    const clean = ids
+      .map(x => Number(x))
+      .filter(n => Number.isFinite(n) && n > 0);
+    if (!clean || clean.length === 0) throw new Error('Tidak ada pelanggan yang dipilih.');
+
+    const deleted = await customerSvc.bulkDeleteCustomers(clean);
+    req.session._msg = { type: 'success', text: `${deleted} data pelanggan berhasil dihapus (Akun PPPoE di MikroTik tetap aman).` };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal hapus massal: ' + e.message };
+  }
+  res.redirect('/admin/customers');
+});
+
 router.post('/customers/:id/delete', requireAdminSession, async (req, res) => {
   try {
     await customerSvc.deleteCustomer(req.params.id);
@@ -2414,6 +2543,7 @@ router.post('/customers/:id/billing/pay', requireAdminSession, express.urlencode
           Number(total || 0).toLocaleString('id-ID'),
           paidBy,
           {
+            customerId: customer.id,
             invoiceId: '',
             username: customer.pppoe_username || customer.id,
             packageName: pkg?.name || customer.package_name || '-',
@@ -2442,6 +2572,7 @@ router.post('/customers/:id/billing/pay', requireAdminSession, express.urlencode
             amount.toLocaleString('id-ID'),
             paidBy,
             {
+              customerId: customer.id,
               invoiceId: inv ? inv.id : '',
               username: customer.pppoe_username || customer.id,
               packageName: pkg?.name || customer.package_name || '-',
@@ -2783,7 +2914,7 @@ router.post('/billing/pay-bulk', requireAdminSession, express.urlencoded({ exten
       if (customer && customer.phone) {
         const total = paidInvoices.reduce((a, b) => a + Number(b.amount || 0), 0);
         const periods = paidInvoices
-          .map(x => `${x.period_month}/${x.period_year}`)
+          .map(x => whatsappService.formatIndonesianPeriod(x.period_month, x.period_year))
           .slice(0, 10)
           .join(', ') + (paidInvoices.length > 10 ? `, +${paidInvoices.length - 10} lainnya` : '');
         const pkg = customer.package_id ? customerSvc.getPackageById(customer.package_id) : null;
@@ -2794,6 +2925,7 @@ router.post('/billing/pay-bulk', requireAdminSession, express.urlencoded({ exten
           Number(total || 0).toLocaleString('id-ID'),
           paidBy,
           {
+            customerId: customer.id,
             invoiceId: paidInvoices.map(x => x.id).join(', '),
             username: customer.pppoe_username || customer.id,
             packageName: pkg?.name || customer.package_name || '-',
@@ -2856,6 +2988,7 @@ router.post('/billing/:id/pay', requireAdminSession, express.urlencoded({ extend
         Number(inv.amount || 0).toLocaleString('id-ID'),
         paidBy,
         {
+          customerId: customer.id,
           invoiceId: inv.id,
           username: customer.pppoe_username || customer.id,
           packageName: pkg?.name || customer.package_name || '-',
@@ -2982,12 +3115,12 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
     }
 
     const unpaidInvoices = billingSvc.getUnpaidInvoicesByCustomerId(customer.id);
-    const totalTagihan = (unpaidInvoices && unpaidInvoices.length > 0)
-      ? unpaidInvoices.reduce((sum, i) => sum + (Number(i.amount) || 0), 0)
-      : Number(inv.amount || 0);
-    const rincianBulan = (unpaidInvoices && unpaidInvoices.length > 0)
-      ? unpaidInvoices.map(i => `${i.period_month}/${i.period_year}`).join(', ')
-      : `${inv.period_month}/${inv.period_year}`;
+    const summary = whatsappService.formatUnpaidInvoicesSummary(
+      (unpaidInvoices && unpaidInvoices.length > 0) ? unpaidInvoices : [inv]
+    );
+    const totalTagihan = summary.totalAmount > 0 ? summary.totalAmount : Number(inv.amount || 0);
+    const rincianBulan = summary.periodText;
+    const rincianDetail = summary.isMultiple ? `📋 *Rincian Tunggakan:*\n${summary.breakdownText}\n` : '';
 
     let qrisAmountUnique = Number(inv.qris_amount_unique || 0) || 0;
     let qrisCode = Number(inv.qris_unique_code || 0) || 0;
@@ -3184,6 +3317,7 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
       baseUrl = parsed.origin;
     } catch {}
     const loginLink = `${baseUrl}/customer/login`;
+    const qrisJpgLink = `${baseUrl}/customer/qris.jpg?amount=${qrisAmountUnique}`;
 
     const comp = company();
     const defaultAutoBilling = `{Halo|Selamat Pagi|Yth.} Pelanggan {{nama}},\n\n{Ini adalah|Berikut} pengingat {sebelum tanggal jatuh tempo|pembayaran tagihan internet} Anda.\n\n📦 *Paket:* {{paket}}\n💰 *Total Tagihan:* Rp {{tagihan}}\n📅 *Periode:* {{rincian}}\n\n{Mohon|Silakan} {segera lakukan|lakukan} pembayaran melalui portal pelanggan: {{link}}\n\n{Terima kasih atas perhatian dan kerja samanya.|Terima kasih.}\nSalam,\nAdmin ${comp}`;
@@ -3197,12 +3331,16 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
     const finalNominal = qrisAmountUnique > 0 ? qrisAmountUnique : totalTagihan;
     const finalNominalStr = Number(finalNominal).toLocaleString('id-ID');
 
-    const qrisJpgLink = `${baseUrl}/customer/qris/static.jpg?amount=${encodeURIComponent(String(finalNominal))}`;
+    const displayPeriode = summary.isMultiple
+      ? `${rincianBulan}\n\n${rincianDetail}`.trim()
+      : rincianBulan;
+
     const qrisJpgCaption = isQrisCase
       ? templateQris
           .replace(/{{nama}}/gi, customer.name || 'Pelanggan')
-          .replace(/{{periode}}/gi, rincianBulan)
-          .replace(/{{rincian}}/gi, rincianBulan)
+          .replace(/{{rincian_detail}}/gi, rincianDetail)
+          .replace(/{{periode}}/gi, displayPeriode)
+          .replace(/{{rincian}}/gi, displayPeriode)
           .replace(/{{paket}}/gi, inv.package_name || customer.package_name || '-')
           .replace(/{{qris_nominal}}/gi, finalNominalStr)
           .replace(/{{tagihan}}/gi, finalNominalStr)
@@ -3213,8 +3351,9 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
     const formattedMsg = isQrisCase
       ? templateQris
           .replace(/{{nama}}/gi, customer.name || 'Pelanggan')
-          .replace(/{{periode}}/gi, rincianBulan)
-          .replace(/{{rincian}}/gi, rincianBulan)
+          .replace(/{{rincian_detail}}/gi, rincianDetail)
+          .replace(/{{periode}}/gi, displayPeriode)
+          .replace(/{{rincian}}/gi, displayPeriode)
           .replace(/{{paket}}/gi, inv.package_name || customer.package_name || '-')
           .replace(/{{qris_nominal}}/gi, finalNominalStr)
           .replace(/{{tagihan}}/gi, finalNominalStr)
@@ -3224,8 +3363,9 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
           .replace(/{{nama}}/gi, customer.name || 'Pelanggan')
           .replace(/{{tagihan}}/gi, finalNominalStr)
           .replace(/{{qris_nominal}}/gi, finalNominalStr)
-          .replace(/{{periode}}/gi, rincianBulan)
-          .replace(/{{rincian}}/gi, rincianBulan)
+          .replace(/{{rincian_detail}}/gi, rincianDetail)
+          .replace(/{{periode}}/gi, displayPeriode)
+          .replace(/{{rincian}}/gi, displayPeriode)
           .replace(/{{paket}}/gi, inv.package_name || customer.package_name || '-')
           .replace(/{{link}}/gi, loginLink);
 
@@ -3234,7 +3374,11 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
       try {
         const payloadNorm = await resolveQrisStaticPayload();
         if (payloadNorm) {
-          const jpg = await qrisUtil.buildDynamicQrisJpgBuffer(payloadNorm, qrisAmountUnique);
+          const jpg = await qrisUtil.buildDynamicQrisJpgBuffer(payloadNorm, qrisAmountUnique, {
+            customerName: customer.name,
+            invoiceNumber: inv.invoice_number,
+            packageName: inv.package_name || customer.package_name || '-'
+          });
           sent = await sendWAImage(customer.phone, jpg, qrisJpgCaption);
         }
       } catch (e) {
@@ -7280,6 +7424,20 @@ router.get('/radius-settings', requireAdminSession, restrictToAdmin, async (req,
     const msg = req.session._msg || null;
     req.session._msg = null;
 
+    let detectedServerIp = '192.168.8.88';
+    try {
+      const ifaces = os.networkInterfaces();
+      for (const ifaceName in ifaces) {
+        for (const alias of ifaces[ifaceName]) {
+          if (alias.family === 'IPv4' && !alias.internal && alias.address !== '127.0.0.1') {
+            detectedServerIp = alias.address;
+            break;
+          }
+        }
+        if (detectedServerIp !== '192.168.8.88') break;
+      }
+    } catch (e) {}
+
     res.render('admin/radius-settings', {
       title: 'Pengaturan RADIUS',
       company: company(),
@@ -7291,6 +7449,7 @@ router.get('/radius-settings', requireAdminSession, restrictToAdmin, async (req,
       nasList,
       todayTrafficMB,
       todayEvents,
+      serverIp: detectedServerIp,
       msg
     });
   } catch (error) {
@@ -7363,6 +7522,21 @@ router.post('/radius/disconnect', requireAdminSession, restrictToAdmin, async (r
   } catch (e) {
     logger.error('Error disconnecting RADIUS session:', e);
     req.session._msg = { type: 'danger', text: 'Gagal memutus sesi RADIUS: ' + e.message };
+  }
+  res.redirect('/admin/radius-settings');
+});
+
+router.post('/radius/clear-stale', requireAdminSession, restrictToAdmin, async (req, res) => {
+  try {
+    const result = db.prepare(`
+      UPDATE radius_accounting
+      SET status_type = 2, terminate_cause = 10, updated_at = NOW_LOCAL()
+      WHERE status_type IN (1, 3) AND updated_at < datetime('now', '-2 hours')
+    `).run();
+    req.session._msg = { type: 'success', text: `Berhasil membersihkan ${result.changes} sesi kadaluarsa / ghost.` };
+  } catch (e) {
+    logger.error('Error clearing stale RADIUS sessions:', e);
+    req.session._msg = { type: 'danger', text: 'Gagal membersihkan sesi: ' + e.message };
   }
   res.redirect('/admin/radius-settings');
 });

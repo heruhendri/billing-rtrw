@@ -3079,11 +3079,40 @@ router.post('/app/customer/topup/create', requireCustomerApiAuth, async (req, re
 
     const customer = req.customer;
 
-    // Generate unique code 1-999
-    const uniqueCode = Math.floor(1 + Math.random() * 998);
-    const totalAmount = amount + uniqueCode;
+    // Generate unique code (1-999) without collision
+    let uniqueCode = 0;
+    let totalAmount = 0;
+    if (customerId > 0) {
+      const prefCode = (customerId % 499 === 0) ? 499 : (customerId % 499);
+      const prefAmt = amount + prefCode;
+      const chk = db.prepare('SELECT id FROM customer_topup_requests WHERE status=? AND qris_amount_unique=? LIMIT 1').get('pending', prefAmt);
+      if (!chk) {
+        uniqueCode = prefCode;
+        totalAmount = prefAmt;
+      }
+    }
+    if (!totalAmount) {
+      for (let c = 1; c <= 999; c++) {
+        const testAmt = amount + c;
+        const chk = db.prepare('SELECT id FROM customer_topup_requests WHERE status=? AND qris_amount_unique=? LIMIT 1').get('pending', testAmt);
+        if (!chk) {
+          uniqueCode = c;
+          totalAmount = testAmt;
+          break;
+        }
+      }
+    }
+    if (!totalAmount) {
+      uniqueCode = Math.floor(1 + Math.random() * 998);
+      totalAmount = amount + uniqueCode;
+    }
 
-    const ins = db.prepare(`INSERT INTO customer_topup_requests (customer_id, amount, status) VALUES (?, ?, 'pending')`).run(customerId, totalAmount);
+    const ins = db.prepare(`
+      INSERT INTO customer_topup_requests (
+        customer_id, amount, payment_gateway, payment_order_id, payment_link,
+        qris_unique_code, qris_amount_unique, qris_assigned_at, status
+      ) VALUES (?, ?, 'qris_static', '', '', ?, ?, (NOW_LOCAL()), 'pending')
+    `).run(customerId, amount, uniqueCode, totalAmount);
     const reqId = Number(ins.lastInsertRowid);
 
     // Static / Dynamic QRIS payload
@@ -3091,14 +3120,15 @@ router.post('/app/customer/topup/create', requireCustomerApiAuth, async (req, re
     let qrisPayload = settings.qris_static_payload || settings.qris_string || '';
 
     // If static payload, modify with total amount if possible
-    if (qrisPayload && qrisUtil && qrisUtil.createDynamicQris) {
+    if (qrisPayload && qrisUtil && qrisUtil.convertStaticQrisToDynamic) {
       try {
-        qrisPayload = qrisUtil.createDynamicQris(qrisPayload, totalAmount);
+        qrisPayload = qrisUtil.convertStaticQrisToDynamic(qrisPayload, totalAmount);
       } catch (_) {}
     }
 
-    db.prepare('UPDATE customer_topup_requests SET payment_payload = ?, updated_at = (NOW_LOCAL()) WHERE id = ?')
-      .run(JSON.stringify({ total_amount: totalAmount, unique_code: uniqueCode, qris_string: qrisPayload }), reqId);
+    const payLink = `/customer/topup/pay/${reqId}`;
+    db.prepare('UPDATE customer_topup_requests SET payment_order_id = ?, payment_link = ?, payment_reference = ?, payment_payload = ?, updated_at = (NOW_LOCAL()) WHERE id = ?')
+      .run(`TOPUP-${reqId}`, payLink, `TOPUP-${reqId}`, JSON.stringify({ total_amount: totalAmount, unique_code: uniqueCode, qris_string: qrisPayload }), reqId);
 
     res.json({
       success: true,
@@ -4946,9 +4976,45 @@ router.post('/invoices/:id/pay', requireCustomerApiAuth, async (req, res) => {
   const returnPath = `/customer/invoice/${invId}`;
   const opts = { orderPrefix: 'INV', returnPath, callbackPath: '/customer/payment/callback' };
 
+  const configuredGateway = paymentSvc.resolveConfiguredGatewayForAmount(settings, inv.amount) || 'tripay';
+  const reqGateway = req.body.gateway ? String(req.body.gateway).toLowerCase() : null;
+  const selectedGateway = reqGateway || configuredGateway;
+
+  if (selectedGateway === 'qris_static' || String(method).toUpperCase() === 'QRIS_STATIC') {
+    const qrisInfo = ensureCustomerApiInvoiceQrisUnique(inv);
+    const totalAmt = qrisInfo.amountUnique || Number(inv.amount || 0);
+    let rawPayload = String(settings.qris_static_payload || '').trim();
+    let qrisPayload = '';
+    if (rawPayload && qrisUtil && qrisUtil.convertStaticQrisToDynamic) {
+      try {
+        qrisPayload = qrisUtil.convertStaticQrisToDynamic(rawPayload, totalAmt);
+      } catch (_) {
+        qrisPayload = rawPayload;
+      }
+    }
+    const qrImageEndpoint = `${appUrl}/api/customer/invoices/${inv.id}/qris-image`;
+    const payLink = `${appUrl}/customer/payment/create/${inv.id}`;
+
+    return res.json({
+      success: true,
+      data: {
+        invoiceId: inv.id,
+        gateway: 'qris_static',
+        method: 'QRIS',
+        orderId: `INV-${inv.id}`,
+        paymentLink: payLink,
+        qrUrl: qrImageEndpoint,
+        payload: {
+          total_amount: totalAmt,
+          unique_code: qrisInfo.uniqueCode,
+          qris_payload: qrisPayload
+        }
+      }
+    });
+  }
+
   try {
     let result;
-    const selectedGateway = String(gateway).toLowerCase();
 
     if (selectedGateway === 'midtrans') {
       result = await paymentSvc.createMidtransTransaction(inv, customer, method === 'SNAP' ? 'snap' : method, appUrl, opts);

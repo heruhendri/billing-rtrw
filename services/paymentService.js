@@ -471,6 +471,12 @@ function isEnabledFlag(val) {
 
 function isGatewayConfigured(settings, gateway) {
   const g = String(gateway || '').toLowerCase();
+  if (g === 'qris_static') {
+    return (
+      isEnabledFlag(settings?.qris_static_enabled) &&
+      Boolean(String(settings?.qris_static_payload || settings?.qris_static_qr_url || '').trim())
+    );
+  }
   if (g === 'tripay') {
     return (
       isEnabledFlag(settings.tripay_enabled) &&
@@ -495,6 +501,16 @@ function isGatewayConfigured(settings, gateway) {
   return false;
 }
 
+function resolveConfiguredGateway(settings) {
+  const def = String(settings?.default_gateway || 'tripay').toLowerCase();
+  const order = ['qris_static', 'tripay', 'midtrans', 'xendit', 'duitku'];
+  if (isGatewayConfigured(settings, def)) return def;
+  for (const g of order) {
+    if (isGatewayConfigured(settings, g)) return g;
+  }
+  return null;
+}
+
 function resolveConfiguredGatewayForAmount(settings, amount) {
   const amt = Number(amount || 0) || 0;
   const min = {
@@ -510,7 +526,7 @@ function resolveConfiguredGatewayForAmount(settings, amount) {
 
   const ok = (g) => {
     if (g === 'qris_static') {
-      const enabled = isEnabledFlag(settings?.qris_static_enabled) && (settings?.qris_static_payload || settings?.qris_static_qr_url);
+      const enabled = isGatewayConfigured(settings, 'qris_static');
       if (!enabled) return false;
       const minAmt = min[g] ?? 0;
       return amt >= minAmt;
@@ -541,6 +557,7 @@ module.exports = {
   verifyDuitkuWebhook,
   getFallbackEmail,
   isGatewayConfigured,
+  resolveConfiguredGateway,
   resolveConfiguredGatewayForAmount
 };
 

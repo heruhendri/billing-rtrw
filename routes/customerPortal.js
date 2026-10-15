@@ -231,6 +231,12 @@ function isEnabledFlag(v) {
 function isGatewayConfigured(settings, gateway) {
   const g = String(gateway || '').toLowerCase();
   if (!settings) return false;
+  if (g === 'qris_static') {
+    return (
+      isEnabledFlag(settings.qris_static_enabled) &&
+      Boolean(String(settings.qris_static_payload || settings.qris_static_qr_url || '').trim())
+    );
+  }
   if (g === 'tripay') {
     return (
       isEnabledFlag(settings.tripay_enabled) &&
@@ -257,7 +263,7 @@ function isGatewayConfigured(settings, gateway) {
 
 function resolveConfiguredGateway(settings) {
   const def = String(settings?.default_gateway || 'tripay').toLowerCase();
-  const order = ['tripay', 'midtrans', 'xendit', 'duitku'];
+  const order = ['qris_static', 'tripay', 'midtrans', 'xendit', 'duitku'];
   if (isGatewayConfigured(settings, def)) return def;
   for (const g of order) {
     if (isGatewayConfigured(settings, g)) return g;
@@ -283,7 +289,7 @@ function resolveConfiguredGatewayForAmount(settings, amount) {
   const ok = (g) => {
     // QRIS Static check
     if (g === 'qris_static') {
-      const enabled = settings?.qris_static_enabled && settings?.qris_static_payload;
+      const enabled = isGatewayConfigured(settings, 'qris_static');
       if (!enabled) return false;
       const minAmt = min[g] ?? 0;
       return amt >= minAmt;
@@ -425,12 +431,18 @@ function isQrisAmountAvailable(amount, opts = {}) {
   if (!Number.isFinite(amt) || amt <= 0) return false;
   const excludeInvoiceId = Number(opts.excludeInvoiceId || 0);
   const excludeVoucherOrderId = Number(opts.excludeVoucherOrderId || 0);
+  const excludeTopupId = Number(opts.excludeTopupId || 0);
 
   const inv = db.prepare('SELECT id FROM invoices WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1').get('unpaid', amt, excludeInvoiceId);
   if (inv && inv.id) return false;
 
   const ord = db.prepare('SELECT id FROM public_voucher_orders WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1').get('pending', amt, excludeVoucherOrderId);
   if (ord && ord.id) return false;
+
+  try {
+    const topup = db.prepare('SELECT id FROM customer_topup_requests WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1').get('pending', amt, excludeTopupId);
+    if (topup && topup.id) return false;
+  } catch (e) {}
 
   return true;
 }
@@ -605,6 +617,67 @@ function ensureVoucherOrderQrisUnique(order, force = false) {
 
   if (!chosenAmount) throw new Error('Gagal membuat nominal unik (slot 1-999 penuh).');
   update.run(chosenCode, chosenAmount, orderId);
+
+  return { uniqueCode: chosenCode, amountUnique: chosenAmount };
+}
+
+function ensureTopupQrisUnique(topup, force = false) {
+  const topupId = Number(topup?.id || 0);
+  if (!Number.isFinite(topupId) || topupId <= 0) throw new Error('Top-up ID tidak valid');
+  if (String(topup?.status) !== 'pending') throw new Error('Hanya top-up status pending yang bisa dibuat kode QRIS.');
+
+  const custId = Number(topup?.customer_id || 0);
+  const baseAmount = Number(topup?.amount || 0);
+  if (!Number.isFinite(baseAmount) || baseAmount <= 0) throw new Error('Nominal top-up tidak valid');
+
+  const currentAmount = Number(topup?.qris_amount_unique || 0) || 0;
+  const currentCode = Number(topup?.qris_unique_code || 0) || 0;
+  if (!force && currentAmount > 0 && currentCode > 0 && (currentAmount - currentCode === baseAmount)) {
+    return { uniqueCode: currentCode, amountUnique: currentAmount };
+  }
+
+  const update = db.prepare(`
+    UPDATE customer_topup_requests
+    SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL()), updated_at=(NOW_LOCAL())
+    WHERE id=?
+  `);
+
+  let chosenCode = 0;
+  let chosenAmount = 0;
+
+  if (custId > 0) {
+    const prefCode = (custId % 499 === 0) ? 499 : (custId % 499);
+    const prefAmount = baseAmount + prefCode;
+    if (isQrisAmountAvailable(prefAmount, { excludeTopupId: topupId })) {
+      chosenCode = prefCode;
+      chosenAmount = prefAmount;
+    }
+  }
+
+  if (!chosenAmount) {
+    for (let code = 1; code <= 499; code++) {
+      const amount = baseAmount + code;
+      if (isQrisAmountAvailable(amount, { excludeTopupId: topupId })) {
+        chosenCode = code;
+        chosenAmount = amount;
+        break;
+      }
+    }
+  }
+
+  if (!chosenAmount) {
+    for (let code = 500; code <= 999; code++) {
+      const amount = baseAmount + code;
+      if (isQrisAmountAvailable(amount, { excludeTopupId: topupId })) {
+        chosenCode = code;
+        chosenAmount = amount;
+        break;
+      }
+    }
+  }
+
+  if (!chosenAmount) throw new Error('Gagal membuat nominal unik (slot 1-999 penuh).');
+  update.run(chosenCode, chosenAmount, topupId);
 
   return { uniqueCode: chosenCode, amountUnique: chosenAmount };
 }
@@ -795,7 +868,11 @@ router.get('/check-billing', async (req, res) => {
   let paymentChannels = [];
 
   const gateway = resolveConfiguredGateway(settings);
-  if (gateway === 'tripay') {
+  if (gateway === 'qris_static') {
+    paymentChannels = [
+      { code: 'QRIS_STATIC', name: 'QRIS (Dinamis / Otomatis)', group: 'QRIS', active: true }
+    ];
+  } else if (gateway === 'tripay') {
     try {
       paymentChannels = await paymentSvc.getTripayChannels();
     } catch {
@@ -2453,7 +2530,10 @@ router.post('/public/payment/create/:invoiceId', async (req, res) => {
     }
 
     const selectedMethod = String(req.body.method || 'QRIS').toUpperCase();
-    if (selectedMethod === 'QRIS_STATIC') {
+    const gateway = resolveConfiguredGatewayForAmount(settings, inv.amount);
+    if (!gateway) throw new Error('Payment gateway belum dikonfigurasi atau nominal terlalu kecil untuk gateway aktif');
+
+    if (gateway === 'qris_static' || selectedMethod === 'QRIS_STATIC') {
       const { uniqueCode, amountUnique } = ensureInvoiceQrisUnique(inv, false);
       const qrisQrUrl = await getStaticQrisQrUrlForAmount(settings, amountUnique);
       if (!qrisQrUrl) throw new Error('QRIS statis belum diatur oleh admin');
@@ -2479,7 +2559,7 @@ router.post('/public/payment/create/:invoiceId', async (req, res) => {
     }
 
     const force = String(req.query.force || '').toLowerCase() === '1' || String(req.query.force || '').toLowerCase() === 'true';
-    if (!force && inv.payment_link) {
+    if (!force && inv.payment_link && inv.payment_gateway === gateway) {
       let expiresAtMs = inv.payment_expires_at ? new Date(inv.payment_expires_at).getTime() : 0;
       let payloadExpiresAt = null;
       if (inv.payment_payload) {
@@ -2510,8 +2590,6 @@ router.post('/public/payment/create/:invoiceId', async (req, res) => {
       }
     }
 
-    const gateway = resolveConfiguredGatewayForAmount(settings, inv.amount);
-    if (!gateway) throw new Error('Payment gateway belum dikonfigurasi atau nominal terlalu kecil untuk gateway aktif');
     let method = selectedMethod;
     const cust = customerSvc.getCustomerById(inv.customer_id);
 
@@ -2760,9 +2838,37 @@ router.get('/payment/create/:invoiceId', async (req, res) => {
     }
 
     const methodRaw = String(req.query.method || 'QRIS').toUpperCase();
+    const gateway = resolveConfiguredGatewayForAmount(settings, inv.amount);
+    if (!gateway) throw new Error('Payment gateway belum dikonfigurasi atau nominal terlalu kecil untuk gateway aktif');
+    
+    // Jika gateway adalah QRIS Static, auto-use QRIS_STATIC method
+    if (gateway === 'qris_static') {
+      const { uniqueCode, amountUnique } = ensureInvoiceQrisUnique(inv, false);
+      const qrisQrUrl = await getStaticQrisQrUrlForAmount(settings, amountUnique);
+      if (!qrisQrUrl) throw new Error('QRIS statis belum diatur oleh admin');
+      const adminWaDigits = getFirstAdminWaDigits(settings);
+      return res.render('qris_static', {
+        settings,
+        backUrl: loginId ? '/customer/dashboard#billing-section' : '/isolated',
+        error: null,
+        info: null,
+        kind: 'invoice',
+        invoiceId: Number(inv.id),
+        periodText: `${inv.period_month}/${inv.period_year}`,
+        customerName: profile?.name || inv.customer_name || '',
+        amountUnique,
+        uniqueCode,
+        qrisQrUrl,
+        helpText: 'Pastikan nominal dibayar sama persis agar sistem dapat mendeteksi pembayaran.',
+        adminWaDigits,
+        publicToken: publicToken || '',
+        proofUrl: '',
+        proofActionUrl: '/customer/payment/proof/' + encodeURIComponent(String(inv.id))
+      });
+    }
 
     const force = String(req.query.force || '').toLowerCase() === '1' || String(req.query.force || '').toLowerCase() === 'true';
-    if (!force && inv.payment_link) {
+    if (!force && inv.payment_link && inv.payment_gateway === gateway) {
       let expiresAtMs = inv.payment_expires_at ? new Date(inv.payment_expires_at).getTime() : 0;
       let payloadExpiresAt = null;
       if (inv.payment_payload) {
@@ -2791,35 +2897,6 @@ router.get('/payment/create/:invoiceId', async (req, res) => {
         logger.info(`[Payment] Reusing existing link for INV-${inv.id}`);
         return res.redirect(inv.payment_link);
       }
-    }
-
-    const gateway = resolveConfiguredGatewayForAmount(settings, inv.amount);
-    if (!gateway) throw new Error('Payment gateway belum dikonfigurasi atau nominal terlalu kecil untuk gateway aktif');
-    
-    // Jika gateway adalah QRIS Static, auto-use QRIS_STATIC method
-    if (gateway === 'qris_static') {
-      const { uniqueCode, amountUnique } = ensureInvoiceQrisUnique(inv, false);
-      const qrisQrUrl = await getStaticQrisQrUrlForAmount(settings, amountUnique);
-      if (!qrisQrUrl) throw new Error('QRIS statis belum diatur oleh admin');
-      const adminWaDigits = getFirstAdminWaDigits(settings);
-      return res.render('qris_static', {
-        settings,
-        backUrl: loginId ? '/customer/dashboard#billing-section' : '/isolated',
-        error: null,
-        info: null,
-        kind: 'invoice',
-        invoiceId: Number(inv.id),
-        periodText: `${inv.period_month}/${inv.period_year}`,
-        customerName: profile?.name || inv.customer_name || '',
-        amountUnique,
-        uniqueCode,
-        qrisQrUrl,
-        helpText: 'Pastikan nominal dibayar sama persis agar sistem dapat mendeteksi pembayaran.',
-        adminWaDigits,
-        publicToken: publicToken || '',
-        proofUrl: '',
-        proofActionUrl: '/customer/payment/proof/' + encodeURIComponent(String(inv.id))
-      });
     }
     
     let method =
@@ -3636,6 +3713,10 @@ router.get('/topup', async (req, res) => {
     const gateway = resolveConfiguredGateway(settings);
     if (!gateway) {
       paymentChannels = [];
+    } else if (gateway === 'qris_static') {
+      paymentChannels = [
+        { code: 'QRIS_STATIC', name: 'QRIS Dinamis (Kode Unik)', group: 'E-Wallet', active: true }
+      ];
     } else if (gateway === 'tripay') {
       paymentChannels = await paymentSvc.getTripayChannels();
     } else if (gateway === 'midtrans') {
@@ -3686,7 +3767,7 @@ router.get('/topup', async (req, res) => {
   });
 });
 
-// Proses request top-up → redirect ke Payment Gateway
+// Proses request top-up → redirect ke Payment Gateway atau QRIS Dinamis
 router.post('/topup/create', express.urlencoded({ extended: true }), async (req, res) => {
   const states = sidebarMenuSvc.getStoredMenuStates();
   if (states['digiflazz'] !== 'visible') {
@@ -3711,6 +3792,18 @@ router.post('/topup/create', express.urlencoded({ extended: true }), async (req,
     const appUrl = settings.app_url || `${protocol}://${req.get('host')}`;
     const gateway = resolveConfiguredGatewayForAmount(settings, amount);
     if (!gateway) throw new Error('Payment gateway belum dikonfigurasi atau nominal terlalu kecil untuk gateway aktif');
+
+    // Jika gateway aktif adalah QRIS Dinamis (kode unik)
+    if (gateway === 'qris_static' || method === 'QRIS_STATIC') {
+      const topupRow = db.prepare('SELECT * FROM customer_topup_requests WHERE id=?').get(reqId);
+      const { uniqueCode, amountUnique } = ensureTopupQrisUnique(topupRow, false);
+      const payLink = `/customer/topup/pay/${reqId}`;
+      const payloadObj = { total_amount: amountUnique, unique_code: uniqueCode, method: 'QRIS_STATIC' };
+      db.prepare(`UPDATE customer_topup_requests SET payment_gateway='qris_static', payment_order_id=?, payment_link=?, payment_reference=?, payment_payload=?, updated_at=(NOW_LOCAL()) WHERE id=?`)
+        .run(`TOPUP-${reqId}`, payLink, `TOPUP-${reqId}`, JSON.stringify(payloadObj), reqId);
+      return res.redirect(payLink);
+    }
+
     let tripayChannels = null;
     let tripayCandidates = null;
     if (gateway === 'tripay') {
@@ -3765,6 +3858,108 @@ router.post('/topup/create', express.urlencoded({ extended: true }), async (req,
   } catch(e) {
     logger.error('[Topup] Error: ' + e.message);
     return redirectErr('Gagal membuat pembayaran: ' + e.message);
+  }
+});
+
+// Halaman Pembayaran QRIS Top-Up Pelanggan
+router.get('/topup/pay/:id', async (req, res) => {
+  try {
+    if (!req.session.phone) return res.redirect('/customer/login?next=' + encodeURIComponent(req.originalUrl));
+    const customer = customerSvc.findCustomerByAny(req.session.phone);
+    if (!customer) return res.redirect('/customer/login');
+
+    const topupId = Number(req.params.id || 0);
+    const topup = db.prepare('SELECT * FROM customer_topup_requests WHERE id = ? AND customer_id = ?').get(topupId, customer.id);
+    if (!topup) return res.redirect('/customer/topup?err=' + encodeURIComponent('Data top-up tidak ditemukan.'));
+
+    if (topup.status === 'paid') {
+      return res.redirect('/customer/topup?info=' + encodeURIComponent('Top-up ini sudah berhasil dibayar.'));
+    }
+
+    const settings = getSettingsWithCache();
+    const { uniqueCode, amountUnique } = ensureTopupQrisUnique(topup, false);
+    const qrisQrUrl = await getStaticQrisQrUrlForAmount(settings, amountUnique);
+    if (!qrisQrUrl) throw new Error('QRIS statis belum diatur oleh admin');
+    const adminWaDigits = getFirstAdminWaDigits(settings);
+
+    let proofUrl = '';
+    try {
+      const pObj = topup.payment_payload ? JSON.parse(topup.payment_payload) : {};
+      if (pObj && pObj.proof_url) proofUrl = pObj.proof_url;
+    } catch {}
+
+    return res.render('qris_static', {
+      settings,
+      backUrl: '/customer/topup',
+      error: null,
+      info: req.query.info ? String(req.query.info) : null,
+      kind: 'topup',
+      invoiceId: Number(topup.id),
+      periodText: 'Top-Up Saldo Pelanggan',
+      customerName: customer.name || '',
+      amountUnique,
+      uniqueCode,
+      qrisQrUrl,
+      helpText: 'Pastikan nominal transfer/scan QRIS tepat hingga 3 digit terakhir agar saldo otomatis masuk.',
+      adminWaDigits,
+      publicToken: '',
+      proofUrl,
+      proofActionUrl: '/customer/topup/proof/' + encodeURIComponent(String(topup.id))
+    });
+  } catch (e) {
+    logger.error(`[TopupPay] Error: ${e.message}`);
+    return res.redirect('/customer/topup?err=' + encodeURIComponent('Gagal membuka halaman pembayaran: ' + e.message));
+  }
+});
+
+// Cek status Top-Up untuk auto-polling
+router.get('/topup/status/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id || 0);
+    const topup = db.prepare('SELECT id, customer_id, amount, status, paid_at FROM customer_topup_requests WHERE id = ?').get(id);
+    if (!topup) return res.status(404).json({ error: 'Top-up tidak ditemukan', status: 'error' });
+
+    return res.json({
+      success: true,
+      status: String(topup.status || 'pending'),
+      paid_at: topup.paid_at || null
+    });
+  } catch (e) {
+    return res.status(500).json({ error: 'Internal error', status: 'error' });
+  }
+});
+
+// Upload Bukti Pembayaran Top-Up
+router.post('/topup/proof/:id', uploadProof.single('proof'), async (req, res) => {
+  try {
+    if (!req.session.phone) return res.redirect('/customer/login');
+    const customer = customerSvc.findCustomerByAny(req.session.phone);
+    if (!customer) return res.redirect('/customer/login');
+
+    const topupId = Number(req.params.id || 0);
+    const topup = db.prepare('SELECT * FROM customer_topup_requests WHERE id = ? AND customer_id = ?').get(topupId, customer.id);
+    if (!topup) return res.redirect('/customer/topup?err=' + encodeURIComponent('Top-up tidak ditemukan'));
+
+    if (topup.status === 'paid') {
+      return res.redirect('/customer/topup?info=' + encodeURIComponent('Top-up ini sudah lunas.'));
+    }
+
+    if (!req.file) {
+      return res.redirect('/customer/topup/pay/' + topupId + '?err=' + encodeURIComponent('File bukti transfer wajib diunggah.'));
+    }
+
+    const proofUrl = `/uploads/proofs/${req.file.filename}`;
+    let pObj = {};
+    try { pObj = topup.payment_payload ? JSON.parse(topup.payment_payload) : {}; } catch {}
+    pObj.proof_url = proofUrl;
+    pObj.proof_uploaded_at = new Date().toISOString();
+
+    db.prepare('UPDATE customer_topup_requests SET payment_payload = ?, updated_at = (NOW_LOCAL()) WHERE id = ?')
+      .run(JSON.stringify(pObj), topupId);
+
+    return res.redirect('/customer/topup/pay/' + topupId + '?info=' + encodeURIComponent('Bukti transfer berhasil diunggah. Menunggu verifikasi admin/sistem.'));
+  } catch (e) {
+    return res.redirect('/customer/topup?err=' + encodeURIComponent('Gagal upload bukti: ' + e.message));
   }
 });
 

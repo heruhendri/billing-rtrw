@@ -437,15 +437,31 @@ const oidUnderBase = (rawOid, baseOid) => {
   return normRaw.startsWith(normBase + '.') || normRaw === normBase;
 };
 
+function formatSnWithColons(val) {
+  if (!val || typeof val !== 'string') return val;
+  const clean = val.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+  // Jika 12 karakter hex (MAC address format MikroTik, misal 2C334187A820 -> 2C:33:41:87:A8:20)
+  if (/^[0-9A-F]{12}$/.test(clean)) {
+    return clean.match(/.{1,2}/g).join(':');
+  }
+  // Jika 16 karakter hex (8 bytes GPON hex)
+  if (/^[0-9A-F]{16}$/.test(clean)) {
+    return clean.match(/.{1,2}/g).join(':');
+  }
+  return val;
+}
+
 const decodeSn = (val) => {
   if (!val) return 'N/A';
+  let res = '';
   if (Buffer.isBuffer(val)) {
     const ascii = val.toString('utf8').replace(/\0/g, '').trim();
     const looksAscii = ascii.length >= 4 && /^[\x20-\x7E]+$/.test(ascii);
-    if (looksAscii) return ascii.toUpperCase();
-    return val.toString('hex').toUpperCase();
+    res = looksAscii ? ascii.toUpperCase() : val.toString('hex').toUpperCase();
+  } else {
+    res = val.toString().toUpperCase();
   }
-  return val.toString().toUpperCase();
+  return formatSnWithColons(res);
 };
 
 /**
@@ -502,7 +518,7 @@ const telnetReadUntil = (socket, matcher, timeoutMs) => {
     const onData = (chunk) => {
       const s = chunk.toString('utf8');
       buf += s;
-      if (buf.includes('--More--') || buf.includes('--Press Enter--')) {
+      if (buf.includes('--More--') || buf.includes('--Press Enter--') || buf.includes('Enter Key To Continue')) {
         socket.write(' ');
       }
       if (typeof matcher === 'function' ? matcher(buf) : matcher.test(buf)) {
@@ -605,51 +621,83 @@ const parseHiosoOnuTable = (text) => {
     const t = line.trim();
     if (!/^0\/\d+:\d+/.test(t)) continue;
     const parts = t.split(/\s+/);
-    if (parts.length < 22) continue;
+    if (parts.length >= 20) {
+      // 22-column legacy format
+      const id = parts[0];
+      const name = parts[1];
+      const mac = parts[2];
+      const status = parts[3];
+      const fwVersion = parts[4];
+      const chipId = parts[5];
+      const ports = parts[6];
+      const rtt = parts[7];
+      const distance = parts[8];
+      const ctcStatus = parts[9];
+      const ctcVer = parts[10];
+      const activate = parts[11];
+      const temperature = parts[12];
+      const txPower = parts[13];
+      const rxPower = parts[14];
+      const onlineTime = parts[15] + ' ' + parts[16];
+      const offlineTime = parts[17] + ' ' + parts[18];
+      const offlineReason = parts[19];
+      const deregisterCnt = parts[parts.length - 1];
+      const online = parts.slice(20, parts.length - 1).join(' ');
 
-    const id = parts[0];
-    const name = parts[1];
-    const mac = parts[2];
-    const status = parts[3];
-    const fwVersion = parts[4];
-    const chipId = parts[5];
-    const ports = parts[6];
-    const rtt = parts[7];
-    const distance = parts[8];
-    const ctcStatus = parts[9];
-    const ctcVer = parts[10];
-    const activate = parts[11];
-    const temperature = parts[12];
-    const txPower = parts[13];
-    const rxPower = parts[14];
-    const onlineTime = parts[15] + ' ' + parts[16];
-    const offlineTime = parts[17] + ' ' + parts[18];
-    const offlineReason = parts[19];
-    const deregisterCnt = parts[parts.length - 1];
-    const online = parts.slice(20, parts.length - 1).join(' ');
+      rows.push({
+        id,
+        name: name === 'NA' ? null : name,
+        mac: formatSnWithColons(mac),
+        status,
+        fwVersion,
+        chipId,
+        ports,
+        rtt,
+        distance,
+        ctcStatus,
+        ctcVer,
+        activate,
+        temperature,
+        txPower,
+        rxPower,
+        onlineTime,
+        offlineTime,
+        offlineReason,
+        online,
+        deregisterCnt,
+      });
+    } else if (parts.length >= 10) {
+      // 12-column modern format (HA7304 / HA7308)
+      // OnuId MacAddress Status Firmware ChipId Ge Fe Pots CtcStatus CtcVer Activate Uptime [Name]
+      const id = parts[0];
+      const mac = parts[1];
+      const status = parts[2];
+      const fwVersion = parts[3];
+      const chipId = parts[4];
+      const ports = (parts[5] || '0') + '/' + (parts[6] || '0');
+      const ctcStatus = parts[8];
+      const ctcVer = parts[9];
+      const activate = parts[10];
+      const uptime = parts[11];
+      const name = parts.length > 12 ? parts.slice(12).join(' ') : null;
 
-    rows.push({
-      id,
-      name: name === 'NA' ? null : name,
-      mac,
-      status,
-      fwVersion,
-      chipId,
-      ports,
-      rtt,
-      distance,
-      ctcStatus,
-      ctcVer,
-      activate,
-      temperature,
-      txPower,
-      rxPower,
-      onlineTime,
-      offlineTime,
-      offlineReason,
-      online,
-      deregisterCnt,
-    });
+      rows.push({
+        id,
+        name: name === 'NA' || !name ? null : name,
+        mac,
+        status,
+        fwVersion,
+        chipId,
+        ports,
+        distance: '-',
+        ctcStatus,
+        ctcVer,
+        activate,
+        uptime,
+        txPower: 'N/A',
+        rxPower: 'N/A'
+      });
+    }
   }
 
   return rows;
@@ -659,6 +707,10 @@ const fetchHiosoOnuDetailViaTelnet = async (olt) => {
   const user = olt.web_user || 'admin';
   const pass = olt.web_password || 'admin';
   const cmds = [
+    'show onu info epon 0/1 all',
+    'show onu info epon 0/2 all',
+    'show onu info epon 0/3 all',
+    'show onu info epon 0/4 all',
     'show onu',
     'show onu all',
     'show onu info',
@@ -666,7 +718,10 @@ const fetchHiosoOnuDetailViaTelnet = async (olt) => {
   ];
 
   try {
-    const out = await telnetLoginAndRun(olt.host, user, pass, cmds);
+    const out = await telnetLoginAndRun(olt.host, user, pass, cmds, {
+      port: olt.telnet_port || 23,
+      enablePassword: olt.enable_password || pass || 'admin'
+    });
     const rows = parseHiosoOnuTable(out);
     return rows.length > 0 ? rows : null;
   } catch (e) {
@@ -915,6 +970,15 @@ const isLikelySn = (sample) => {
 };
 
 const pickSnTable = async (session, activeProfile) => {
+  if (activeProfile.sn_table) {
+    try {
+      const m = await slowWalk(session, activeProfile.sn_table);
+      if (m && Object.keys(m).length > 0) {
+        return { oid: activeProfile.sn_table, map: m };
+      }
+    } catch (e) {}
+  }
+
   const nameOid = activeProfile.name_table || '';
   const lastDot = nameOid.lastIndexOf('.');
   const parentBranch = lastDot > 0 ? nameOid.slice(0, lastDot) : nameOid;
@@ -978,6 +1042,40 @@ const getHrCpuPercent = async (session) => {
 };
 
 const getHrRamPercent = async (session) => {
+  // Fast path: try direct GET on common hrStorage indices first (1, 3, 6, 7)
+  // hrStorageSize and hrStorageUsed with allocation unit 1024 bytes
+  const fastOids = [
+    '1.3.6.1.2.1.25.2.2.0',         // hrMemorySize (total KB)
+    '1.3.6.1.2.1.25.2.3.1.4.1',     // hrStorageAllocationUnits.1
+    '1.3.6.1.2.1.25.2.3.1.5.1',     // hrStorageSize.1
+    '1.3.6.1.2.1.25.2.3.1.6.1',     // hrStorageUsed.1
+    '1.3.6.1.2.1.25.2.3.1.2.1',     // hrStorageType.1 (OID value)
+  ];
+  try {
+    const vbs = await snmpGet(session, fastOids);
+    const totalKb   = bufferToInt(vbs[0]);
+    const allocUnit = bufferToInt(vbs[1]);
+    const size      = bufferToInt(vbs[2]);
+    const used      = bufferToInt(vbs[3]);
+
+    if (Number.isFinite(totalKb) && totalKb > 0 &&
+        Number.isFinite(allocUnit) && allocUnit > 0 &&
+        Number.isFinite(size) && size > 0 &&
+        Number.isFinite(used)) {
+      // size/used are in allocation units
+      const usedKb = (used * allocUnit) / 1024;
+      const pct = Math.round((usedKb / totalKb) * 100);
+      return Math.max(0, Math.min(100, pct));
+    }
+    // Fallback: size as a percentage directly
+    if (Number.isFinite(size) && size > 0 && Number.isFinite(used)) {
+      return Math.max(0, Math.min(100, Math.round((used / size) * 100)));
+    }
+  } catch (e) {
+    // fall through to slow path
+  }
+
+  // Slow path: full walk (for other brands)
   const descrMap = await slowWalk(session, '1.3.6.1.2.1.25.2.3.1.3');
   const typeMap  = await slowWalk(session, '1.3.6.1.2.1.25.2.3.1.2');
   const sizeMap  = await slowWalk(session, '1.3.6.1.2.1.25.2.3.1.5');
@@ -1165,11 +1263,55 @@ const readInterfaceOctets = async (session, ifIndex) => {
 };
 
 /**
+ * Ambil CPU, RAM, Suhu modul optik, dan Uptime via Telnet CLI untuk Hioso / HSGQ.
+ * Berfungsi sebagai fallback handal jika OLT tidak mendukung OID Suhu/CPU vendor via SNMP.
+ */
+const fetchHiosoSystemMetricsViaTelnet = async (olt, stats) => {
+  if (!olt || !olt.host) return;
+  const user = olt.web_user || 'admin';
+  const pass = olt.web_password || 'admin';
+  const cmds = [
+    'show cpu resource',
+    'show epon optical-ddm 0/1'
+  ];
+  try {
+    const out = await telnetLoginAndRun(olt.host, user, pass, cmds, {
+      port: olt.telnet_port || 23,
+      enablePassword: olt.enable_password || pass || 'admin'
+    });
+    if (!out) return;
+
+    if (stats.cpu === 'N/A' || !stats.cpu || stats.cpu === '-') {
+      const cpuMatch = out.match(/CPU usage\s*:\s*(\d+)%/i);
+      if (cpuMatch) stats.cpu = `${cpuMatch[1]}%`;
+    }
+
+    if (stats.ram === 'N/A' || !stats.ram || stats.ram === '-') {
+      const ramMatch = out.match(/Memory usage\s*:\s*([\d\.]+)%/i);
+      if (ramMatch) stats.ram = `${Math.round(parseFloat(ramMatch[1]))}%`;
+    }
+
+    if (stats.temp === 'N/A' || !stats.temp || stats.temp === '-') {
+      const tempMatch = out.match(/Temperature\s*:\s*([\d\.]+)\s*C/i);
+      if (tempMatch) stats.temp = `${parseFloat(tempMatch[1]).toFixed(0)}°C`;
+    }
+
+    if (stats.uptime === 'N/A' || !stats.uptime || stats.uptime === '-') {
+      const uptimeMatch = out.match(/OS up time\s*:\s*([^\r\n]+)/i);
+      if (uptimeMatch) stats.uptime = uptimeMatch[1].trim();
+    }
+  } catch (e) {
+    logger.debug(`[oltService] fetchHiosoSystemMetricsViaTelnet: ${e.message}`);
+  }
+};
+
+/**
  * Ambil system metrics (temp, cpu, ram, uplink) untuk brand tertentu.
  * Mengisi field stats secara langsung.
  */
-const fetchSystemMetrics = async (session, brandKey, stats, oltId) => {
+const fetchSystemMetrics = async (session, brandKey, stats, oltOrId) => {
   const oids = SYSTEM_OIDS[brandKey] || SYSTEM_OIDS.hioso;
+  const oltId = (oltOrId && typeof oltOrId === 'object') ? oltOrId.id : oltOrId;
   try {
     const [temp, cpu, ram, rx, tx] = await snmpGet(session, [
       oids.temp, oids.cpu, oids.ram, oids.uplink_rx, oids.uplink_tx
@@ -1220,6 +1362,16 @@ const fetchSystemMetrics = async (session, brandKey, stats, oltId) => {
     if (stats.ram === 'N/A') {
       const hrRam = await getHrRamPercent(session);
       if (hrRam != null) stats.ram = `${hrRam}%`;
+    }
+
+    // Telnet Fallback untuk Suhu/CPU/RAM pada Hioso/HSGQ jika SNMP tidak menyediakan
+    if (stats.cpu === 'N/A' || stats.ram === 'N/A' || stats.temp === 'N/A') {
+      if (brandKey === 'hioso' || brandKey === 'hsgq') {
+        const oltObj = (oltOrId && typeof oltOrId === 'object') ? oltOrId : getOltById(oltOrId);
+        if (oltObj) {
+          await fetchHiosoSystemMetricsViaTelnet(oltObj, stats);
+        }
+      }
     }
   } catch (e) {
   }
@@ -1436,7 +1588,7 @@ async function getOltStats(id, full = false) {
   const cacheKey = `${id}:${full}`;
   const now = Date.now();
   const cached = statsCache.get(cacheKey);
-  const cacheDuration = full ? 15000 : 10000; // 15s cache for full table, 10s for summary
+  const cacheDuration = full ? 120000 : 10000; // 120s cache for full table, 10s for summary
 
   if (cached && (now - cached.timestamp < cacheDuration)) {
     logger.info(`[oltService] Returning cached stats for OLT ${id} (full: ${full})`);
@@ -1506,7 +1658,7 @@ async function getOltStatsInternal(id, full = false) {
 
   const session = snmp.createSession(olt.host, community, {
     port:     olt.snmp_port || 161,
-    timeout:  full ? 8000 : 5000,
+    timeout:  full ? 10000 : 5000,
     retries:  full ? 2 : 1,
     version:  snmp.Version2c,
   });
@@ -1526,7 +1678,7 @@ async function getOltStatsInternal(id, full = false) {
       resolve(data);
     };
 
-    const timeoutMs = full ? 15000 : 10000;
+    const timeoutMs = full ? 90000 : 20000;
     const globalTimeout = setTimeout(() => {
       stats.error = `Koneksi Timeout (${Math.round(timeoutMs / 1000)}s) - OLT ${olt.host} tidak merespons SNMP/Telnet`;
       safeResolve(stats);
@@ -1559,7 +1711,7 @@ async function getOltStatsInternal(id, full = false) {
                   index: r.id || idx,
                   id: r.id || '-',
                   name: r.name || r.mac || `ONU-${idx+1}`,
-                  sn: r.mac || '-',
+                  sn: formatSnWithColons(r.mac) || '-',
                   status: String(r.status).toLowerCase().includes('on') ? 'Online' : 'Offline',
                   offline_reason: translateOfflineReason(brandKey, r.offlineReason),
                   tx: r.txPower || 'N/A',
@@ -1569,6 +1721,7 @@ async function getOltStatsInternal(id, full = false) {
                   uptime: r.onlineTime || '-'
                 }));
               }
+              await fetchHiosoSystemMetricsViaTelnet(olt, stats);
               safeResolve(stats);
               return;
             }
@@ -1607,7 +1760,7 @@ async function getOltStatsInternal(id, full = false) {
                   index: r.id || idx,
                   id: r.id || '-',
                   name: r.name || r.mac || `ONU-${idx+1}`,
-                  sn: r.mac || '-',
+                  sn: formatSnWithColons(r.mac) || '-',
                   status: String(r.status).toLowerCase().includes('on') ? 'Online' : 'Offline',
                   offline_reason: translateOfflineReason(brandKey, r.offlineReason),
                   tx: r.txPower || 'N/A',
@@ -1617,6 +1770,7 @@ async function getOltStatsInternal(id, full = false) {
                   uptime: r.onlineTime || '-'
                 }));
               }
+              await fetchHiosoSystemMetricsViaTelnet(olt, stats);
               safeResolve(stats);
               return;
             }
@@ -1640,7 +1794,7 @@ async function getOltStatsInternal(id, full = false) {
         const onlineVals = getOnlineValues(detectedBrandKey, activeProfile);
 
         // Start system metrics concurrently
-        const systemMetricsPromise = fetchSystemMetrics(session, detectedBrandKey, stats, olt.id);
+        const systemMetricsPromise = fetchSystemMetrics(session, detectedBrandKey, stats, olt);
 
         // 4. Mode Counter (ZTE)
         if (activeProfile.is_counter) {
@@ -1676,52 +1830,140 @@ async function getOltStatsInternal(id, full = false) {
         // Summary mode: skip rx/tx/distance/firmware/uptime/reason walks
         // This makes summary 5-10x faster
         if (full) {
-          const tasks = [];
+          // For Hioso/HSGQ, rx/tx DDM walks take ~33s (OLT measures all 256 slots on demand).
+          // Use a dedicated slow session (30s timeout, 0 retries) and walk them SEQUENTIALLY
+          // AFTER the fast walks complete. This prevents packet loss from concurrent walking.
+          const isSlowDdmBrand = (detectedBrandKey === 'hioso' || detectedBrandKey === 'hsgq');
 
-          // Walk OLT cards & unauth ONUs
-          tasks.push(() => fetchCardMetrics(session, detectedBrandKey, stats));
-          tasks.push(() => fetchUnauthOnus(session, activeProfile, stats));
+          if (isSlowDdmBrand && (activeProfile.rx_power_table || activeProfile.tx_power_table)) {
+            // --- Phase 1: Fast walks (status already done, now sn + distance + card + unauth) ---
+            const fastTasks = [];
+            fastTasks.push(() => fetchCardMetrics(session, detectedBrandKey, stats));
+            fastTasks.push(() => fetchUnauthOnus(session, activeProfile, stats));
+            fastTasks.push(() => pickSnTable(session, activeProfile).then(res => snMap = res.map || {}));
+            if (activeProfile.distance_table) {
+              fastTasks.push(() => slowWalk(session, activeProfile.distance_table).then(res => distMap = res));
+            }
+            if (activeProfile.firmware_table) {
+              fastTasks.push(() => slowWalk(session, activeProfile.firmware_table).then(res => fwMap = res));
+            }
+            if (activeProfile.uptime_table) {
+              fastTasks.push(() => slowWalk(session, activeProfile.uptime_table).then(res => upMap = res));
+            }
+            if (activeProfile.offline_reason_table) {
+              fastTasks.push(() => slowWalk(session, activeProfile.offline_reason_table).then(res => reasonMap = res));
+            }
+            await limitConcurrency(fastTasks, 2);
 
-          // 1. Pick SN Table
-          tasks.push(() => pickSnTable(session, activeProfile).then(res => snMap = res.map || {}));
+            // --- Phase 2: Slow DDM walks on dedicated session (sequential, high timeout) ---
+            const slowSession = snmp.createSession(olt.host, community, {
+              port:    olt.snmp_port || 161,
+              timeout: 30000, // 30s per GETBULK batch — DDM on Hioso needs long timeouts
+              retries: 0,     // No retries; a retry on a 30s timeout would kill the budget
+              version: snmp.Version2c,
+            });
+            slowSession.on('error', (err) => {
+              logger.warn(`[SNMP SlowSession Error] OLT ${olt.host}: ${err.message}`);
+            });
+            try {
+              if (activeProfile.rx_power_table) {
+                logger.info(`[oltService] Walking rx_power_table for OLT ${olt.host} (slow DDM session)`);
+                rxMap = await slowWalk(slowSession, activeProfile.rx_power_table);
+                logger.info(`[oltService] rx_power_table done, ${Object.keys(rxMap).length} entries`);
+              }
+              if (activeProfile.tx_power_table) {
+                logger.info(`[oltService] Walking tx_power_table for OLT ${olt.host} (slow DDM session)`);
+                txMap = await slowWalk(slowSession, activeProfile.tx_power_table);
+                logger.info(`[oltService] tx_power_table done, ${Object.keys(txMap).length} entries`);
+              }
 
-          // 2. Rx Power
-          if (activeProfile.rx_power_table) {
-            tasks.push(() => slowWalk(session, activeProfile.rx_power_table).then(res => rxMap = res));
-          }
-          // 3. Tx Power
-          if (activeProfile.tx_power_table) {
-            tasks.push(() => slowWalk(session, activeProfile.tx_power_table).then(res => txMap = res));
-          }
-          // 4. Distance
-          if (activeProfile.distance_table) {
-            tasks.push(() => slowWalk(session, activeProfile.distance_table).then(res => distMap = res));
-          }
-          // 5. Firmware
-          if (activeProfile.firmware_table) {
-            tasks.push(() => slowWalk(session, activeProfile.firmware_table).then(res => fwMap = res));
-          }
-          // 6. Uptime
-          if (activeProfile.uptime_table) {
-            tasks.push(() => slowWalk(session, activeProfile.uptime_table).then(res => upMap = res));
-          }
-          // 7. Offline Reason
-          if (activeProfile.offline_reason_table) {
-            tasks.push(() => slowWalk(session, activeProfile.offline_reason_table).then(res => reasonMap = res));
-          }
+              // Gap-fill: Hioso OLT truncates walk responses but individual GET works for all slots.
+              // Find indices present in statusMap but missing from rxMap/txMap, then GET them directly.
+              const statusIndices = Object.keys(statusMap);
+              const missingRx = activeProfile.rx_power_table
+                ? statusIndices.filter(idx => rxMap[idx] == null)
+                : [];
+              const missingTx = activeProfile.tx_power_table
+                ? statusIndices.filter(idx => txMap[idx] == null)
+                : [];
 
-          // OPTIMIZATION: Tune concurrency per brand
-          // ZTE handles 5, others 3-4
-          const concurrencyMap = {
-            'zte': 5,
-            'huawei': 4,
-            'hioso': 3,
-            'vsol': 4,
-            'cdata': 3,
-            'hsgq': 3
-          };
-          const concurrency = concurrencyMap[detectedBrandKey] || 4;
-          await limitConcurrency(tasks, concurrency);
+              if (missingRx.length > 0 || missingTx.length > 0) {
+                logger.info(`[oltService] Gap-filling DDM: ${missingRx.length} rx + ${missingTx.length} tx missing, fetching via GET`);
+
+                // Build OID list for batch GET (up to 50 per request)
+                const batchGet = async (oidBase, indices, targetMap) => {
+                  const BATCH = 50;
+                  for (let i = 0; i < indices.length; i += BATCH) {
+                    const batch = indices.slice(i, i + BATCH);
+                    const oids = batch.map(idx => `${oidBase}.${idx}`);
+                    await new Promise(rv => {
+                      slowSession.get(oids, (err, vbs) => {
+                        if (err) { rv(); return; }
+                        for (const vb of vbs) {
+                          if (!vb || snmp.isVarbindError(vb)) continue;
+                          const suffix = vb.oid.split(oidBase + '.')[1];
+                          if (!suffix) continue;
+                          const val = Buffer.isBuffer(vb.value)
+                            ? vb.value.toString('utf8').replace(/\0/g,'').trim()
+                            : String(vb.value).trim();
+                          if (val && val !== 'null' && val !== '0') {
+                            targetMap[suffix] = vb.value; // store raw for decoding
+                          }
+                        }
+                        rv();
+                      });
+                    });
+                  }
+                };
+
+                await batchGet(activeProfile.rx_power_table, missingRx, rxMap);
+                await batchGet(activeProfile.tx_power_table, missingTx, txMap);
+                logger.info(`[oltService] Gap-fill done, rx now ${Object.keys(rxMap).length}, tx now ${Object.keys(txMap).length}`);
+              }
+            } catch (ddmErr) {
+              logger.warn(`[oltService] DDM walk failed for OLT ${olt.host}: ${ddmErr.message}`);
+            } finally {
+              try { slowSession.close(); } catch (e) {}
+            }
+
+          } else {
+            // --- Standard path for all other brands ---
+            const tasks = [];
+            tasks.push(() => fetchCardMetrics(session, detectedBrandKey, stats));
+            tasks.push(() => fetchUnauthOnus(session, activeProfile, stats));
+            tasks.push(() => pickSnTable(session, activeProfile).then(res => snMap = res.map || {}));
+            if (activeProfile.rx_power_table) {
+              tasks.push(() => slowWalk(session, activeProfile.rx_power_table).then(res => rxMap = res));
+            }
+            if (activeProfile.tx_power_table) {
+              tasks.push(() => slowWalk(session, activeProfile.tx_power_table).then(res => txMap = res));
+            }
+            if (activeProfile.distance_table) {
+              tasks.push(() => slowWalk(session, activeProfile.distance_table).then(res => distMap = res));
+            }
+            if (activeProfile.firmware_table) {
+              tasks.push(() => slowWalk(session, activeProfile.firmware_table).then(res => fwMap = res));
+            }
+            if (activeProfile.uptime_table) {
+              tasks.push(() => slowWalk(session, activeProfile.uptime_table).then(res => upMap = res));
+            }
+            if (activeProfile.offline_reason_table) {
+              tasks.push(() => slowWalk(session, activeProfile.offline_reason_table).then(res => reasonMap = res));
+            }
+
+            // OPTIMIZATION: Tune concurrency per brand
+            // ZTE handles 5, others 3-4
+            const concurrencyMap = {
+              'zte': 5,
+              'huawei': 4,
+              'hioso': 2,
+              'vsol': 4,
+              'cdata': 3,
+              'hsgq': 2
+            };
+            const concurrency = concurrencyMap[detectedBrandKey] || 4;
+            await limitConcurrency(tasks, concurrency);
+          }
         }
 
         await systemMetricsPromise;
@@ -1741,7 +1983,13 @@ async function getOltStatsInternal(id, full = false) {
             : (stStr === 'online' || stStr === 'up' || stStr === 'on' || stStr === 'operation');
 
           const nameRaw = getByIdx(nameMap, idx);
-          const nameStr = nameRaw == null ? '' : String(nameRaw).replace(/\0/g, '').trim();
+          // SNMP returns ONU name as Buffer (OctetString) — must decode as UTF-8
+          const nameStr = nameRaw == null
+            ? ''
+            : (Buffer.isBuffer(nameRaw)
+                ? nameRaw.toString('utf8')
+                : String(nameRaw)
+              ).replace(/\0/g, '').trim();
           const name = nameStr || ('ONU-' + idx);
           const snVal = getByIdx(snMap, idx);
           const rxVal = getByIdx(rxMap, idx);
@@ -2364,9 +2612,15 @@ async function configureWanViaAcs(sn, data) {
    let onus_online = 0;
    let onus_offline = 0;
    let onus_weak = 0;
+   let uplink_rx = 0;
+   let uplink_tx = 0;
    const allOnus = [];
    const allUnauth = [];
    const olts_summary = [];
+
+   const tempValues = [];
+   const cpuValues = [];
+   const ramValues = [];
 
    for (let i = 0; i < results.length; i++) {
      const s = results[i];
@@ -2376,6 +2630,15 @@ async function configureWanViaAcs(sn, data) {
        onus_online += (s.onus_online || 0);
        onus_offline += (s.onus_offline || 0);
        onus_weak += (s.onus_weak || 0);
+       uplink_rx += (s.uplink_rx || 0);
+       uplink_tx += (s.uplink_tx || 0);
+
+       const tN = parseFloat(s.temp);
+       if (Number.isFinite(tN) && tN > 0) tempValues.push(tN);
+       const cN = parseFloat(s.cpu);
+       if (Number.isFinite(cN) && cN >= 0) cpuValues.push(cN);
+       const rN = parseFloat(s.ram);
+       if (Number.isFinite(rN) && rN > 0) ramValues.push(rN);
 
        olts_summary.push({
          id: oltInfo.id,
@@ -2391,6 +2654,8 @@ async function configureWanViaAcs(sn, data) {
          cpu: s.cpu,
          ram: s.ram,
          uptime: s.uptime,
+         uplink_rx: s.uplink_rx || 0,
+         uplink_tx: s.uplink_tx || 0,
          error: s.error,
          activeProfile: s.activeProfile || null,
          systemOids: s.systemOids || null,
@@ -2411,19 +2676,139 @@ async function configureWanViaAcs(sn, data) {
      }
    }
 
+   let temp = 'N/A';
+   let cpu = 'N/A';
+   let ram = 'N/A';
+   let uptime = 'Multi-OLT Active';
+
+   if (olts_summary.length === 1) {
+     const s0 = olts_summary[0];
+     temp = s0.temp || 'N/A';
+     cpu = s0.cpu || 'N/A';
+     ram = s0.ram || 'N/A';
+     uptime = s0.uptime || 'N/A';
+   } else if (olts_summary.length > 1) {
+     if (tempValues.length > 0) {
+       const avgT = Math.round(tempValues.reduce((a, b) => a + b, 0) / tempValues.length);
+       temp = `${avgT}°C (rata-rata)`;
+     }
+     if (cpuValues.length > 0) {
+       const avgC = Math.round(cpuValues.reduce((a, b) => a + b, 0) / cpuValues.length);
+       cpu = `${avgC}% (rata-rata)`;
+     }
+     if (ramValues.length > 0) {
+       const avgR = Math.round(ramValues.reduce((a, b) => a + b, 0) / ramValues.length);
+       ram = `${avgR}% (rata-rata)`;
+     }
+     const onlineCount = olts_summary.filter(o => o.status === 'Online').length;
+     uptime = `${onlineCount}/${olts_summary.length} OLT Online`;
+   }
+
    return {
      is_all: true,
      onus_total,
      onus_online,
      onus_offline,
      onus_weak,
+     temp,
+     cpu,
+     ram,
+     uptime,
+     uplink_rx,
+     uplink_tx,
      onus: allOnus,
      unauth_onus: allUnauth,
      olts_summary
    };
  }
 
+ async function testOltConnection(data) {
+   const host = String(data.host || '').trim();
+   const snmpPort = parseInt(data.snmp_port, 10) || 161;
+   const snmpCommunity = String(data.snmp_community || 'public').trim();
+   const brand = String(data.brand || 'generic').toLowerCase();
+   const telnetPort = parseInt(data.telnet_port, 10) || 23;
+   const webUser = String(data.web_user || 'admin').trim();
+   const webPassword = String(data.web_password || 'admin').trim();
+   const enablePassword = data.enable_password ? String(data.enable_password).trim() : null;
+
+   if (!host) {
+     return { success: false, message: 'Host/IP OLT harus diisi.' };
+   }
+
+   const result = {
+     success: false,
+     host,
+     snmp: { ok: false, error: null, uptime: null, sysDescr: null, profile: null, onus: 0 },
+     telnet: { ok: false, error: null },
+     messages: []
+   };
+
+   // 1. Test SNMP v2c
+   try {
+     const session = snmp.createSession(host, snmpCommunity, {
+       port: snmpPort,
+       timeout: 3000,
+       retries: 1,
+       version: snmp.Version2c
+     });
+
+     const vbs = await new Promise((resolve) => {
+       session.get(['1.3.6.1.2.1.1.3.0'], (err, res) => {
+         if (err) resolve(null);
+         else resolve(res);
+       });
+     });
+
+     if (vbs && vbs[0] && !snmp.isVarbindError(vbs[0])) {
+       result.snmp.ok = true;
+       result.snmp.uptime = decodeUptime(vbs[0].value);
+
+       // Probe profile
+       const selectedProfiles = (BRAND_PROFILES[brand] || []).map(p => ({ ...p, __brandKey: brand }));
+       const otherProfiles = Object.keys(BRAND_PROFILES)
+         .filter(k => k !== brand)
+         .reduce((acc, k) => acc.concat((BRAND_PROFILES[k] || []).map(p => ({ ...p, __brandKey: k }))), []);
+       const allProfiles = [...selectedProfiles, ...otherProfiles];
+
+       for (const p of allProfiles) {
+         const ok = await probeOid(session, p.probe_oid);
+         if (ok) {
+           result.snmp.profile = p.name;
+           try {
+             const statusMap = await slowWalk(session, p.status_table, 500);
+             result.snmp.onus = Object.keys(statusMap).length;
+           } catch (e) {}
+           break;
+         }
+       }
+       result.messages.push(`SNMP OK (Uptime: ${result.snmp.uptime}, Profil: ${result.snmp.profile || 'Standar'}, ${result.snmp.onus} ONU)`);
+     } else {
+       result.snmp.error = 'Tidak ada respon SNMP. Pastikan Service SNMP di OLT sudah Aktif dan IP/Community benar.';
+     }
+     try { session.close(); } catch (e) {}
+   } catch (e) {
+     result.snmp.error = e.message;
+   }
+
+   // 2. Test Telnet
+   try {
+     await telnetLoginAndRun(host, webUser, webPassword, ['show version'], {
+       port: telnetPort,
+       enablePassword
+     });
+     result.telnet.ok = true;
+     result.messages.push('Telnet CLI OK (Login Berhasil)');
+   } catch (e) {
+     result.telnet.error = e.message;
+   }
+
+   result.success = result.snmp.ok || result.telnet.ok;
+   result.message = result.messages.join(' | ') || (result.snmp.error || result.telnet.error || 'Gagal terhubung ke OLT');
+   return result;
+ }
+
  module.exports = {
-  getAllOlts, getActiveOlts, getOltById, createOlt, updateOlt, deleteOlt, getOltStats, getAllOltsStats, rebootOnu, renameOnu, authorizeOnu,
+  getAllOlts, getActiveOlts, getOltById, createOlt, updateOlt, deleteOlt, getOltStats, getAllOltsStats, testOltConnection, rebootOnu, renameOnu, authorizeOnu,
   configureOnuWan, configureZteWanViaGoApi, configureWanViaAcs
 };

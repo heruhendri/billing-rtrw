@@ -33,6 +33,12 @@ function isGatewayConfigured(settings, gateway) {
   if (g === 'xendit') {
     return isEnabledFlag(settings.xendit_enabled) && String(settings.xendit_api_key || '').trim();
   }
+  if (g === 'qris_static') {
+    return (
+      isEnabledFlag(settings.qris_static_enabled) &&
+      Boolean(String(settings.qris_static_payload || settings.qris_static_qr_url || '').trim())
+    );
+  }
   if (g === 'duitku') {
     return (
       isEnabledFlag(settings.duitku_enabled) &&
@@ -45,7 +51,7 @@ function isGatewayConfigured(settings, gateway) {
 
 function resolveConfiguredGateway(settings) {
   const def = String(settings?.default_gateway || 'tripay').toLowerCase();
-  const order = ['tripay', 'midtrans', 'xendit', 'duitku'];
+  const order = ['qris_static', 'tripay', 'midtrans', 'xendit', 'duitku'];
   if (isGatewayConfigured(settings, def)) return def;
   for (const g of order) {
     if (isGatewayConfigured(settings, g)) return g;

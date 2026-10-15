@@ -264,6 +264,75 @@ const updateWebhookPaymentNotifMatchDonation = db.prepare(`
   WHERE id=?
 `);
 
+// Safe migration & preparation for customer_topup_requests
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS customer_topup_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      customer_id INTEGER NOT NULL,
+      amount INTEGER NOT NULL DEFAULT 0,
+      payment_gateway TEXT DEFAULT '',
+      payment_order_id TEXT DEFAULT '',
+      payment_link TEXT DEFAULT '',
+      payment_reference TEXT DEFAULT '',
+      payment_payload TEXT,
+      payment_expires_at DATETIME,
+      qris_unique_code INTEGER,
+      qris_amount_unique INTEGER,
+      qris_assigned_at DATETIME,
+      qris_paid_notif_id INTEGER,
+      status TEXT DEFAULT 'pending',
+      paid_at DATETIME,
+      created_at DATETIME DEFAULT (NOW_LOCAL()),
+      updated_at DATETIME DEFAULT (NOW_LOCAL())
+    );
+  `);
+} catch (e) {}
+try { db.exec("ALTER TABLE customer_topup_requests ADD COLUMN qris_unique_code INTEGER"); } catch (e) {}
+try { db.exec("ALTER TABLE customer_topup_requests ADD COLUMN qris_amount_unique INTEGER"); } catch (e) {}
+try { db.exec("ALTER TABLE customer_topup_requests ADD COLUMN qris_assigned_at DATETIME"); } catch (e) {}
+try { db.exec("ALTER TABLE customer_topup_requests ADD COLUMN qris_paid_notif_id INTEGER"); } catch (e) {}
+try { db.exec("ALTER TABLE webhook_payment_notifs ADD COLUMN matched_topup_request_id INTEGER"); } catch (e) {}
+
+let selectTopupOrderByUniqueAmount = null;
+let markTopupPaid = null;
+let updateWebhookPaymentNotifMatchTopup = null;
+
+try {
+  selectTopupOrderByUniqueAmount = db.prepare(`
+    SELECT id, customer_id, amount, qris_amount_unique, qris_unique_code, status
+    FROM customer_topup_requests
+    WHERE status = 'pending' AND (qris_amount_unique = ? OR (qris_amount_unique IS NULL AND amount = ?))
+    ORDER BY id DESC
+    LIMIT 2
+  `);
+} catch (err) {
+  logger.error('Failed to prepare selectTopupOrderByUniqueAmount: ' + (err && err.message ? err.message : String(err)));
+}
+
+try {
+  markTopupPaid = db.prepare(`
+    UPDATE customer_topup_requests
+    SET status='paid',
+        paid_at=NOW_LOCAL(),
+        qris_paid_notif_id=?,
+        updated_at=NOW_LOCAL()
+    WHERE id=?
+  `);
+} catch (err) {
+  logger.error('Failed to prepare markTopupPaid: ' + (err && err.message ? err.message : String(err)));
+}
+
+try {
+  updateWebhookPaymentNotifMatchTopup = db.prepare(`
+    UPDATE webhook_payment_notifs
+    SET matched_topup_request_id=?
+    WHERE id=?
+  `);
+} catch (err) {
+  logger.error('Failed to prepare updateWebhookPaymentNotifMatchTopup: ' + (err && err.message ? err.message : String(err)));
+}
+
 const markInvoicePaidAppendNote = db.prepare(`
   UPDATE invoices
   SET status='paid',
@@ -869,14 +938,17 @@ app.post('/api/webhook/v1/payment-notif', multer().any(), async (req, res) => {
     let matchedInvoiceId = null;
     let matchedVoucherOrderId = null;
     let matchedDonationOrderId = null;
+    let matchedTopupRequestId = null;
     if (amount != null) {
       try {
         const invCandidates = selectInvoiceByUniqueAmount.all(amount);
         const vCandidates = selectVoucherOrderByUniqueAmount.all(amount);
         const dCandidates = selectDonationOrderByUniqueAmount.all(amount);
+        const tCandidates = selectTopupOrderByUniqueAmount ? selectTopupOrderByUniqueAmount.all(amount, amount) : [];
         const totalCandidates = (Array.isArray(invCandidates) ? invCandidates.length : 0) + 
                                 (Array.isArray(vCandidates) ? vCandidates.length : 0) +
-                                (Array.isArray(dCandidates) ? dCandidates.length : 0);
+                                (Array.isArray(dCandidates) ? dCandidates.length : 0) +
+                                (Array.isArray(tCandidates) ? tCandidates.length : 0);
 
         if (totalCandidates === 1) {
           if (Array.isArray(invCandidates) && invCandidates.length === 1) {
@@ -948,12 +1020,73 @@ app.post('/api/webhook/v1/payment-notif', multer().any(), async (req, res) => {
                 logger.error(`[WEBHOOK][payment-notif] Donation fulfill error: ${e?.message || e}`);
               }
             }
+          } else if (Array.isArray(tCandidates) && tCandidates.length === 1) {
+            const topup = tCandidates[0];
+            const topupId = Number(topup.id || 0);
+            const custId = Number(topup.customer_id || 0);
+            const baseAmount = Number(topup.amount || 0);
+            if (topupId > 0 && custId > 0 && baseAmount > 0) {
+              if (markTopupPaid) {
+                try { markTopupPaid.run(notifId || null, topupId); } catch (e) {
+                  logger.error(`[WEBHOOK][payment-notif] markTopupPaid error: ${e?.message || e}`);
+                }
+              }
+              matchedTopupRequestId = topupId;
+              logger.info(`[WEBHOOK][payment-notif] MATCH customer_topup=${topupId} amount=${amount} baseAmount=${baseAmount}`);
+
+              if (notifId && updateWebhookPaymentNotifMatchTopup) {
+                try { updateWebhookPaymentNotifMatchTopup.run(topupId, notifId); } catch {}
+              }
+
+              let updatedBalance = 0;
+              try {
+                db.transaction(() => {
+                  db.prepare('UPDATE customers SET balance = balance + ? WHERE id = ?').run(baseAmount, custId);
+                  const custRow = db.prepare('SELECT balance FROM customers WHERE id = ?').get(custId);
+                  updatedBalance = Number(custRow?.balance || 0);
+
+                  let pObj = {};
+                  try { pObj = topup.payment_payload ? JSON.parse(topup.payment_payload) : {}; } catch {}
+                  pObj.paid_amount = amount;
+                  pObj.balance_after = updatedBalance;
+                  pObj.fulfilled_at = new Date().toISOString();
+                  pObj.source = `AUTO-QRIS (service=${String(service || '-')}, notif=${notifId || '-'})`;
+                  db.prepare('UPDATE customer_topup_requests SET payment_payload = ?, updated_at = NOW_LOCAL() WHERE id = ?')
+                    .run(JSON.stringify(pObj), topupId);
+                })();
+              } catch (e) {
+                logger.error(`[WEBHOOK][payment-notif] Top-up balance update error: ${e?.message || e}`);
+              }
+
+              try {
+                const settings = getSettingsWithCache();
+                const customer = db.prepare('SELECT name, phone FROM customers WHERE id = ?').get(custId);
+                if (settings?.whatsapp_enabled && customer && customer.phone) {
+                  const { sendWA, whatsappStatus } = await import('./services/whatsappBot.mjs');
+                  if (whatsappStatus.connection === 'open') {
+                    const waMsg = 
+                      `✅ *TOP-UP SALDO BERHASIL*\n\n` +
+                      `Halo *${customer.name}*,\n` +
+                      `Top-up saldo Anda via QRIS sebesar *Rp ${baseAmount.toLocaleString('id-ID')}* telah berhasil diverifikasi otomatis.\n\n` +
+                      `💰 *Nominal Top-Up:* Rp ${baseAmount.toLocaleString('id-ID')}\n` +
+                      `💳 *Total Saldo Sekarang:* Rp ${updatedBalance.toLocaleString('id-ID')}\n` +
+                      `🏷️ *Metode:* QRIS Dinamis Otomatis\n` +
+                      `🆔 *ID Transaksi:* TOPUP-${topupId}\n\n` +
+                      `Saldo dapat langsung digunakan untuk pembelian pulsa, paket data, voucher, atau pembayaran tagihan di portal/aplikasi. Terima kasih!`;
+                    await sendWA(customer.phone, waMsg);
+                  }
+                }
+              } catch (waErr) {
+                logger.error(`[WEBHOOK][payment-notif] Top-up WA notification error: ${waErr?.message || waErr}`);
+              }
+            }
           }
         } else if (totalCandidates > 1) {
           const invIds = Array.isArray(invCandidates) ? invCandidates.map(x => x.id).join(',') : '';
           const vIds = Array.isArray(vCandidates) ? vCandidates.map(x => x.id).join(',') : '';
           const dIds = Array.isArray(dCandidates) ? dCandidates.map(x => x.id).join(',') : '';
-          logger.error(`[WEBHOOK][payment-notif] MATCH ambiguous: amount=${amount} invoices=[${invIds}] vouchers=[${vIds}] donations=[${dIds}]`);
+          const tIds = Array.isArray(tCandidates) ? tCandidates.map(x => x.id).join(',') : '';
+          logger.error(`[WEBHOOK][payment-notif] MATCH ambiguous: amount=${amount} invoices=[${invIds}] vouchers=[${vIds}] donations=[${dIds}] topups=[${tIds}]`);
         }
       } catch (e) {
         logger.error(`[WEBHOOK][payment-notif] MATCH error: ${e && e.message ? e.message : String(e)}`);
@@ -962,7 +1095,7 @@ app.post('/api/webhook/v1/payment-notif', multer().any(), async (req, res) => {
 
     if (amount != null) {
       logger.info(`[WEBHOOK][payment-notif] PARSED service=${String(service || '-')} amount=${amount}`);
-      return res.status(200).json({ status: 'processed', parsed: true, amount, matched_invoice_id: matchedInvoiceId, matched_voucher_order_id: matchedVoucherOrderId, matched_donation_order_id: matchedDonationOrderId });
+      return res.status(200).json({ status: 'processed', parsed: true, amount, matched_invoice_id: matchedInvoiceId, matched_voucher_order_id: matchedVoucherOrderId, matched_donation_order_id: matchedDonationOrderId, matched_topup_request_id: matchedTopupRequestId });
     }
 
     logger.error(`[WEBHOOK][payment-notif] FAILED parse: "${rawText.replace(/\r?\n/g, ' ').slice(0, 500)}"`);

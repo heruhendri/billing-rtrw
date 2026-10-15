@@ -61,7 +61,8 @@
           <%
             const kindSafe = String(kind || 'invoice').toLowerCase();
             const isVoucher = kindSafe === 'voucher';
-            const refPrefix = isVoucher ? 'VOUCHER' : 'INV';
+            const isTopup = kindSafe === 'topup';
+            const refPrefix = isVoucher ? 'VOUCHER' : (isTopup ? 'TOPUP' : 'INV');
           %>
           <div class="mb-3">
             <div class="fw-bold"><%= customerName || (isVoucher ? 'Pembeli Voucher' : 'Pelanggan') %></div>
@@ -132,8 +133,9 @@
 
               <%
                 const adminWa = String(adminWaDigits || '').trim();
+                const titleKind = isVoucher ? 'Konfirmasi pembayaran Voucher (QRIS)' : (isTopup ? 'Konfirmasi Top-Up Saldo (QRIS)' : 'Konfirmasi pembayaran QRIS');
                 const msgLines = [
-                  isVoucher ? 'Konfirmasi pembayaran Voucher (QRIS Statis)' : 'Konfirmasi pembayaran QRIS Statis',
+                  titleKind,
                   `${refPrefix}-${invoiceId}${periodText ? ' • ' + periodText : ''}`,
                   `Nama: ${customerName || (isVoucher ? 'Pembeli Voucher' : 'Pelanggan')}`,
                   `Nominal: Rp ${Number(amountUnique || 0).toLocaleString('id-ID')} (kode ${String(uniqueCode || 0).padStart(3, '0')})`,
@@ -252,7 +254,9 @@
           var token = <%- JSON.stringify(String(publicToken || '')) %>;
           var url = kindSafe === 'voucher'
             ? '/customer/voucher/status/' + refId + '?t=' + encodeURIComponent(token)
-            : '/customer/payment/status/' + refId + '?t=' + encodeURIComponent(token);
+            : (kindSafe === 'topup'
+              ? '/customer/topup/status/' + refId
+              : '/customer/payment/status/' + refId + '?t=' + encodeURIComponent(token));
 
           var res = await fetch(url, {
             method: 'GET',
@@ -274,7 +278,9 @@
             } else {
               var redirectUrl = kindSafe === 'voucher'
                 ? '/customer/voucher?order=' + refId + '&t=' + encodeURIComponent(token)
-                : '/customer/billing?invoice=' + refId;
+                : (kindSafe === 'topup'
+                  ? '/customer/topup?info=' + encodeURIComponent('Top-up saldo berhasil!')
+                  : '/customer/billing?invoice=' + refId);
               window.location.href = redirectUrl;
             }
             return;

@@ -36,7 +36,7 @@ try {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
-      hour12: false
+      hourCycle: 'h23'
     };
     
     const formatter = new Intl.DateTimeFormat('en-US', options);
@@ -355,6 +355,10 @@ db.exec(`
     payment_reference TEXT DEFAULT '',
     payment_payload TEXT,
     payment_expires_at DATETIME,
+    qris_unique_code INTEGER,
+    qris_amount_unique INTEGER,
+    qris_assigned_at DATETIME,
+    qris_paid_notif_id INTEGER,
     status TEXT DEFAULT 'pending',
     paid_at DATETIME,
     created_at DATETIME DEFAULT (NOW_LOCAL()),
@@ -776,6 +780,13 @@ try { db.exec("ALTER TABLE public_voucher_orders ADD COLUMN qris_amount_unique I
 try { db.exec("ALTER TABLE public_voucher_orders ADD COLUMN qris_assigned_at DATETIME"); } catch (e) {}
 try { db.exec("ALTER TABLE public_voucher_orders ADD COLUMN qris_paid_notif_id INTEGER"); } catch (e) {}
 try { db.exec("ALTER TABLE public_voucher_orders ADD COLUMN proof_url TEXT DEFAULT ''"); } catch (e) {}
+
+// Kolom untuk QRIS pada top-up pelanggan
+try { db.exec("ALTER TABLE customer_topup_requests ADD COLUMN qris_unique_code INTEGER"); } catch (e) {}
+try { db.exec("ALTER TABLE customer_topup_requests ADD COLUMN qris_amount_unique INTEGER"); } catch (e) {}
+try { db.exec("ALTER TABLE customer_topup_requests ADD COLUMN qris_assigned_at DATETIME"); } catch (e) {}
+try { db.exec("ALTER TABLE customer_topup_requests ADD COLUMN qris_paid_notif_id INTEGER"); } catch (e) {}
+try { db.exec("ALTER TABLE webhook_payment_notifs ADD COLUMN matched_topup_request_id INTEGER"); } catch (e) {}
 
 // Kolom untuk Login OLT (Web/API)
 try { db.exec("ALTER TABLE olts ADD COLUMN web_user TEXT DEFAULT 'admin'"); } catch (e) {}
