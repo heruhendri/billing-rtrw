@@ -15,6 +15,7 @@ const adminSvc = require('../services/adminService');
 const agentSvc = require('../services/agentService');
 const oltSvc = require('../services/oltService');
 const odpSvc = require('../services/odpService');
+const uniqueCodeService = require('../services/uniqueCodeService');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -936,7 +937,8 @@ router.post('/odps/:id/delete', requireAdminSession, restrictToAdmin, (req, res)
 // --- TECHNICIAN MANAGEMENT ---
 router.get('/technicians', requireAdminSession, requireSidebarMenuAccess('technicians'), restrictToAdmin, (req, res) => {
   const technicians = adminSvc.getAllTechnicians();
-  res.render('admin/technicians', { title: 'Manajemen Teknisi', company: company(), activePage: 'technicians', technicians, msg: flashMsg(req) });
+  const masterAreas = areaSvc.getAllAreas();
+  res.render('admin/technicians', { title: 'Manajemen Teknisi', company: company(), activePage: 'technicians', technicians, masterAreas, msg: flashMsg(req) });
 });
 
 router.post('/technicians', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), (req, res) => {
@@ -3026,7 +3028,7 @@ router.post('/billing/:id/qris-assign', requireAdminSession, (req, res) => {
     if (!Number.isFinite(invId) || invId <= 0) throw new Error('Invoice ID tidak valid');
 
     const force = String(req.query.force || '') === '1';
-    const inv = db.prepare('SELECT id, status, amount, qris_amount_unique FROM invoices WHERE id=?').get(invId);
+    const inv = db.prepare('SELECT id, status, amount, qris_amount_unique, customer_id FROM invoices WHERE id=?').get(invId);
     if (!inv) throw new Error('Tagihan tidak ditemukan');
     if (String(inv.status) !== 'unpaid') throw new Error('Hanya tagihan BELUM BAYAR yang bisa dibuat kode QRIS.');
 
@@ -3035,44 +3037,8 @@ router.post('/billing/:id/qris-assign', requireAdminSession, (req, res) => {
       return res.redirect('back');
     }
 
-    const baseAmount = Number(inv.amount || 0);
-    if (!Number.isFinite(baseAmount) || baseAmount <= 0) throw new Error('Nominal tagihan tidak valid');
-
-    const exists = db.prepare('SELECT id FROM invoices WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1');
-    const update = db.prepare(`
-      UPDATE invoices
-      SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL())
-      WHERE id=?
-    `);
-
-    let chosenCode = 0;
-    let chosenAmount = 0;
-
-    for (let i = 0; i < 50; i++) {
-      const code = 1 + Math.floor(Math.random() * 999);
-      const amount = baseAmount + code;
-      if (!exists.get('unpaid', amount, invId)) {
-        chosenCode = code;
-        chosenAmount = amount;
-        break;
-      }
-    }
-
-    if (!chosenAmount) {
-      for (let code = 1; code <= 999; code++) {
-        const amount = baseAmount + code;
-        if (!exists.get('unpaid', amount, invId)) {
-          chosenCode = code;
-          chosenAmount = amount;
-          break;
-        }
-      }
-    }
-
-    if (!chosenAmount) throw new Error('Gagal membuat nominal unik (slot 1-999 penuh).');
-
-    update.run(chosenCode, chosenAmount, invId);
-    req.session._msg = { type: 'success', text: `Kode QRIS dibuat: Rp ${Number(chosenAmount).toLocaleString('id-ID')} (kode ${chosenCode}).` };
+    const { uniqueCode, amountUnique } = uniqueCodeService.ensureInvoiceQrisUnique(inv, force);
+    req.session._msg = { type: 'success', text: `Kode QRIS dibuat: Rp ${Number(amountUnique).toLocaleString('id-ID')} (kode ${uniqueCode}).` };
   } catch (e) {
     req.session._msg = { type: 'error', text: 'Gagal membuat kode QRIS: ' + e.message };
   }
@@ -3133,52 +3099,11 @@ router.post('/billing/:id/whatsapp', requireAdminSession, async (req, res) => {
     const baseAmount = totalTagihan > 0 ? totalTagihan : Number(inv.amount || 0);
 
     if (hasStaticQris && String(inv.status) === 'unpaid' && (!qrisAmountUnique || !qrisCode || (qrisAmountUnique - qrisCode !== baseAmount))) {
-      const invId = Number(inv.id);
-      if (Number.isFinite(invId) && invId > 0 && Number.isFinite(baseAmount) && baseAmount > 0) {
-        const exists = db.prepare('SELECT id FROM invoices WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1');
-        const update = db.prepare(`
-          UPDATE invoices
-          SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL())
-          WHERE id=?
-        `);
-
-        let chosenCode = qrisCode > 0 ? qrisCode : 0;
-        let chosenAmount = 0;
-
-        if (chosenCode > 0) {
-          const pAmt = baseAmount + chosenCode;
-          if (!exists.get('unpaid', pAmt, invId)) {
-            chosenAmount = pAmt;
-          }
-        }
-
-        if (!chosenAmount) {
-          for (let i = 0; i < 50; i++) {
-            const code = 1 + Math.floor(Math.random() * 999);
-            const amount = baseAmount + code;
-            if (!exists.get('unpaid', amount, invId)) {
-              chosenCode = code;
-              chosenAmount = amount;
-              break;
-            }
-          }
-        }
-        if (!chosenAmount) {
-          for (let code = 1; code <= 999; code++) {
-            const amount = baseAmount + code;
-            if (!exists.get('unpaid', amount, invId)) {
-              chosenCode = code;
-              chosenAmount = amount;
-              break;
-            }
-          }
-        }
-        if (chosenAmount) {
-          update.run(chosenCode, chosenAmount, invId);
-          qrisAmountUnique = chosenAmount;
-          qrisCode = chosenCode;
-        }
-      }
+      try {
+        const ensured = uniqueCodeService.ensureInvoiceQrisUnique(inv, false);
+        qrisAmountUnique = ensured.amountUnique;
+        qrisCode = ensured.uniqueCode;
+      } catch (_) {}
     }
 
     const normalizeQrisPayload = (raw) => {

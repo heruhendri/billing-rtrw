@@ -177,16 +177,11 @@ router.get('/', requireCollectorSession, (req, res) => {
   const todayDay = now.getDate();
 
   const collectorId = Number(req.session.collectorId || 0);
-  const collectorObj = db.prepare('SELECT area FROM collectors WHERE id = ?').get(collectorId);
+  const collectorObj = db.prepare('SELECT id, area FROM collectors WHERE id = ?').get(collectorId);
   const collectorArea = String(collectorObj?.area || req.session.collectorArea || '').trim();
   req.session.collectorArea = collectorArea;
 
-  let collectorWhere = '(c.collector_id = ? OR c.collector_id IS NULL)';
-  let collectorParams = [collectorId];
-  if (collectorArea) {
-    collectorWhere = '(c.collector_id = ? OR ((c.collector_id IS NULL OR c.collector_id = 0) AND LOWER(TRIM(c.area)) = LOWER(TRIM(?))))';
-    collectorParams = [collectorId, collectorArea];
-  }
+  const { where: collectorWhere, params: collectorParams } = customerSvc.getCollectorCustomerWhere(collectorObj, 'c');
   
   let q = `
     SELECT c.id as customer_id,
@@ -351,6 +346,16 @@ router.post('/payment-request', requireCollectorSession, express.urlencoded({ ex
     if (!inv) throw new Error('Tagihan tidak ditemukan');
     if (String(inv.status || '').toLowerCase() === 'paid') throw new Error('Tagihan sudah lunas');
 
+    const collectorId = Number(req.session.collectorId || 0);
+    const collector = db.prepare('SELECT id, area, auto_approve FROM collectors WHERE id = ?').get(collectorId);
+    if (!collector) throw new Error('Data kolektor tidak valid');
+
+    const customer = customerSvc.getCustomerById(inv.customer_id);
+    if (!customer) throw new Error('Data pelanggan tidak ditemukan');
+    if (!customerSvc.canCollectorAccessCustomer(collector, customer)) {
+      throw new Error('Akses ditolak: Pelanggan tidak berada di wilayah tugas Anda');
+    }
+
     const existingPending = db.prepare(`
       SELECT id FROM collector_payment_requests
       WHERE invoice_id = ? AND status = 'pending'
@@ -358,12 +363,10 @@ router.post('/payment-request', requireCollectorSession, express.urlencoded({ ex
     `).get(invoiceId);
     if (existingPending) throw new Error('Tagihan ini sudah pernah diajukan dan masih menunggu approval');
 
-    const collectorId = Number(req.session.collectorId || 0);
     const amount = Math.max(0, Number(inv.amount || 0) || 0);
     if (amount <= 0) throw new Error('Nominal tagihan tidak valid');
 
     // Check if auto-approve is enabled for this collector
-    const collector = db.prepare('SELECT auto_approve FROM collectors WHERE id = ?').get(collectorId);
     const autoApproveEnabled = collector && collector.auto_approve === 1;
 
     if (autoApproveEnabled) {
@@ -471,6 +474,13 @@ router.get('/invoice/:id/print-thermal', requireCollectorSession, (req, res) => 
 
     const customer = customerSvc.getCustomerById(invoice.customer_id);
     if (!customer) return res.status(404).send('Data pelanggan tidak ditemukan');
+
+    const collectorId = Number(req.session.collectorId || 0);
+    const collectorObj = db.prepare('SELECT id, area FROM collectors WHERE id = ?').get(collectorId);
+    if (!customerSvc.canCollectorAccessCustomer(collectorObj, customer)) {
+      return res.status(403).send('Akses ditolak: Pelanggan bukan di wilayah tugas Anda');
+    }
+
     const settings = getSettings();
 
     res.render('collector/print_thermal', {
@@ -497,6 +507,12 @@ router.post('/invoice/:id/send-pdf-wa', requireCollectorSession, async (req, res
 
     const customer = customerSvc.getCustomerById(inv.customer_id);
     if (!customer || !customer.phone) return res.json({ success: false, message: 'Nomor HP pelanggan tidak valid' });
+
+    const collectorId = Number(req.session.collectorId || 0);
+    const collectorObj = db.prepare('SELECT id, area FROM collectors WHERE id = ?').get(collectorId);
+    if (!customerSvc.canCollectorAccessCustomer(collectorObj, customer)) {
+      return res.status(403).json({ success: false, message: 'Akses ditolak: Pelanggan bukan di wilayah tugas Anda' });
+    }
 
     const settings = getSettings();
     const pdfBuffer = await pdfSvc.generateInvoicePdfBuffer(inv, customer, settings);

@@ -19,6 +19,7 @@ const agentSvc = require('../services/agentService');
 const techSvc = require('../services/techService');
 const mikrotikService = require('../services/mikrotikService');
 const qrisUtil = require('../utils/qrisUtil');
+const uniqueCodeService = require('../services/uniqueCodeService');
 const QRCode = require('qrcode');
 
 // Helper Token JWT / HMAC
@@ -755,6 +756,18 @@ router.get('/app/collector/dashboard', requireCollectorApiAuth, (req, res) => {
     const curMonth = now.getMonth() + 1;
     const curYear = now.getFullYear();
 
+    const isFullAdmin = req.collector?.role === 'admin' || req.collector?.role === 'root';
+    const collectorId = Number(req.collector?.collectorId || req.collector?.id || 0);
+    const collector = collectorId ? db.prepare('SELECT id, name, area, auto_approve FROM collectors WHERE id = ?').get(collectorId) : null;
+
+    let collectorWhere = '1=1';
+    let collectorParams = [];
+    if (!isFullAdmin && collector) {
+      const colFilter = customerSvc.getCollectorCustomerWhere(collector, 'c');
+      collectorWhere = colFilter.where;
+      collectorParams = colFilter.params;
+    }
+
     let q = `
       SELECT c.id, c.name, c.phone, c.address, c.status, c.area, c.isolate_day, c.pppoe_username,
              p.name as package_name, p.price as package_price,
@@ -763,9 +776,9 @@ router.get('/app/collector/dashboard', requireCollectorApiAuth, (req, res) => {
       FROM customers c
       LEFT JOIN packages p ON p.id = c.package_id
       LEFT JOIN invoices i ON i.customer_id = c.id AND i.period_month = ? AND i.period_year = ?
-      WHERE 1=1
+      WHERE ${collectorWhere}
     `;
-    const params = [curMonth, curYear];
+    const params = [curMonth, curYear, ...collectorParams];
 
     if (filterStatus === 'unpaid') {
       q += ` AND (i.status = 'unpaid' OR i.status IS NULL)`;
@@ -794,11 +807,13 @@ router.get('/app/collector/dashboard', requireCollectorApiAuth, (req, res) => {
       FROM customers c
       LEFT JOIN packages p ON p.id = c.package_id
       LEFT JOIN invoices i ON i.customer_id = c.id AND i.period_month = ? AND i.period_year = ?
-    `).get(todayDay, curMonth, curYear) || {};
+      WHERE ${collectorWhere}
+    `).get(todayDay, curMonth, curYear, ...collectorParams) || {};
 
     res.json({
       success: true,
       data: {
+        collectorArea: collector?.area || '',
         customers: list,
         summary: {
           unpaidCount: Number(stats.unpaid_count || 0),
@@ -833,8 +848,18 @@ router.post('/app/collector/pay-bill', requireCollectorApiAuth, async (req, res)
     const inv = billingSvc.getInvoiceById(invId);
     if (!inv) return res.status(404).json({ success: false, message: 'Tagihan tidak ditemukan' });
 
+    const isFullAdmin = req.collector?.role === 'admin' || req.collector?.role === 'root';
     const collectorId = Number(req.collector?.collectorId || req.collector?.id || 0);
-    const collector = collectorId ? db.prepare('SELECT id, name, auto_approve FROM collectors WHERE id = ?').get(collectorId) : null;
+    const collector = collectorId ? db.prepare('SELECT id, name, area, auto_approve FROM collectors WHERE id = ?').get(collectorId) : null;
+
+    if (!isFullAdmin && collector) {
+      const cust = db.prepare('SELECT id, name, area, collector_id FROM customers WHERE id = ?').get(inv.customer_id);
+      if (!cust) return res.status(404).json({ success: false, message: 'Pelanggan tidak ditemukan' });
+      if (!customerSvc.canCollectorAccessCustomer(collector, cust)) {
+        return res.status(403).json({ success: false, message: 'Akses ditolak: Pelanggan tidak berada di wilayah tugas Anda' });
+      }
+    }
+
     const collectorName = collector?.name || req.collector?.name || 'Kolektor Lapangan';
     const isAutoApprove = collector && collector.auto_approve === 1;
 
@@ -1226,6 +1251,18 @@ router.get('/app/collector/customers/map', requireCollectorApiAuth, (req, res) =
     const curMonth = now.getMonth() + 1;
     const curYear = now.getFullYear();
 
+    const isFullAdmin = req.collector?.role === 'admin' || req.collector?.role === 'root';
+    const collectorId = Number(req.collector?.collectorId || req.collector?.id || 0);
+    const collector = collectorId ? db.prepare('SELECT id, name, area FROM collectors WHERE id = ?').get(collectorId) : null;
+
+    let collectorWhere = '1=1';
+    let collectorParams = [];
+    if (!isFullAdmin && collector) {
+      const colFilter = customerSvc.getCollectorCustomerWhere(collector, 'c');
+      collectorWhere = colFilter.where;
+      collectorParams = colFilter.params;
+    }
+
     const customers = db.prepare(`
       SELECT c.id, c.name, c.phone, c.address, c.area, c.lat, c.lng, c.status, c.isolate_day,
              p.name as package_name, p.price as package_price,
@@ -1234,8 +1271,9 @@ router.get('/app/collector/customers/map', requireCollectorApiAuth, (req, res) =
       LEFT JOIN packages p ON p.id = c.package_id
       LEFT JOIN invoices i ON i.customer_id = c.id AND i.period_month = ? AND i.period_year = ?
       WHERE (i.status = 'unpaid' OR i.status IS NULL OR c.status = 'suspended' OR c.status = 'isolated')
+        AND ${collectorWhere}
       ORDER BY c.name ASC LIMIT 100
-    `).all(curMonth, curYear) || [];
+    `).all(curMonth, curYear, ...collectorParams) || [];
 
     res.json({
       success: true,
@@ -2545,7 +2583,7 @@ router.get('/app/tech/dashboard', requireTechApiAuth, (req, res) => {
     const techId = resolveTechId(req);
     const stats = techSvc.getTechStats(techId);
     const assignedTickets = techSvc.getAssignedTickets(techId);
-    const openTickets = techSvc.getOpenTickets();
+    const openTickets = techSvc.getOpenTickets(techId);
     const resolvedTickets = techSvc.getResolvedTickets(techId);
     const techInfo = techSvc.getTechById(techId);
 
@@ -2573,7 +2611,7 @@ router.post('/app/tech/tickets/take', requireTechApiAuth, (req, res) => {
     techSvc.takeTicket(ticketId, techId);
     res.json({ success: true, message: `Tiket #${ticketId} berhasil diambil! Silakan mulai pengerjaan.` });
   } catch (e) {
-    res.status(500).json({ success: false, message: 'Gagal mengambil tiket: ' + e.message });
+    res.status(400).json({ success: false, message: e.message || 'Gagal mengambil tiket' });
   }
 });
 
@@ -2723,17 +2761,35 @@ router.post('/app/tech/mikrotik/secret/kick', requireTechApiAuth, async (req, re
 });
 
 // ─── TR-069 ONU MANAGEMENT FOR TECHNICIAN ────────────────────────────
+function checkTechApiTagAccess(techId, tag) {
+  const tech = techSvc.getTechById(techId);
+  if (!tech || !tech.area) return true;
+  const filter = techSvc.getTechAreaWhere(tech, 'c');
+  if (!filter.isRestricted) return true;
+  const cust = customerSvc.findCustomerByAny(tag);
+  if (!cust) return true;
+  return filter.areas.includes(String(cust.area || '').trim().toLowerCase());
+}
+
 router.get('/app/tech/tr069/devices', requireTechApiAuth, async (req, res) => {
   try {
     const { search, status, acs } = req.query;
-    const customers = db.prepare('SELECT id, name, phone, pppoe_username, genieacs_tag FROM customers').all();
+    const techId = resolveTechId(req);
+    const tech = techSvc.getTechById(techId);
+    const filter = tech ? techSvc.getTechAreaWhere(tech, 'c') : null;
+
+    const customers = db.prepare('SELECT id, name, phone, pppoe_username, genieacs_tag, area FROM customers').all();
+    const allowedCustomerIds = new Set();
     const byPppoe = new Map();
     const byTag = new Map();
     for (const c of customers) {
-      const pu = String(c.pppoe_username || '').trim().toLowerCase();
-      const tg = String(c.genieacs_tag || '').trim();
-      if (pu) byPppoe.set(pu, c);
-      if (tg) byTag.set(tg, c);
+      if (!filter || !filter.isRestricted || filter.areas.includes(String(c.area || '').trim().toLowerCase())) {
+        allowedCustomerIds.add(c.id);
+        const pu = String(c.pppoe_username || '').trim().toLowerCase();
+        const tg = String(c.genieacs_tag || '').trim();
+        if (pu) byPppoe.set(pu, c);
+        if (tg) byTag.set(tg, c);
+      }
     }
 
     const result = await customerDevice.listAllDevices(999999, acs);
@@ -2772,6 +2828,10 @@ router.get('/app/tech/tr069/devices', requireTechApiAuth, async (req, res) => {
       };
     });
 
+    if (filter && filter.isRestricted) {
+      devices = devices.filter(d => d.customerId && allowedCustomerIds.has(d.customerId));
+    }
+
     if (search) {
       const s = search.toLowerCase();
       devices = devices.filter(d =>
@@ -2798,6 +2858,11 @@ router.post('/app/tech/tr069/device/ssid', requireTechApiAuth, async (req, res) 
   try {
     const { tag, ssid } = req.body;
     if (!tag || !ssid) return res.status(400).json({ success: false, message: 'Tag perangkat dan SSID baru wajib diisi' });
+
+    const techId = resolveTechId(req);
+    if (!checkTechApiTagAccess(techId, tag)) {
+      return res.status(403).json({ success: false, message: 'Akses ditolak: Perangkat di luar wilayah tugas Anda' });
+    }
 
     const ok = await customerDevice.updateSSID(tag, ssid.trim());
     if (ok) {
@@ -2836,6 +2901,11 @@ router.post('/app/tech/tr069/device/password', requireTechApiAuth, async (req, r
       return res.status(400).json({ success: false, message: 'Password WiFi minimal 8 karakter' });
     }
 
+    const techId = resolveTechId(req);
+    if (!checkTechApiTagAccess(techId, tag)) {
+      return res.status(403).json({ success: false, message: 'Akses ditolak: Perangkat di luar wilayah tugas Anda' });
+    }
+
     const ok = await customerDevice.updatePassword(tag, password.trim());
     if (ok) {
       // WA notification to customer
@@ -2871,6 +2941,11 @@ router.post('/app/tech/tr069/device/reboot', requireTechApiAuth, async (req, res
     const { tag } = req.body;
     if (!tag) return res.status(400).json({ success: false, message: 'Tag / ID perangkat tidak valid' });
 
+    const techId = resolveTechId(req);
+    if (!checkTechApiTagAccess(techId, tag)) {
+      return res.status(403).json({ success: false, message: 'Akses ditolak: Perangkat di luar wilayah tugas Anda' });
+    }
+
     const ok = await customerDevice.requestReboot(tag);
     if (ok) {
       res.json({ success: true, message: 'Perintah Reboot berhasil dikirim ke Modem ONT melalui TR-069!' });
@@ -2885,10 +2960,20 @@ router.post('/app/tech/tr069/device/reboot', requireTechApiAuth, async (req, res
 // ─── TEKNISI NATIVE: PASANG BARU PELANGGAN ──────────────────────────────────
 router.get('/app/tech/customers/options', requireTechApiAuth, (req, res) => {
   try {
+    const techId = resolveTechId(req);
+    const tech = techSvc.getTechById(techId);
+    const filter = tech ? techSvc.getTechAreaWhere(tech, 'c') : null;
+
     const pkgs = customerSvc.getAllPackages() || [];
     const routers = db.prepare('SELECT id, name, host FROM routers WHERE is_active = 1').all() || [];
-    const odps = db.prepare('SELECT id, name, area, total_ports, used_ports FROM odps').all() || [];
-    const areas = db.prepare('SELECT id, name FROM areas ORDER BY name ASC').all() || [];
+    let odps = db.prepare('SELECT id, name, area, total_ports, used_ports FROM odps').all() || [];
+    let areas = db.prepare('SELECT id, name FROM areas ORDER BY name ASC').all() || [];
+
+    if (filter && filter.isRestricted) {
+      areas = areas.filter(a => filter.areas.includes(String(a.name || '').trim().toLowerCase()));
+      odps = odps.filter(o => !o.area || filter.areas.includes(String(o.area || '').trim().toLowerCase()));
+    }
+
     res.json({ success: true, data: { packages: pkgs, routers, odps, areas } });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
@@ -2900,11 +2985,25 @@ router.post('/app/tech/customers/create', requireTechApiAuth, async (req, res) =
     const name = String(req.body.name || '').trim();
     if (!name) return res.status(400).json({ success: false, message: 'Nama pelanggan wajib diisi' });
 
+    const techId = resolveTechId(req);
+    const tech = techSvc.getTechById(techId);
+    let area = String(req.body.area || '').trim();
+    if (tech && tech.area) {
+      const filter = techSvc.getTechAreaWhere(tech, 'c');
+      if (filter.isRestricted) {
+        if (!area) {
+          area = filter.areas[0];
+        } else if (!filter.areas.includes(area.toLowerCase())) {
+          return res.status(403).json({ success: false, message: `Anda hanya dapat mendaftarkan pelanggan di wilayah tugas Anda (${tech.area})` });
+        }
+      }
+    }
+
     const customerData = {
       name,
       phone: String(req.body.phone || '').trim(),
       address: String(req.body.address || '').trim(),
-      area: String(req.body.area || '').trim(),
+      area,
       package_id: req.body.package_id ? Number(req.body.package_id) : null,
       pppoe_username: String(req.body.pppoe_username || '').trim(),
       pppoe_password: String(req.body.pppoe_password || '123456').trim(),
@@ -3079,33 +3178,12 @@ router.post('/app/customer/topup/create', requireCustomerApiAuth, async (req, re
 
     const customer = req.customer;
 
-    // Generate unique code (1-999) without collision
-    let uniqueCode = 0;
-    let totalAmount = 0;
-    if (customerId > 0) {
-      const prefCode = (customerId % 499 === 0) ? 499 : (customerId % 499);
-      const prefAmt = amount + prefCode;
-      const chk = db.prepare('SELECT id FROM customer_topup_requests WHERE status=? AND qris_amount_unique=? LIMIT 1').get('pending', prefAmt);
-      if (!chk) {
-        uniqueCode = prefCode;
-        totalAmount = prefAmt;
-      }
-    }
-    if (!totalAmount) {
-      for (let c = 1; c <= 999; c++) {
-        const testAmt = amount + c;
-        const chk = db.prepare('SELECT id FROM customer_topup_requests WHERE status=? AND qris_amount_unique=? LIMIT 1').get('pending', testAmt);
-        if (!chk) {
-          uniqueCode = c;
-          totalAmount = testAmt;
-          break;
-        }
-      }
-    }
-    if (!totalAmount) {
-      uniqueCode = Math.floor(1 + Math.random() * 998);
-      totalAmount = amount + uniqueCode;
-    }
+    // Generate unique code without collision across all tables
+    const prefCode = (customerId > 0) ? ((customerId % 499 === 0) ? 499 : (customerId % 499)) : null;
+    const { uniqueCode, amountUnique: totalAmount } = uniqueCodeService.allocateUniqueCode(amount, {
+      preferredCode: prefCode,
+      randomize: false
+    });
 
     const ins = db.prepare(`
       INSERT INTO customer_topup_requests (
@@ -4687,69 +4765,11 @@ router.get('/invoices', requireCustomerApiAuth, (req, res) => {
 });
 
 function ensureCustomerApiInvoiceQrisUnique(inv) {
-  const invId = Number(inv?.id || 0);
-  const custId = Number(inv?.customer_id || 0);
-  const baseAmount = Number(inv?.amount || 0);
-  if (!invId || baseAmount <= 0) {
-    return { uniqueCode: 0, amountUnique: baseAmount };
+  try {
+    return uniqueCodeService.ensureInvoiceQrisUnique(inv, false);
+  } catch (_) {
+    return { uniqueCode: Number(inv?.qris_unique_code || 0), amountUnique: Number(inv?.qris_amount_unique || inv?.amount || 0) };
   }
-
-  const currentAmount = Number(inv?.qris_amount_unique || 0);
-  const currentCode = Number(inv?.qris_unique_code || 0);
-  if (currentAmount > 0 && currentCode > 0 && (currentAmount - currentCode === baseAmount)) {
-    return { uniqueCode: currentCode, amountUnique: currentAmount };
-  }
-
-  const exists = db.prepare('SELECT id FROM invoices WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1');
-  let chosenCode = 0;
-  let chosenAmount = 0;
-
-  // 1. Prioritaskan ID Pelanggan sebagai kode unik utama (1 s/d 499)
-  if (custId > 0) {
-    const prefCode = (custId % 499 === 0) ? 499 : (custId % 499);
-    const prefAmount = baseAmount + prefCode;
-    if (!exists.get('unpaid', prefAmount, invId)) {
-      chosenCode = prefCode;
-      chosenAmount = prefAmount;
-    }
-  }
-
-  // 2. Jika kode ID Pelanggan sudah terpakai, cari kode 1 s/d 499
-  if (!chosenAmount) {
-    for (let code = 1; code <= 499; code++) {
-      const amount = baseAmount + code;
-      if (!exists.get('unpaid', amount, invId)) {
-        chosenCode = code;
-        chosenAmount = amount;
-        break;
-      }
-    }
-  }
-
-  // 3. Fallback 500 s/d 999
-  if (!chosenAmount) {
-    for (let code = 500; code <= 999; code++) {
-      const amount = baseAmount + code;
-      if (!exists.get('unpaid', amount, invId)) {
-        chosenCode = code;
-        chosenAmount = amount;
-        break;
-      }
-    }
-  }
-
-  if (chosenAmount > 0 && String(inv?.status) === 'unpaid') {
-    try {
-      db.prepare(`
-        UPDATE invoices
-        SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL())
-        WHERE id=?
-      `).run(chosenCode, chosenAmount, invId);
-    } catch (_) {}
-    return { uniqueCode: chosenCode, amountUnique: chosenAmount };
-  }
-
-  return { uniqueCode: chosenCode || 0, amountUnique: chosenAmount || baseAmount };
 }
 
 // Middleware: Customer Auth or Public Invoice Token

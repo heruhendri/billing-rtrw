@@ -21,6 +21,7 @@ const _jimpMod = require('jimp');
 const Jimp = _jimpMod.Jimp || _jimpMod;
 const qrisUtil = require('../utils/qrisUtil');
 const whatsappService = require('../services/whatsappService');
+const uniqueCodeService = require('../services/uniqueCodeService');
 const { BinaryBitmap, HybridBinarizer, RGBLuminanceSource, MultiFormatReader, BarcodeFormat, DecodeHintType } = require('@zxing/library');
 let loginRateLimiter = (req, res, next) => next();
 try {
@@ -427,24 +428,7 @@ function getBaseUrl(req, settings) {
 }
 
 function isQrisAmountAvailable(amount, opts = {}) {
-  const amt = Number(amount || 0);
-  if (!Number.isFinite(amt) || amt <= 0) return false;
-  const excludeInvoiceId = Number(opts.excludeInvoiceId || 0);
-  const excludeVoucherOrderId = Number(opts.excludeVoucherOrderId || 0);
-  const excludeTopupId = Number(opts.excludeTopupId || 0);
-
-  const inv = db.prepare('SELECT id FROM invoices WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1').get('unpaid', amt, excludeInvoiceId);
-  if (inv && inv.id) return false;
-
-  const ord = db.prepare('SELECT id FROM public_voucher_orders WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1').get('pending', amt, excludeVoucherOrderId);
-  if (ord && ord.id) return false;
-
-  try {
-    const topup = db.prepare('SELECT id FROM customer_topup_requests WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1').get('pending', amt, excludeTopupId);
-    if (topup && topup.id) return false;
-  } catch (e) {}
-
-  return true;
+  return uniqueCodeService.isQrisAmountAvailable(amount, opts);
 }
 
 router.get('/qris/static.jpg', async (req, res) => {
@@ -498,192 +482,19 @@ router.get('/qris/static.jpg', async (req, res) => {
 });
 
 function ensureInvoiceQrisUnique(inv, force = false) {
-  const invId = Number(inv?.id || 0);
-  if (!Number.isFinite(invId) || invId <= 0) throw new Error('Invoice ID tidak valid');
-  if (String(inv?.status) !== 'unpaid') throw new Error('Hanya tagihan BELUM BAYAR yang bisa dibuat kode QRIS.');
-
-  const custId = Number(inv?.customer_id || 0);
-  let baseAmount = Number(inv?.amount || 0);
-
-  if (custId > 0) {
-    const unpaidInvoices = db.prepare("SELECT amount FROM invoices WHERE customer_id=? AND status='unpaid'").all(custId);
-    if (unpaidInvoices && unpaidInvoices.length > 0) {
-      const sumAll = unpaidInvoices.reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
-      if (sumAll > 0) baseAmount = sumAll;
-    }
-  }
-
-  if (!Number.isFinite(baseAmount) || baseAmount <= 0) throw new Error('Nominal tagihan tidak valid');
-
-  const currentAmount = Number(inv?.qris_amount_unique || 0) || 0;
-  const currentCode = Number(inv?.qris_unique_code || 0) || 0;
-  if (!force && currentAmount > 0 && currentCode > 0 && (currentAmount - currentCode === baseAmount)) {
-    return { uniqueCode: currentCode, amountUnique: currentAmount };
-  }
-
-  const update = db.prepare(`
-    UPDATE invoices
-    SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL())
-    WHERE id=?
-  `);
-
-  let chosenCode = 0;
-  let chosenAmount = 0;
-
-  // 1. Prioritaskan ID Pelanggan sebagai kode unik utama (selalu di bawah 500)
-  if (custId > 0) {
-    const prefCode = (custId % 499 === 0) ? 499 : (custId % 499);
-    const prefAmount = baseAmount + prefCode;
-    if (isQrisAmountAvailable(prefAmount, { excludeInvoiceId: invId })) {
-      chosenCode = prefCode;
-      chosenAmount = prefAmount;
-    }
-  }
-
-  // 2. Jika kode ID Pelanggan sudah terpakai, cari kode terendah yang tersedia (1 s/d 499)
-  if (!chosenAmount) {
-    for (let code = 1; code <= 499; code++) {
-      const amount = baseAmount + code;
-      if (isQrisAmountAvailable(amount, { excludeInvoiceId: invId })) {
-        chosenCode = code;
-        chosenAmount = amount;
-        break;
-      }
-    }
-  }
-
-  // 3. Fallback keamanan jika slot 1-499 penuh (500 s/d 999)
-  if (!chosenAmount) {
-    for (let code = 500; code <= 999; code++) {
-      const amount = baseAmount + code;
-      if (isQrisAmountAvailable(amount, { excludeInvoiceId: invId })) {
-        chosenCode = code;
-        chosenAmount = amount;
-        break;
-      }
-    }
-  }
-
-  if (!chosenAmount) throw new Error('Gagal membuat nominal unik (slot 1-999 penuh).');
-  update.run(chosenCode, chosenAmount, invId);
-
-  return { uniqueCode: chosenCode, amountUnique: chosenAmount };
+  return uniqueCodeService.ensureInvoiceQrisUnique(inv, force);
 }
 
 function ensureVoucherOrderQrisUnique(order, force = false) {
-  const orderId = Number(order?.id || 0);
-  if (!Number.isFinite(orderId) || orderId <= 0) throw new Error('Order ID tidak valid');
-  if (String(order?.status) !== 'pending') throw new Error('Hanya pesanan PENDING yang bisa dibuat kode QRIS.');
-
-  const baseAmount = Number(order?.price || 0);
-  if (!Number.isFinite(baseAmount) || baseAmount <= 0) throw new Error('Harga voucher tidak valid');
-
-  const currentAmount = Number(order?.qris_amount_unique || 0) || 0;
-  const currentCode = Number(order?.qris_unique_code || 0) || 0;
-  if (!force && currentAmount > 0 && currentCode > 0) {
-    return { uniqueCode: currentCode, amountUnique: currentAmount };
-  }
-
-  const update = db.prepare(`
-    UPDATE public_voucher_orders
-    SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL()), updated_at=(NOW_LOCAL())
-    WHERE id=?
-  `);
-
-  let chosenCode = 0;
-  let chosenAmount = 0;
-
-  // Search sequentially from 1 to 499 (always under 500)
-  for (let code = 1; code <= 499; code++) {
-    const amount = baseAmount + code;
-    if (isQrisAmountAvailable(amount, { excludeVoucherOrderId: orderId })) {
-      chosenCode = code;
-      chosenAmount = amount;
-      break;
-    }
-  }
-
-  // Safety fallback if 1-499 full
-  if (!chosenAmount) {
-    for (let code = 500; code <= 999; code++) {
-      const amount = baseAmount + code;
-      if (isQrisAmountAvailable(amount, { excludeVoucherOrderId: orderId })) {
-        chosenCode = code;
-        chosenAmount = amount;
-        break;
-      }
-    }
-  }
-
-  if (!chosenAmount) throw new Error('Gagal membuat nominal unik (slot 1-999 penuh).');
-  update.run(chosenCode, chosenAmount, orderId);
-
-  return { uniqueCode: chosenCode, amountUnique: chosenAmount };
+  return uniqueCodeService.ensureVoucherOrderQrisUnique(order, force);
 }
 
 function ensureTopupQrisUnique(topup, force = false) {
-  const topupId = Number(topup?.id || 0);
-  if (!Number.isFinite(topupId) || topupId <= 0) throw new Error('Top-up ID tidak valid');
-  if (String(topup?.status) !== 'pending') throw new Error('Hanya top-up status pending yang bisa dibuat kode QRIS.');
-
-  const custId = Number(topup?.customer_id || 0);
-  const baseAmount = Number(topup?.amount || 0);
-  if (!Number.isFinite(baseAmount) || baseAmount <= 0) throw new Error('Nominal top-up tidak valid');
-
-  const currentAmount = Number(topup?.qris_amount_unique || 0) || 0;
-  const currentCode = Number(topup?.qris_unique_code || 0) || 0;
-  if (!force && currentAmount > 0 && currentCode > 0 && (currentAmount - currentCode === baseAmount)) {
-    return { uniqueCode: currentCode, amountUnique: currentAmount };
-  }
-
-  const update = db.prepare(`
-    UPDATE customer_topup_requests
-    SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL()), updated_at=(NOW_LOCAL())
-    WHERE id=?
-  `);
-
-  let chosenCode = 0;
-  let chosenAmount = 0;
-
-  if (custId > 0) {
-    const prefCode = (custId % 499 === 0) ? 499 : (custId % 499);
-    const prefAmount = baseAmount + prefCode;
-    if (isQrisAmountAvailable(prefAmount, { excludeTopupId: topupId })) {
-      chosenCode = prefCode;
-      chosenAmount = prefAmount;
-    }
-  }
-
-  if (!chosenAmount) {
-    for (let code = 1; code <= 499; code++) {
-      const amount = baseAmount + code;
-      if (isQrisAmountAvailable(amount, { excludeTopupId: topupId })) {
-        chosenCode = code;
-        chosenAmount = amount;
-        break;
-      }
-    }
-  }
-
-  if (!chosenAmount) {
-    for (let code = 500; code <= 999; code++) {
-      const amount = baseAmount + code;
-      if (isQrisAmountAvailable(amount, { excludeTopupId: topupId })) {
-        chosenCode = code;
-        chosenAmount = amount;
-        break;
-      }
-    }
-  }
-
-  if (!chosenAmount) throw new Error('Gagal membuat nominal unik (slot 1-999 penuh).');
-  update.run(chosenCode, chosenAmount, topupId);
-
-  return { uniqueCode: chosenCode, amountUnique: chosenAmount };
+  return uniqueCodeService.ensureTopupQrisUnique(topup, force);
 }
 
 function qrisDefaultExpiresAtIso() {
-  return new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  return new Date(Date.now() + uniqueCodeService.VOUCHER_ORDER_EXPIRY_MS).toISOString();
 }
 
 function resolvePaymentExpiresAt(gateway, result) {
@@ -1434,7 +1245,10 @@ router.post('/public/voucher/create-payment', async (req, res) => {
     const appUrl = settings.app_url || `${protocol}://${host}`;
 
     let method = String(req.body.method || 'QRIS').toUpperCase();
-    if (method === 'QRIS_STATIC') {
+    const gateway = resolveConfiguredGatewayForAmount(settings, selected.price);
+    const isQrisStaticMethod = (method === 'QRIS_STATIC' || ((method === 'QRIS' || !method) && gateway === 'qris_static') || gateway === 'qris_static');
+
+    if (isQrisStaticMethod) {
       const hasStaticQris = !!(getStaticQrisQrUrl(settings) || getStaticQrisPayload(settings));
       if (!hasStaticQris) throw new Error('QRIS statis belum diatur oleh admin');
 
@@ -1472,7 +1286,6 @@ router.post('/public/voucher/create-payment', async (req, res) => {
       return res.redirect('/customer/voucher/qris/' + encodeURIComponent(String(orderId)) + '?t=' + encodeURIComponent(token));
     }
 
-    const gateway = resolveConfiguredGatewayForAmount(settings, selected.price);
     if (!gateway) throw new Error('Payment gateway belum dikonfigurasi atau nominal terlalu kecil untuk gateway aktif');
     let tripayChannels = null;
     let tripayCandidates = null;

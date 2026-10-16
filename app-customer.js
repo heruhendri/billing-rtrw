@@ -17,6 +17,7 @@ const whatsappService = require('./services/whatsappService');
 const mikrotikService = require('./services/mikrotikService');
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
 const { scheduleAutoBackup } = require('./services/backupService');
+const uniqueCodeService = require('./services/uniqueCodeService');
 
 // Prefer IPv4 to avoid AggregateError (IPv6 timeouts) on some servers
 if (dns.setDefaultResultOrder) {
@@ -46,6 +47,9 @@ const { SUPPORTED_LANGS, FALLBACK_LANG, normalizeLang, t } = require('./config/i
 if (typeof ensureDefaultSettings === 'function') {
   ensureDefaultSettings();
 }
+
+// Pastikan pesanan kadaluarsa lama dibersihkan saat server mulai
+try { uniqueCodeService.cleanupExpiredPendingOrders(); } catch (_) {}
 
 // Inisialisasi aplikasi Express
 const app = express();
@@ -1918,29 +1922,9 @@ app.get('/broadcast', (req, res) => {
 // Helper: Ensure unique nominal for donation order
 function ensureDonationOrderQrisUnique(baseAmount, donorPhone, donorName, notes) {
   const base = Math.max(1000, Math.floor(Number(baseAmount) || 50000));
-  let chosenCode = 0;
-  let chosenAmount = 0;
-
-  for (let code = 1; code <= 999; code++) {
-    const candidate = base + code;
-    const inv = db.prepare('SELECT id FROM invoices WHERE status=? AND qris_amount_unique=? LIMIT 1').get('unpaid', candidate);
-    if (inv && inv.id) continue;
-
-    const ord = db.prepare('SELECT id FROM public_voucher_orders WHERE status=? AND qris_amount_unique=? LIMIT 1').get('pending', candidate);
-    if (ord && ord.id) continue;
-
-    const don = db.prepare('SELECT id FROM public_donation_orders WHERE status=? AND qris_amount_unique=? LIMIT 1').get('pending', candidate);
-    if (don && don.id) continue;
-
-    chosenCode = code;
-    chosenAmount = candidate;
-    break;
-  }
-
-  if (!chosenAmount) {
-    chosenCode = Math.floor(1 + Math.random() * 998);
-    chosenAmount = base + chosenCode;
-  }
+  const { uniqueCode: chosenCode, amountUnique: chosenAmount } = uniqueCodeService.allocateUniqueCode(base, {
+    randomize: true
+  });
 
   const ins = db.prepare(`
     INSERT INTO public_donation_orders (donor_name, donor_phone, amount, qris_amount_unique, qris_unique_code, notes, status, activation_code)

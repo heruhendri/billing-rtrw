@@ -829,9 +829,76 @@ async function topupCustomerBalance(customerId, amount, note = '', actorName = '
   };
 }
 
+/**
+ * Helper untuk membatasi query pelanggan berdasarkan wilayah tugas kolektor.
+ * Jika kolektor sudah ditentukan wilayahnya (misal: "pegagan"):
+ * - Kolektor HANYA bisa melihat pelanggan di wilayahnya sendiri.
+ * - Tidak bisa melihat pelanggan di wilayah lain atau tanpa wilayah.
+ * - Tidak bisa melihat pelanggan yang sudah secara spesifik ditugaskan ke kolektor lain.
+ * Jika kolektor tidak ditentukan wilayahnya (kosong / "semua" / bebas):
+ * - Kolektor bisa melihat semua pelanggan (kecuali yang ditugaskan ke kolektor lain).
+ */
+function getCollectorCustomerWhere(collector, tableAlias = 'c') {
+  let col = collector;
+  if (typeof collector === 'number' || typeof collector === 'string') {
+    col = db.prepare('SELECT id, area FROM collectors WHERE id = ?').get(Number(collector));
+  }
+  const colId = Number(col?.id || col?.collectorId || 0);
+  const rawArea = String(col?.area || '').trim();
+
+  // Parsing area, dukung multi area dengan koma
+  const areas = rawArea.split(',')
+    .map(a => a.trim().toLowerCase())
+    .filter(a => a.length > 0 && a !== 'semua' && a !== 'all');
+
+  if (areas.length > 0) {
+    const placeholders = areas.map(() => '?').join(', ');
+    const where = `(LOWER(TRIM(${tableAlias}.area)) IN (${placeholders}) AND (${tableAlias}.collector_id = ? OR ${tableAlias}.collector_id IS NULL OR ${tableAlias}.collector_id = 0))`;
+    const params = [...areas, colId];
+    return { where, params, isRestricted: true, areas };
+  } else {
+    const where = `(${tableAlias}.collector_id = ? OR ${tableAlias}.collector_id IS NULL OR ${tableAlias}.collector_id = 0)`;
+    const params = [colId];
+    return { where, params, isRestricted: false, areas: [] };
+  }
+}
+
+/**
+ * Validasi apakah kolektor berhak mengakses data / transaksi seorang pelanggan.
+ */
+function canCollectorAccessCustomer(collector, customer) {
+  if (!collector || !customer) return false;
+  let col = collector;
+  if (typeof collector === 'number' || typeof collector === 'string') {
+    col = db.prepare('SELECT id, area FROM collectors WHERE id = ?').get(Number(collector));
+  }
+  const colId = Number(col?.id || col?.collectorId || 0);
+  const custColId = Number(customer?.collector_id || 0);
+
+  // Jika pelanggan secara spesifik ditugaskan ke kolektor lain, tolak
+  if (custColId > 0 && custColId !== colId) {
+    return false;
+  }
+
+  const rawArea = String(col?.area || '').trim();
+  const areas = rawArea.split(',')
+    .map(a => a.trim().toLowerCase())
+    .filter(a => a.length > 0 && a !== 'semua' && a !== 'all');
+
+  if (areas.length > 0) {
+    const custArea = String(customer?.area || '').trim().toLowerCase();
+    if (!custArea) return false;
+    return areas.includes(custArea);
+  }
+
+  return true;
+}
+
 module.exports = {
   getAllCustomers, getAllCustomerAreas, getCustomerById, createCustomer, updateCustomer, deleteCustomer, bulkDeleteCustomers, getCustomerStats,
   getAllPackages, getPackageById, createPackage, updatePackage, deletePackage,
   suspendCustomer, activateCustomer, findCustomerByAny, updateCustomerCablePath,
-  resetPromoCyclesUsed, getEffectiveRouterId, topupCustomerBalance
+  resetPromoCyclesUsed, getEffectiveRouterId, topupCustomerBalance,
+  getCollectorCustomerWhere, canCollectorAccessCustomer
 };
+

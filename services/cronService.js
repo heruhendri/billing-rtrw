@@ -57,6 +57,19 @@ function addMessageVariation(message, index) {
 }
 
 function startCronJobs() {
+  // 0. Cleanup otomatis pesanan voucher & topup pending yang kadaluarsa setiap 10 menit
+  cron.schedule('*/10 * * * *', () => {
+    try {
+      const uniqueCodeService = require('./uniqueCodeService');
+      const res = uniqueCodeService.cleanupExpiredPendingOrders();
+      if (res.expiredVouchers > 0 || res.expiredTopups > 0) {
+        logger.info(`[CRON] Cleaned up expired pending orders: ${res.expiredVouchers} vouchers, ${res.expiredTopups} topups released.`);
+      }
+    } catch (e) {
+      logger.error(`[CRON] Gagal auto-expire pending orders: ${e?.message || e}`);
+    }
+  });
+
   // 1. Generate Tagihan Otomatis setiap tanggal 1 jam 00:01
   cron.schedule('1 0 1 * *', () => {
     const now = new Date();
@@ -296,43 +309,13 @@ function startCronJobs() {
 
               // Jika amt tidak ada atau amt tidak cocok dengan akumulasi total tagihan + kode, buat/perbarui nominal unik
               if ((!code || !amt || (amt - code !== baseAmount)) && invId > 0 && baseAmount > 0) {
-                const exists = db.prepare('SELECT id FROM invoices WHERE status=? AND qris_amount_unique=? AND id!=? LIMIT 1');
-                const custId = Number(c?.id || inv?.customer_id || 0);
-                let tryCode = 0;
-                let tryAmt = 0;
-
-                if (code > 0) {
-                  const pAmt = baseAmount + code;
-                  if (!exists.get('unpaid', pAmt, invId)) {
-                    tryCode = code;
-                    tryAmt = pAmt;
-                  }
-                }
-
-                if (!tryAmt && custId > 0) {
-                  const prefCode = (custId % 499 === 0) ? 499 : (custId % 499);
-                  const pAmt = baseAmount + prefCode;
-                  if (!exists.get('unpaid', pAmt, invId)) {
-                    tryCode = prefCode;
-                    tryAmt = pAmt;
-                  }
-                }
-
-                if (!tryAmt) {
-                  for (let randCode = 1; randCode <= 499; randCode++) {
-                    const pAmt = baseAmount + randCode;
-                    if (!exists.get('unpaid', pAmt, invId)) {
-                      tryCode = randCode;
-                      tryAmt = pAmt;
-                      break;
-                    }
-                  }
-                }
-
-                if (tryAmt > 0) {
-                  code = tryCode;
-                  amt = tryAmt;
-                  db.prepare('UPDATE invoices SET qris_unique_code=?, qris_amount_unique=?, qris_assigned_at=(NOW_LOCAL()) WHERE id=?').run(code, amt, invId);
+                try {
+                  const uniqueCodeService = require('./uniqueCodeService');
+                  const ensured = uniqueCodeService.ensureInvoiceQrisUnique(inv, false);
+                  code = ensured.uniqueCode;
+                  amt = ensured.amountUnique;
+                } catch (e) {
+                  logger.error(`[CRON] Gagal alokasi kode QRIS: ${e?.message || e}`);
                 }
               }
 

@@ -30,6 +30,7 @@
     .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;border:1px solid rgba(148,163,184,.18)}
     .pill-u{background: rgba(248, 81, 73, .12);color:#fca5a5;border-color: rgba(248, 81, 73, .28)}
     .pill-p{background: rgba(63, 185, 80, .12);color:#86efac;border-color: rgba(63, 185, 80, .28)}
+    .pill-d{background: rgba(100, 116, 139, .15);color:#cbd5e1;border-color: rgba(148, 163, 184, .3)}
     .voucher-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
     @media (max-width: 576px){.voucher-grid{grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}}
     .voucher-radio{position:absolute;opacity:0;pointer-events:none}
@@ -240,6 +241,10 @@
                   <span class="pill pill-p"><i class="bi bi-check-circle"></i> Selesai</span>
                 <% } else if (st === 'paid') { %>
                   <span class="pill pill-u"><i class="bi bi-hourglass-split"></i> Diproses</span>
+                <% } else if (st === 'expired') { %>
+                  <span class="pill pill-d"><i class="bi bi-x-circle"></i> Kadaluarsa</span>
+                <% } else if (st === 'cancelled') { %>
+                  <span class="pill pill-d"><i class="bi bi-x-circle"></i> Dibatalkan</span>
                 <% } else { %>
                   <span class="pill pill-u"><i class="bi bi-clock"></i> Menunggu</span>
                 <% } %>
